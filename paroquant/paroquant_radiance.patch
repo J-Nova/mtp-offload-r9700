@@ -603,6 +603,201 @@ index 0000000..4789052
 +    val = torch.where((codes & 0x8) != 0, -mag, mag)
 +    scale = torch.exp2(e8m0.float() - 127.0)
 +    return (val.reshape(-1, BLOCK) * scale.reshape(-1, 1)).reshape(out_f, half * 2)
+diff --git a/paroquant/optim/mxfp6.py b/paroquant/optim/mxfp6.py
+new file mode 100644
+index 0000000..1b4d9ef
+--- /dev/null
++++ b/paroquant/optim/mxfp6.py
+@@ -0,0 +1,189 @@
++from __future__ import annotations
++
++import os
++
++import torch
++import torch.nn as nn
++
++from .quant import clamp_ste, round_ste
++
++BLOCK = 32
++_GRID8 = tuple(range(16)) + tuple(range(16, 32, 2)) + tuple(range(32, 64, 4))
++_GRID = tuple(g / 8 for g in _GRID8)
++_MIDS = tuple((a + b) / 2 for a, b in zip(_GRID, _GRID[1:]))
++_EMAX = 7.5
++_EMAX_ELEM = 2
++_EVEN_BUMP = 0.96875
++_EXP_MIN, _EXP_MAX = -127.0, 127.0
++DEFAULT_MAX_EXP_SPREAD = 6
++FROM_ENV = object()
++_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
++
++
++def scale_rule() -> str:
++    rule = os.environ.get("PARO_MXFP6_SCALE_RULE", "even").strip().lower() or "even"
++    if rule not in ("even", "ocp", "mse2"):
++        raise ValueError(f"PARO_MXFP6_SCALE_RULE must be 'even', 'ocp' or 'mse2', got {rule!r}")
++    return rule
++
++
++def max_exp_spread() -> int | None:
++    v = os.environ.get("PARO_MXFP6_MAX_EXP_SPREAD", "").strip().lower()
++    if v in ("off", "none"):
++        return None
++    n = int(v) if v else DEFAULT_MAX_EXP_SPREAD
++    if n < 0:
++        raise ValueError(f"PARO_MXFP6_MAX_EXP_SPREAD must be >= 0 or 'off', got {v!r}")
++    return n
++
++
++def _tables(device, dtype):
++    key = (device, dtype)
++    if key not in _cache:
++        _cache[key] = (
++            torch.tensor(_GRID, device=device, dtype=dtype),
++            torch.tensor(_MIDS, device=device, dtype=dtype),
++        )
++    return _cache[key]
++
++
++def _code_index(mag: torch.Tensor) -> torch.Tensor:
++    grid, mids = _tables(mag.device, mag.dtype)
++    idx = torch.bucketize(mag, mids)
++    last = len(_MIDS) - 1
++    tie = (idx <= last) & (mag == mids[idx.clamp(max=last)])
++    return idx + (tie & (idx % 2 == 1)).to(idx.dtype)
++
++
++def round_to_e2m3(v: torch.Tensor) -> torch.Tensor:
++    grid, _ = _tables(v.device, v.dtype)
++    return torch.sign(v) * grid[_code_index(v.abs().clamp(max=_EMAX))]
++
++
++def _block_sse(xs: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
++    scale = torch.exp2(e).unsqueeze(-1)
++    q = round_to_e2m3(xs / scale) * scale
++    return ((q - xs).double() ** 2).sum(-1)
++
++
++def shared_exponent(
++    x: torch.Tensor,
++    exp_bias: torch.Tensor | None = None,
++    rule: str | None = None,
++    max_spread=FROM_ENV,
++) -> torch.Tensor:
++    rule = scale_rule() if rule is None else rule
++    spread = max_exp_spread() if max_spread is FROM_ENV else max_spread
++    assert x.dim() == 2 and x.shape[1] % BLOCK == 0, x.shape
++    out_f, in_f = x.shape
++    xs = x.float().reshape(out_f, in_f // BLOCK, BLOCK)
++    with torch.no_grad():
++        amax = xs.abs().amax(dim=-1)
++        man, ex = torch.frexp(amax)
++        e = (ex - 1).to(torch.float32) - _EMAX_ELEM
++        if rule == "even":
++            e = e + (man >= _EVEN_BUMP).to(torch.float32)
++        elif rule == "mse2":
++            e1 = e + 1.0
++            better = _block_sse(xs, e1.clamp(_EXP_MIN, _EXP_MAX)) < _block_sse(xs, e.clamp(_EXP_MIN, _EXP_MAX))
++            e = torch.where(better, e1, e)
++        elif rule != "ocp":
++            raise ValueError(f"unknown MXFP6 scale rule {rule!r}")
++        e = torch.where(amax > 0, e, torch.full_like(e, _EXP_MIN))
++    if exp_bias is not None:
++        e = e + clamp_ste(exp_bias.reshape(out_f, in_f // BLOCK), -2.0, 2.0)
++        e = round_ste(e)
++    e = e.clamp(_EXP_MIN, _EXP_MAX)
++    if spread is not None:
++        floor_ = (e.detach().amax(dim=1, keepdim=True) - float(spread))
++        e = e + (torch.maximum(e, floor_) - e).detach()
++    return e
++
++
++def mxfp6_fake_quant(
++    x: torch.Tensor,
++    exp_bias: torch.Tensor | None = None,
++    rule: str | None = None,
++    max_spread=FROM_ENV,
++) -> torch.Tensor:
++    dtype = x.dtype
++    xf = x.float()
++    assert xf.shape[-1] % BLOCK == 0, xf.shape
++    x2 = xf.reshape(-1, xf.shape[-1])
++    e = shared_exponent(x2, exp_bias, rule, max_spread)
++    scale = torch.exp2(e).unsqueeze(-1)
++    v = x2.reshape(x2.shape[0], -1, BLOCK) / scale
++    q = round_to_e2m3(v)
++    q = (q - v).detach() + v
++    return (q * scale).reshape(xf.shape).to(dtype)
++
++
++class MXFP6Quantizer(nn.Module):
++    def __init__(self, weight: torch.Tensor, n_bits, group_size):
++        super().__init__()
++        del n_bits, group_size
++        assert weight.dim() == 2, weight.shape
++        assert weight.shape[-1] % BLOCK == 0, weight.shape
++        n_blocks = weight.numel() // BLOCK
++        self.exp_bias = nn.Parameter(torch.zeros(n_blocks, 1, device=weight.device,
++                                                 dtype=torch.float32))
++        self.enable_checkpoint = False
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return mxfp6_fake_quant(x, self.exp_bias)
++
++    def optim_params(self) -> list[nn.Parameter]:
++        return [self.exp_bias]
++
++    def set_optim_enabled(self, enabled: bool):
++        for param in self.optim_params():
++            param.requires_grad = enabled
++
++
++def pack_fp6(codes: torch.Tensor) -> torch.Tensor:
++    *lead, K = codes.shape
++    assert K % 4 == 0, codes.shape
++    c = codes.reshape(*lead, K // 4, 4).to(torch.int32)
++    w = c[..., 0] | (c[..., 1] << 6) | (c[..., 2] << 12) | (c[..., 3] << 18)
++    b = torch.stack((w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF), dim=-1).to(torch.uint8)
++    return b.reshape(*lead, 3 * K // 4).contiguous()
++
++
++def unpack_fp6(packed: torch.Tensor) -> torch.Tensor:
++    *lead, nb = packed.shape
++    assert nb % 3 == 0, packed.shape
++    t = packed.reshape(*lead, nb // 3, 3).to(torch.int32)
++    w = t[..., 0] | (t[..., 1] << 8) | (t[..., 2] << 16)
++    c = torch.stack([(w >> (6 * i)) & 0x3F for i in range(4)], dim=-1)
++    return c.reshape(*lead, nb // 3 * 4).to(torch.uint8)
++
++
++def quantize_to_codes(
++    x: torch.Tensor,
++    exp_bias: torch.Tensor | None = None,
++    rule: str | None = None,
++    max_spread=FROM_ENV,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    assert x.dim() == 2, x.shape
++    out_f, in_f = x.shape
++    assert in_f % BLOCK == 0, x.shape
++    with torch.no_grad():
++        xf = x.float()
++        e = shared_exponent(xf, exp_bias, rule, max_spread).detach()
++        v = xf.reshape(out_f, in_f // BLOCK, BLOCK) / torch.exp2(e).unsqueeze(-1)
++        idx = _code_index(v.abs().clamp(max=_EMAX)).to(torch.uint8)
++        sign = (v < 0).to(torch.uint8) << 5
++        codes = torch.where(idx == 0, torch.zeros_like(idx), idx | sign).reshape(out_f, in_f)
++        e8m0 = (e + 127.0).round().clamp(0, 254).to(torch.uint8)
++    return pack_fp6(codes), e8m0.contiguous()
++
++
++def dequantize_from_codes(packed: torch.Tensor, e8m0: torch.Tensor) -> torch.Tensor:
++    out_f, nb = packed.shape
++    in_f = nb // 3 * 4
++    codes = unpack_fp6(packed).long()
++    grid, _ = _tables(packed.device, torch.float32)
++    mag = grid[codes & 0x1F]
++    val = torch.where((codes & 0x20) != 0, -mag, mag)
++    scale = torch.exp2(e8m0.float() - 127.0)
++    return (val.reshape(out_f, -1, BLOCK) * scale.unsqueeze(-1)).reshape(out_f, in_f)
 diff --git a/paroquant/optim/qlinear.py b/paroquant/optim/qlinear.py
 index 384b66e..85be61d 100644
 --- a/paroquant/optim/qlinear.py
