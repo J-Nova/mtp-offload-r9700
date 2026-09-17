@@ -636,9 +636,8 @@ into that same directory instead.
 - **No `torch_dtype` in `config.json`.** A `float16` stamp makes vLLM pick fp16, and R4D attention
   then refuses to start (`dtype not supported`). Convert drops it for mxfp6. Check any hand-edited config.
 
-**Results** (2 x R9700, TP=2, fp8 KV, DFlash2-FP8 drafter, SPEC=7, `run_paroquant.sh` with its default
-chat template). The serving numbers are pending; the MXFP4-PARO and int5 rows are the recorded ones
-above.
+**Results.** The `run_paroquant.sh` numbers are an open item: nothing has been measured through this
+launcher and its default template yet.
 
 | served, TP=2, SPEC=7 | GSM8K 500q | wikitext PPL | ms/step @ctx25 / 8k / 32k | prefill @2k / 64k | KV |
 |---|---|---|---|---|---|
@@ -646,6 +645,9 @@ above.
 | int5 fine-tuned, I8 + PG + ZPE (recorded) | 97.40 | -- | 25.90 / 27.46 / 28.19 | 3941 / 3436 | 760k |
 | **MXFP6 RTN** | open | open | open | open | open |
 | **MXFP6 fine-tuned** | open | open | open | open | open |
+
+What has been measured -- the kernel and loader gates, and TP=2 serving numbers from a second R9700
+rig against that rig's own int5 runs -- is in paroquant/RESULTS.md, 2026-09-16.
 
 ### Same-stack fidelity ranking (2026-09-11)
 

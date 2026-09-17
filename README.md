@@ -504,9 +504,9 @@ On the images `./build.sh` and `./build.sh --paro` bake, the same checkpoint goe
 scripts instead: `./setup.sh --mxfp6`, then `QUANT=mxfp6 ./serve.sh`.
 
 Expect MXFP6 to trade decode and KV for weight fidelity: +47% weight bytes over MXFP4 and a wider
-unpack in the prefill loop. Nothing has been measured through `run_paroquant.sh` yet. The format, the
-fold window, the served layout, the traps and the open measurements are in
-[PAROQUANT.md](PAROQUANT.md#mxfp6-weights-w6a8).
+unpack in the prefill loop. Nothing has been measured through `run_paroquant.sh` yet. Numbers from a
+second 2 x R9700 rig are in [paroquant/RESULTS.md](paroquant/RESULTS.md); the fold window, the served
+layout and the traps are in [PAROQUANT.md](PAROQUANT.md#mxfp6-weights-w6a8).
 
 The format, the kernels, the knob reference and the rejected experiments are in
 [PAROQUANT.md](PAROQUANT.md).

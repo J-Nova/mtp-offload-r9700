@@ -1015,3 +1015,167 @@ vs PARO-MXFP4) at the same GSM8K, from a checkpoint downloaded as-is. Not a syst
 `serve-mxfp4.sh` with the env in the README); nothing committed. The int2 draft/verify heads read the lm_head through `_head_matrix`
 (radiance_drafthead.py), which also supports an FP8 per-channel head with an in-kernel e4m3 decode in the
 exact rerank (byte-verified, same 0.3 ms as bf16) -- kept for checkpoints that need it.
+
+## 2026-09-16: MXFP6-E2M3 W6A8 -- kernel gates, TP=2 numbers from a second rig, stage-2 fine-tune no perplexity gain
+
+**What it is:** OCP MXFP6 E2M3 elements on the e8m0/32 block scale, with the per-row exponent spread
+clamped to 6, on z-lab's rotations, with per-token e4m3 activations through the fp8-WMMA GEMM. That is
+`quant_method: paroquant_mxfp6` at 6.25 bits/weight. Why E2M3 rides the fp8 WMMA, the fold window and
+the traps are in PAROQUANT.md "MXFP6 weights (W6A8)". This entry holds the numbers.
+
+**Kernel and loader.** None of these depends on a launcher or a chat template. Except where marked,
+they ran on this series before it was trimmed for upstream: the same E6 device code, loader arithmetic
+and loader test, plus host-side guards, config validation and an `M > 112` decode remap that this tree
+does not carry.
+
+- **Kernel harness** (a standalone E6 gate, not part of this tree), full run on one R9700, 46 s:
+  - (a) The WMMA is exact on every finite B byte. That includes the E2M3-only subnormals 0x05 / 0x07
+    / 0x85 / 0x87.
+  - (b, c) 3584/3584 (code, d, position) combinations and 4.1M random slots per band are exact through
+    `launch6_p` / `launch6_at_p`.
+  - (d) 608 E6 checks land at rel 0.98e-3 to 2.14e-3 against a double reference (E2M1 through the MXFP4
+    entries: 1.10e-3 to 2.18e-3). The bands agree to 5.6e-5.
+- **(e) E6 / E4 kernel time**, paired and DRAM-fed (kernel only):
+
+| | M=1 | M=8 | M=64 | M=2048 folded | M=2048 A-tiled |
+|---|--:|--:|--:|--:|--:|
+| gate_up | 1.50x | 1.49x | 1.32x | 1.10x | 1.15x |
+| down | 1.54x | 1.49x | 1.28x | 1.06x | 1.19x |
+
+The weight bytes are 1.47x, and decode at M <= 8 tracks that ratio because it is bandwidth-bound. For
+comparison, int5 was 1.20-1.26x int4 there, at 1.235x the bytes.
+
+- **Compile** (this tree): 86 E6 instantiations (80 decode, 4 folded, 2 A-tiled). 82 have no spill, at
+  most 242 VGPR. The four `decode<BK=128, KS=2|4, TM=8>` cells spill exactly as their E2M1 twins do, and
+  are reachable only with `DECODE_MAX_M >= 113` (the launcher default is 64). The 142 E2M1 kernels are
+  ISA-identical to before.
+- **`test_mxfp6_loader.py`, 27 runs** (6 module families x TP=1 / TP=2 rank 0 / rank 1, and 9 more at
+  ragged M, on layers 62-63 and on the base checkpoint; M up to 4096):
+  - Kernel vs the fp32 reference: 0.0101-0.0179, which is the e4m3 activation quantization.
+  - CHECKALL: 0.00166-0.00183.
+  - Single launch vs per-partition: <= 2.8e-5.
+- **In-serve CHECKALL, TP=1 eager** (the Swift RTN build, second rig, outside this tree's entry points,
+  which refuse TP=1 for MXFP6): 0.00088-0.00194 on served traffic, and 0.00207 on a warmup batch.
+- **In-serve CHECKALL, TP=2 eager, both ranks** (the Swift RTN build, second rig, `CHECK_MAX_M=128`):
+  - Each rank logged 162 real lines: 36 warmup and 126 served, M 1..69, with no zero-input lines.
+  - 323 of the 324 lines are <= 0.0021. The one outlier is a served line (rank 0, `down`, M=15).
+
+| shape, per rank (N:K) | P | worst rank 0 | worst rank 1 |
+|---|--:|---|---|
+| qkv 7168:5120 | 3 | 0.00180 / 0.00173 / 0.00177 | 0.00176 / 0.00174 / 0.00169 |
+| o_proj + out_proj 5120:3072 | 1 | 0.00192 | 0.00197 |
+| gate_up 17408:5120 | 2 | 0.00169 / 0.00170 | 0.00167 / 0.00169 |
+| down 5120:8704 | 1 | **0.00232** | 0.00191 |
+| in_proj_qkvz 8192:5120 | 2 | 0.00185 / 0.00172 | 0.00177 / 0.00171 |
+
+Served M reached 69, so the folded band above that and the A-tiled band (M >= 513) are not covered
+in-serve. The kernel log shows one soft `MES failed to respond to msg=INVALIDATE_TLBS` during KV
+profiling, with no reset, and serving then ran clean.
+
+**Served, on a second 2 x R9700 rig (not `run_paroquant.sh`).** Setup:
+- **Image:** the rig's build of radiance 0.13.0 at 3368c48, which carries local patches (among them a
+  class-level rotation-stream binding this tree does not have) and an aiter pre-bake, plus this series'
+  kernel and loader in their pre-trim form.
+- **Serve:** the rig's own `vllm serve` command. TP=2, R4D, fp8 KV, prefix caching, max-model-len 262144,
+  mns 8, batched 8240, util 0.96, `--kv-cache-memory=12500000000` (13.5e9 for the base FT build),
+  DFlash2-FP8 K=7, `FULL_AND_PIECEWISE`, `--no-async-scheduling`, `RADIANCE_VERIFY_HEAD=1`. The MXFP4
+  kernel knobs are at `run_paroquant.sh`'s defaults (WPERM=1, DECODE_MAX_M=64, DECODE_NT=1,
+  A_TILED_MIN_M=513, TN4_MIN_M=2048).
+- **Chat template:** froggeric family v22.5 with a one-line local edit to the xhigh instruction, at
+  `reasoning_effort=xhigh`. This is not `qwen-fixed-v22.3.jinja`.
+- **Checkpoints:** MXFP6 RTN and stage-2 FT builds of both `ukisai/Swift-Qwen3.8-27b` and the
+  Qwen3.8-27B base.
+- **int5 comparators:** the rig's recorded Swift int5 RTN / FT runs from 2026-09-15. They used the same
+  serve apart from the chat template [1] and the same image without the MXFP6 additions, but a KV pin
+  of 15e9 and I8 + PG + ZPE activations.
+- **Noise:** one boot per arm for the three 2026-09-16 builds. Each was healthy on the first try (engine
+  init ~150 s, compile 71-74 s), and every BetterBench lane finished 24/24 with 0 engine deaths and 0
+  INVALIDATE_TLBS / MODE1 lines. The base FT build's lanes (2026-09-17) span two boots: the first engine
+  hung within ~10 s of entering c4 in the second fixed-prompt pass and the host then froze, with no
+  amdgpu lines in the kernel log, so that pass and the rest of its lanes ran on a second boot with the
+  same command. The only between-boot yardstick is one recorded int5 pair: single stream 2.2%, prefill
+  0.1-0.3%, c1 / c2 / c4 / c8 0.7 / 2.1 / 2.4 / 10.0%.
+
+| second rig, TP=2, SPEC=7 | GSM8K flex / strict | wikitext-2 PPL | single stream t/s | acc/draft | c1 / c2 / c4 / c8 t/s | prefill @2k / 8k / 16k / 32k / 60k | KV tokens (pin) | weights / rank |
+|---|---|---|--:|--:|---|---|---|---|
+| int5 RTN, Swift (recorded) | 97.0 / 93.5 | -- | 160.2 [1] | 3.002 [1] | 149.3 / 235.2 / 356.3 / 447.3 [1] | 3026 / 3226 / 3168 / 3066 / 2962 | 762,413 (15e9) | 11.73 GiB |
+| int5 FT, Swift (recorded) | 96.2 / 93.3 | -- | 160.7 [1] | 2.943 [1] | 136.9 / 252.6 / 370.9 / 427.3 [1] | 3027 / 3222 / 3166 / 3073 / 2965 | 762,413 (15e9) | 11.73 GiB |
+| **MXFP6 RTN, Swift** | 96.7 / 95.5 | 7.0892 | 139.9 | 2.910 | 121.7 / 200.7 / 320.5 / 397.7 | 3338 / 3632 / 3575 / 3479 / 3352 | 634,772 (12.5e9) | 12.85 GiB |
+| **MXFP6 FT, Swift** | 96.7 / 95.9 | 7.0826 | 138.0 | 2.983 | 124.7 / 209.6 / 321.6 / 394.0 | 3327 / 3628 / 3570 / 3479 / 3348 | 634,772 (12.5e9) | 12.85 GiB |
+| **MXFP6 RTN, base** | not run | 7.0449 | 141.5 | 2.949 | 120.2 / 212.8 / 307.9 / 400.2 | 3338 / 3634 / 3583 / 3480 / 3354 | 634,772 (12.5e9) | 12.85 GiB |
+| **MXFP6 FT, base** | 97.5 / 96.6 | 7.0344 | 135.7 | 2.923 | 122.2 / 213.9 / 328.4 / 401.6 | 3312 / 3599 / 3555 / 3453 / 3333 | 685,554 (13.5e9) | 12.85 GiB |
+
+[1] These int5 boots served the checkpoint's bundled chat template, because the rig's serve had
+dropped its template flags. Decode speed and acceptance depend on the generated text, so those columns
+carry a template confound against the MXFP6 rows. Prefill does not. The int5 GSM8K runs came later, on
+the MXFP6 template.
+
+**How each column was measured:**
+- **GSM8K:** lm-eval `gsm8k`, 5-shot multi-turn through `/v1/chat/completions`, the first 500 test
+  questions, greedy, `max_gen_toks` 1024. Two repeats with different few-shot seeds; the table gives the
+  means.
+  - MXFP6 RTN, Swift repeats: flex 96.4 / 97.0, strict 95.2 / 95.8.
+  - MXFP6 FT, Swift repeats: flex 96.6 / 96.8, strict 96.0 / 95.8.
+  - MXFP6 FT, base repeats: flex 97.2 / 97.8, strict 96.8 / 96.4.
+- **Perplexity:** the full wikitext-2-raw-v1 test split, rows joined with `\n\n` and tokenized by the
+  server. Non-overlapping 2048-token chunks: 145 chunks, 296,815 scored tokens, and an identical token
+  hash on all four builds. Token-ID prompts go to `/v1/completions` with `prompt_logprobs`, so there is
+  no template. The serve was TP=1 eager on the second rig (outside this tree's entry points), with no spec
+  decode, fp8 KV and `RADIANCE_VERIFY_HEAD=0`.
+- **Speed:** BetterBench on the weighted 8-category mix, greedy. Concurrency is 24 requests per level,
+  the mean of two fixed-prompt passes. Prefill is 8 runs per depth with 16 output tokens.
+
+**Paired perplexity**, per chunk, recomputed from the per-chunk nll (the token-weighted Δ equals the chunk
+mean to 5 decimals):
+
+| a - b | Δnll | paired se | t | a better / worse (of 145) | ppl a / b |
+|---|--:|--:|--:|--:|---|
+| Swift FT - Swift RTN | -0.00092 | 0.00074 | -1.24 | 76 / 69 | 7.0826 / 7.0892 |
+| base FT - base RTN | -0.00149 | 0.00088 | -1.70 | 82 / 63 | 7.0344 / 7.0449 |
+| Swift RTN - base RTN | +0.00626 | 0.00080 | +7.84 | 19 / 126 | 7.0892 / 7.0449 |
+| Swift FT - base RTN | +0.00533 | 0.00083 | +6.43 | 33 / 112 | 7.0826 / 7.0449 |
+
+**What it shows:**
+- **Prefill is +9-13% over int5** at every depth, against a 0.1-0.3% boot spread.
+- **For the Swift builds, single stream is -12 to -14%, and c4 is -10 to -13% like-for-like**, against 2.2% and 2.4% spreads.
+  The recorded comparators are template-confounded [1], but against int5 served on the MXFP6 template
+  (2026-09-17), single stream still trails by 9.3% (base FT against Launch80's int5, same day) and 13.8%
+  (Swift FT against Swift int5 FT, cross-day). The kernel's 1.28-1.54x at decode points the same way.
+- **KV:** 19,692 B per token at 12.5e9 against 19,674 at 15e9, so the bytes per token match and the
+  pool difference is the pin. The weights are +1.12 GiB per rank. At an equal memory budget that is
+  about 61k tokens (arithmetic, not measured).
+- **GSM8K:** flexible is 96.7 on both Swift MXFP6 builds against int5's 96.2-97.0 on the same template,
+  inside the repeat spread (up to 1.2 pp). Strict is +2.0-2.6 pp, but strict swung 2.6 pp between
+  repeats of one int5 serve, so it measures formatting.
+- **Fidelity (2026-09-17, FT builds only):** KL(bf16 || model) against each family's own bf16, top-256,
+  96 x 500-char wikitext-2 chunks, both sides served eager on the same image: base FT 0.0091 against
+  0.0106 for Launch80's int5 and 0.0423 for Launch80's MXFP4-PARO (top-1 95.28 / 95.13 / 90.59%), Swift
+  FT 0.0117 against 0.0126 for Swift int5 FT. The MXFP6-vs-int5 gaps are inside the ~0.005-nat
+  implementation noise, and MMLU 5-shot (82.4 vs 82.1, 95% half-width 0.6) and HumanEval (96.3 vs 97.0)
+  do not separate base FT from int5 either.
+- **Not resolvable at one boot per arm:** c1 (~23% spread within one boot), c8 (10% between boots), and
+  any speed difference between the MXFP6 builds.
+- **The stage-2 fine-tune gave no measurable gain over RTN.** Setup (the Swift run; the base run used
+  the same recipe): 256 samples x 2 epochs, rotations frozen, 64 layers at ~315 s/layer on one R9700,
+  and a mean best validation loss 1.9% below the starting loss. The calibration mix includes
+  wikitext-2's train split. Even so, FT - RTN is t = -1.24 (Swift) and -1.70 (base) on perplexity, and
+  Swift GSM8K flexible is identical. For int5, stage 2 at 512 samples was worth 7-14% of served KL
+  (2026-09-11). KL was not collected for the RTN builds, so a KL gain is not ruled out.
+- **Base vs Swift:** the base builds' lower perplexity is a difference in the weights, not in the
+  quantization.
+
+**Traps:**
+- (1) **`RADIANCE_VERIFY_HEAD=1` does not survive `prompt_logprobs`.** A perplexity request hung the
+  engine for ~10 min, then it died with triton `OutOfResources`. With the verify head off, the same run
+  is clean. This was seen at TP=1, and it is not MXFP6-specific: boot perplexity and KL servers with
+  `RADIANCE_VERIFY_HEAD=0`.
+- (2) **The fine-tune's convert writes one 23.4 GiB safetensors file.** Loading it takes more host
+  memory than the 18-shard RTN builds: a container capped at 14 GiB was OOM-killed at load, while the
+  sharded builds loaded under the same cap.
+
+**Next:**
+- **The upstream-comparable run:** `run_paroquant.sh MODE=eval` CHECKALL on both TP=2 ranks, then
+  `MODE=prod SPEC=7` with the default v22.3 template. That gives ms/step at ctx 25 / 8k / 32k, prefill
+  2k-64k, KV at the launcher's `GPU_UTIL`, and GSM8K.
+- **Fidelity:** KL / top-1 against the same-stack bf16 reference, for the RTN builds.
+- **GSM8K on the base RTN build**, and a second boot of any build.
