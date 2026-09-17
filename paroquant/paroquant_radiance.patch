@@ -1,5 +1,5 @@
 diff --git a/paroquant/cli/convert.py b/paroquant/cli/convert.py
-index 8055cec..f9edbbc 100644
+index 8055cec..0c91147 100644
 --- a/paroquant/cli/convert.py
 +++ b/paroquant/cli/convert.py
 @@ -15,6 +15,8 @@ from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
@@ -11,7 +11,16 @@ index 8055cec..f9edbbc 100644
  
  _AWQ_REORDER = (0, 2, 4, 6, 1, 3, 5, 7)
  _LAYER_PATHS = ["model.layers", "model.language_model.layers", "language_model.layers"]
-@@ -191,6 +193,29 @@ def _quantize_rotated_weight(
+@@ -101,6 +103,8 @@ def _write_config_json(
+ 
+     if quant_config is not None:
+         config["quantization_config"] = quant_config
++    if quant_format() == "mxfp6":
++        config.pop("torch_dtype", None)
+ 
+     output_cfg.write_text(json.dumps(config, indent=2) + "\n")
+ 
+@@ -191,6 +195,33 @@ def _quantize_rotated_weight(
      return quantized, scales_2d, zeros_2d
  
  
@@ -30,7 +39,11 @@ index 8055cec..f9edbbc 100644
 +    a different weight than the one that was calibrated.
 +    """
 +    from paroquant.kernels.cuda import scaled_pairwise_rotation
-+    from paroquant.optim.mxfp4 import quantize_to_codes
++
++    if quant_format() == "mxfp6":
++        from paroquant.optim.mxfp6 import quantize_to_codes
++    else:
++        from paroquant.optim.mxfp4 import quantize_to_codes
 +
 +    if channel_scales.ndim == 1:
 +        channel_scales = channel_scales.unsqueeze(0)
@@ -41,7 +54,7 @@ index 8055cec..f9edbbc 100644
  def _to_awq_buffers(
      quantized: torch.Tensor,
      scales_2d: torch.Tensor,
-@@ -236,6 +261,31 @@ def _convert_pseudo(model: torch.nn.Module, result_dir: Path) -> int:
+@@ -236,6 +267,39 @@ def _convert_pseudo(model: torch.nn.Module, result_dir: Path) -> int:
      return count
  
  
@@ -70,15 +83,23 @@ index 8055cec..f9edbbc 100644
 +            self.bias = None
 +
 +
++class _MXFP6BufferHolder(_MXFP4BufferHolder):
++    def __init__(self, in_features: int, out_features: int, bias: bool, krot: int):
++        super().__init__(in_features, out_features, bias, krot)
++        assert in_features % 4 == 0, in_features
++        self.register_buffer("weight", torch.zeros(out_features, 3 * in_features // 4,
++                                                   dtype=torch.uint8))
++
++
  @torch.no_grad()
  def _quantize_layer(state_dict: dict, device: str) -> tuple[dict[str, torch.Tensor], int, int, int]:
      weight = state_dict["weight"].to(device=device, dtype=torch.float32)
-@@ -247,7 +297,38 @@ def _quantize_layer(state_dict: dict, device: str) -> tuple[dict[str, torch.Tens
+@@ -247,7 +311,38 @@ def _quantize_layer(state_dict: dict, device: str) -> tuple[dict[str, torch.Tens
      theta = _stack_if_numbered(state_dict, "angles_grouped").to(device=device, dtype=torch.float32)
  
      channel_scales_opt = state_dict["channel_scales"].to(device=device, dtype=torch.float32)
 +
-+    if quant_format() == "mxfp4":
++    if quant_format() in ("mxfp4", "mxfp6"):
 +        exp_bias = state_dict.get("quantizer.exp_bias")
 +        if exp_bias is not None:
 +            exp_bias = exp_bias.to(device=device, dtype=torch.float32)
@@ -112,18 +133,19 @@ index 8055cec..f9edbbc 100644
      zp_flat = state_dict["quantizer.zero_point_float"].to(device=device, dtype=torch.float32).reshape(-1, 1)
      quantized, scales_2d, zeros_2d = _quantize_rotated_weight(
          weight=weight,
-@@ -410,7 +491,9 @@ def _convert_real(
+@@ -409,8 +504,10 @@ def _inject_quantized_moe_state_dict(
+ def _convert_real(
      model: torch.nn.Module,
      result_dir: Path,
  ) -> tuple[int, dict[str, Any] | None, dict[str, torch.Tensor]]:
 -    from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
-+    if quant_format() != "mxfp4":
++    if quant_format() not in ("mxfp4", "mxfp6"):
 +        # imports autoawq's GEMM at module scope; irrelevant (and absent) for MXFP4
 +        from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
  
      blocks = _get_blocks(model)
      count = 0
-@@ -426,15 +509,26 @@ def _convert_real(
+@@ -426,15 +523,27 @@ def _convert_real(
              sd = torch.load(pt_file, map_location="cpu", weights_only=False)
              buffers, bits, group_size, krot = _quantize_layer(sd, device="cuda")
  
@@ -136,8 +158,9 @@ index 8055cec..f9edbbc 100644
 -                krot=krot,
 -            )
 -            rl.load_state_dict(buffers, strict=False)
-+            if quant_format() == "mxfp4":
-+                rl = _MXFP4BufferHolder(
++            if quant_format() in ("mxfp4", "mxfp6"):
++                holder_cls = _MXFP6BufferHolder if quant_format() == "mxfp6" else _MXFP4BufferHolder
++                rl = holder_cls(
 +                    module.in_features,
 +                    module.out_features,
 +                    bias=module.bias is not None,
@@ -159,7 +182,7 @@ index 8055cec..f9edbbc 100644
              set_module_by_name(layer, name, rl)
              count += 1
  
-@@ -455,7 +549,11 @@ def _convert_real(
+@@ -455,11 +564,16 @@ def _convert_real(
          torch.cuda.empty_cache()
  
      quant_config = {
@@ -167,12 +190,19 @@ index 8055cec..f9edbbc 100644
 +        # A distinct method name rather than a "format" discriminator inside "paroquant": the
 +        # buffers are completely different (packed e2m1 + e8m0 vs AWQ int4), so the shipped
 +        # int4 serving path should not have to branch at load time.
-+        "quant_method": "paroquant_mxfp4" if quant_format() == "mxfp4" else "paroquant",
-+        "format": quant_format(),
++        "quant_method": ("paroquant_mxfp6" if quant_format() == "mxfp6" else
++                         "paroquant_mxfp4" if quant_format() == "mxfp4" else "paroquant"),
++        "format": "mxfp6_e2m3" if quant_format() == "mxfp6" else quant_format(),
          "bits": bits,
          "group_size": group_size,
          "krot": krot,
-@@ -481,7 +579,10 @@ def main() -> None:
+     }
+     state_dict = _inject_quantized_moe_state_dict(model.state_dict(), moe_entries)
+     return count, quant_config, state_dict
+ 
+@@ -479,31 +593,34 @@ def main() -> None:
+     result_dir = Path(args.result_dir)
+     if not result_dir.is_dir():
          raise FileNotFoundError(f"Result directory not found: {result_dir}")
  
      source_dir = _resolve_source_dir(args.model)
@@ -184,6 +214,28 @@ index 8055cec..f9edbbc 100644
  
      quant_config: dict[str, Any] | None = None
      save_state_dict: dict[str, torch.Tensor] | None = None
+     if args.mode == "pseudo":
+         count = _convert_pseudo(model, result_dir)
+     else:
+         count, quant_config, save_state_dict = _convert_real(model, result_dir)
+         model.config.quantization_config = quant_config
+ 
+     if count == 0:
+         raise RuntimeError(f"No checkpoint files matched in {result_dir}")
+ 
+     output_path = Path(args.output_path)
+     source_non_md = _copy_source_non_md_files(source_dir, output_path)
+     _remove_safetensor_files(output_path)
+ 
+     model.save_pretrained(output_path, safe_serialization=True, state_dict=save_state_dict)
+ 
+     # Restore original non-MD assets in case save_pretrained overwrote any.
+     source_non_md = _copy_source_non_md_files(source_dir, output_path)
+     _prune_non_md_extras(output_path, source_non_md)
+     _write_config_json(source_dir, output_path, quant_config)
+ 
+     if not any(_is_safetensor_related(p) for p in output_path.rglob("*") if p.is_file()):
+         raise RuntimeError("No safetensors artifacts were generated.")
 diff --git a/paroquant/cli/optimize.py b/paroquant/cli/optimize.py
 index 9469078..51803e7 100644
 --- a/paroquant/cli/optimize.py
@@ -799,7 +851,7 @@ index 0000000..1b4d9ef
 +    scale = torch.exp2(e8m0.float() - 127.0)
 +    return (val.reshape(out_f, -1, BLOCK) * scale.unsqueeze(-1)).reshape(out_f, in_f)
 diff --git a/paroquant/optim/qlinear.py b/paroquant/optim/qlinear.py
-index 384b66e..85be61d 100644
+index 384b66e..3b5bb04 100644
 --- a/paroquant/optim/qlinear.py
 +++ b/paroquant/optim/qlinear.py
 @@ -5,6 +5,7 @@ from torch import nn
@@ -810,7 +862,7 @@ index 384b66e..85be61d 100644
  from .quantizer import UniformAffineQuantizer
  
  from paroquant.kernels.cuda import scaled_pairwise_rotation
-@@ -153,7 +154,13 @@ class PseudoQuantizedLinear(nn.Module):
+@@ -153,7 +154,17 @@ class PseudoQuantizedLinear(nn.Module):
                      self.group_size,
                  )
  
@@ -819,13 +871,17 @@ index 384b66e..85be61d 100644
 +                from .mxfp4 import MXFP4Quantizer
 +
 +                quantizer_cls = MXFP4Quantizer
++            elif quant_format() == "mxfp6":
++                from .mxfp6 import MXFP6Quantizer
++
++                quantizer_cls = MXFP6Quantizer
 +            else:
 +                quantizer_cls = UniformAffineQuantizer
 +            self.quantizer = quantizer_cls(
                  weight,
                  n_bits=self.n_bits,
                  group_size=self.group_size,
-@@ -214,8 +221,10 @@ class PseudoQuantizedLinear(nn.Module):
+@@ -214,8 +225,10 @@ class PseudoQuantizedLinear(nn.Module):
              num_rotations=num_rotations,
          )
  
@@ -839,7 +895,7 @@ index 384b66e..85be61d 100644
  
          qlinear.load_state_dict(state_dict)
 diff --git a/paroquant/optim/quant.py b/paroquant/optim/quant.py
-index 4dea8dd..5a8022a 100644
+index 4dea8dd..7238461 100644
 --- a/paroquant/optim/quant.py
 +++ b/paroquant/optim/quant.py
 @@ -1,5 +1,7 @@
@@ -889,11 +945,11 @@ index 4dea8dd..5a8022a 100644
 +    `paroquant.cli.convert` cannot disagree about the grid the codes were trained on.
 +    """
 +    fmt = os.environ.get("PARO_QUANT_FORMAT", "int").lower()
-+    if fmt not in ("int", "mxfp4"):
-+        raise ValueError(f"PARO_QUANT_FORMAT must be 'int' or 'mxfp4', got {fmt!r}")
++    if fmt not in ("int", "mxfp4", "mxfp6"):
++        raise ValueError(f"PARO_QUANT_FORMAT must be 'int', 'mxfp4' or 'mxfp6', got {fmt!r}")
 +    return fmt
 diff --git a/paroquant/optim/quantizer.py b/paroquant/optim/quantizer.py
-index 89d83b4..b1a9ac8 100644
+index 89d83b4..3fc8f72 100644
 --- a/paroquant/optim/quantizer.py
 +++ b/paroquant/optim/quantizer.py
 @@ -4,7 +4,7 @@ import torch
@@ -905,7 +961,7 @@ index 89d83b4..b1a9ac8 100644
  
  
  def _calc_scales_and_zero_points(
-@@ -96,11 +96,21 @@ class UniformAffineQuantizer(nn.Module):
+@@ -96,11 +96,25 @@ class UniformAffineQuantizer(nn.Module):
              x = x.float()
          assert torch.isnan(x).sum() == 0, x
  
@@ -916,6 +972,10 @@ index 89d83b4..b1a9ac8 100644
 +            from .mxfp4 import mxfp4_fake_quant
 +
 +            return mxfp4_fake_quant(x).to(dtype)
++        if quant_format() == "mxfp6":
++            from .mxfp6 import mxfp6_fake_quant
++
++            return mxfp6_fake_quant(x).to(dtype)
 +
          qmin, qmax = 0, 2**n_bits - 1
          if scale is None or zero_point is None:

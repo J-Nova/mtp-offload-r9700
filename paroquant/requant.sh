@@ -41,16 +41,19 @@ SRC=${SRC:-$HOME/paroquant-src}
 MODELS=${MODELS:-$HOME/models}
 IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
 BASE=${BASE:-Qwen3.8-27B-bf16}
-OUT=${OUT:-Qwen3.8-27B-PARO-MXFP4}
+FORMAT=${FORMAT:-mxfp4}          # mxfp4 | mxfp6 | int
+if [ "$FORMAT" = mxfp6 ]; then MX6=1; else MX6=0; fi
+if [ "$MX6" = 1 ]; then OUT=${OUT:-Qwen3.8-27B-PARO-MXFP6-FT}; else OUT=${OUT:-Qwen3.8-27B-PARO-MXFP4}; fi
 RESULTS=${RESULTS:-$HOME/paroquant-out}
 CACHE=${CACHE:-$HOME/.cache/paroquant}
 # The calibration sets (wikitext2, one C4 shard, the RedPajama *sample*, pileval -- ~8 GiB
 # total, not the full corpora) are fetched on first run, so this cannot be offline. Set
 # HF_OFFLINE=1 once they are cached.
-FORMAT=${FORMAT:-mxfp4}          # mxfp4 | int
-NBIT=${NBIT:-4}                  # weight bits for FORMAT=int (5 = the W5A8 grid; the serving kernel takes 4 or 5)
+# weight bits for FORMAT=int (5 = the W5A8 grid; the serving kernel takes 4 or 5); 6 for FORMAT=mxfp6
+if [ "$MX6" = 1 ]; then NBIT=${NBIT:-6}; else NBIT=${NBIT:-4}; fi
 POW2=${POW2:-1}                  # only meaningful when FORMAT=int
-SCALE_RULE=${SCALE_RULE:-ocp}    # mxfp4 shared exponent: ocp (AMD-compatible) | noclip
+# mxfp4 shared exponent: ocp (AMD-compatible) | noclip; mxfp6: even (default) | ocp | mse2
+if [ "$MX6" = 1 ]; then SCALE_RULE=${SCALE_RULE:-even}; else SCALE_RULE=${SCALE_RULE:-ocp}; fi
 
 # Calibration size. 512 fits the swap budget above; the upstream 27B recipe uses 2048 and the
 # 70B one 1024. Raise it (and the swapfile) if the accuracy gate lands just below band -- that
@@ -70,12 +73,18 @@ WEIGHT_LR=${WEIGHT_LR:-1e-5}
 QUANT_LR=${QUANT_LR:-1e-6}
 STAGE=${STAGE:-all}              # all | optimize | finetune | pseudo | convert
 # finetune: rotations + channel scales come from a TRAINED checkpoint and are frozen; only the
-# weights and the per-block exponent bias are optimized under the MXFP4 grid. This is the
-# path that matters on this box -- see build_hybrid.py for why from-scratch rotations are dead.
+# weights and the per-block exponent bias are optimized under the MXFP4 grid (E2M3 for
+# FORMAT=mxfp6). This is the path that matters on this box -- see build_hybrid.py for why
+# from-scratch rotations are dead.
 INIT_ROTATIONS=${INIT_ROTATIONS:-Qwen3.8-27B-PARO/model.safetensors}   # under $MODELS
 FT_EPOCHS=${FT_EPOCHS:-2}
-FT_RESULTS=${FT_RESULTS:-$HOME/paroquant-out-ft}    # NOT the from-scratch dir: resume would reuse dead layers
-PSEUDO_OUT=${PSEUDO_OUT:-Qwen3.8-27B-PARO-MXFP4-pseudo}
+if [ "$MX6" = 1 ]; then
+  FT_RESULTS=${FT_RESULTS:-$HOME/paroquant-out-ft-mxfp6}
+  PSEUDO_OUT=${PSEUDO_OUT:-Qwen3.8-27B-PARO-MXFP6-FT-pseudo}
+else
+  FT_RESULTS=${FT_RESULTS:-$HOME/paroquant-out-ft}    # NOT the from-scratch dir: resume would reuse dead layers
+  PSEUDO_OUT=${PSEUDO_OUT:-Qwen3.8-27B-PARO-MXFP4-pseudo}
+fi
 
 [ -d "$MODELS/$BASE" ] || { echo "base model missing at $MODELS/$BASE" >&2; exit 1; }
 [ -d "$SRC/paroquant" ] || { echo "paroquant source missing at $SRC" >&2; exit 1; }
@@ -96,6 +105,12 @@ for _try in 1 2 3 4 5 6; do used=$(vram_used_mib 0); [ "${used:-0}" -le 4000 ] &
 if [ "${used:-0}" -gt 4000 ] && [ "${FORCE:-0}" != 1 ]; then
   echo "GPU 0 still has ${used} MiB in use after 60 s (another server? check podman ps / systemctl --user); FORCE=1 to override" >&2; exit 1; fi
 
+if [ "$MX6" = 1 ]; then
+  GRID_ENV=(-e PARO_MXFP6_SCALE_RULE="$SCALE_RULE")
+else
+  GRID_ENV=(-e PARO_MXFP4_SCALE_RULE="$SCALE_RULE")
+fi
+
 run() {
   # --privileged and --ipc=host are load-bearing: without them a side HIP container faults on
   # the first GPU allocation ("Memory critical error ... Reason: Memory in use") even for a
@@ -107,7 +122,7 @@ run() {
     -e HIP_VISIBLE_DEVICES=0 -e PYTORCH_ROCM_ARCH=gfx1201 \
     -e PYTHONPATH=/src:/src/.pydeps \
     -e PARO_QUANT_FORMAT="$FORMAT" \
-    -e PARO_MXFP4_SCALE_RULE="$SCALE_RULE" \
+    "${GRID_ENV[@]}" \
     -e PARO_POW2_SCALES="$POW2" \
     -e PARO_INIT_ROTATIONS="${PARO_INIT_ROTATIONS:-}" \
     -e HF_HUB_OFFLINE="${HF_OFFLINE:-0}" -e HF_HOME=/root/.cache/huggingface \
