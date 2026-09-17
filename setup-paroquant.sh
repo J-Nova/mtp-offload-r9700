@@ -30,10 +30,11 @@ for a in "$@"; do
   case "$a" in
     -h|--help)
       cat <<'USAGE'
-setup-paroquant.sh -- one-time setup for the ParoQuant W4A8 / W5A8 serve
+setup-paroquant.sh -- one-time setup for the ParoQuant W4A8 / W5A8 / W6A8 serve
 
   ./setup-paroquant.sh              run every step that is not already done (int4)
   ./setup-paroquant.sh --int5       fetch the int5 W5A8 checkpoint instead
+  ./setup-paroquant.sh --mxfp6      fetch (or validate a local build of) the MXFP6 W6A8 checkpoint
   ./setup-paroquant.sh --yes        don't ask before downloading (~21 GiB)
   ./setup-paroquant.sh --no-drafter skip the DFlash2 drafter (then serve with MODE=eval)
 
@@ -53,10 +54,12 @@ USAGE
     --no-drafter)  WANT_DRAFTER=0 ;;
     --int5|int5)   QUANT=int5 ;;
     --int4|int4)   QUANT=int4 ;;
+    --mxfp6|mxfp6) QUANT=mxfp6 ;;
     *) echo "unknown argument: $a (try --help)" >&2; exit 2 ;;
   esac
 done
 
+WANT_METHOD=paroquant
 case "$QUANT" in
   int4) SRC_REPO=${SRC_REPO:-z-lab/Qwen3.8-27B-PARO}
         SNAP=${SNAP:-$MODELS/Qwen3.8-27B-PARO}
@@ -64,7 +67,10 @@ case "$QUANT" in
   int5) SRC_REPO=${SRC_REPO:-Launch80/Qwen3.8-27B-PARO-int5}
         SNAP=${SNAP:-$MODELS/Qwen3.8-27B-PARO-int5}
         WANT_BITS=5; DL_SIZE="~21 GiB" ;;
-  *) echo "unknown QUANT=$QUANT (want int4 or int5)" >&2; exit 2 ;;
+  mxfp6) SRC_REPO=${SRC_REPO:-hugypufy/Qwen3.8-27B-PARO-MXFP6}
+         SNAP=${SNAP:-$MODELS/Qwen3.8-27B-PARO-MXFP6}
+         WANT_BITS=6; DL_SIZE="~24 GiB"; WANT_METHOD=paroquant_mxfp6 ;;
+  *) echo "unknown QUANT=$QUANT (want int4, int5 or mxfp6)" >&2; exit 2 ;;
 esac
 
 step() { echo; echo "=== $* ==="; }
@@ -99,6 +105,7 @@ else
     echo "  (skipped as too small:$RAD_GPU_SKIPPED)"
   fi
 fi
+if [ "$QUANT" = mxfp6 ]; then rad_require_tp2 MXFP6-PARO || exit 2; fi
 
 command -v git >/dev/null 2>&1 || die "git is required (the libr4d build clones it)"
 
@@ -164,14 +171,14 @@ fi
 # The kernels are built for exactly this shape: group 128 is baked into the slab structure, and
 # the prologue's rotation table is sized for krot <= 8. Fail here with the reason rather than at
 # model load with an assertion, or worse, at the first token.
-python3 - "$SNAP/config.json" "$WANT_BITS" <<'PY' || die "checkpoint is not servable by this stack" \
-    "the radiance ParoQuant kernels are built for quant_method=paroquant, bits=$WANT_BITS, group_size=128, krot<=8"
+python3 - "$SNAP/config.json" "$WANT_BITS" "$WANT_METHOD" <<'PY' || die "checkpoint is not servable by this stack" \
+    "the radiance ParoQuant kernels are built for quant_method=$WANT_METHOD, bits=$WANT_BITS, group_size=128, krot<=8"
 import json, sys
 q = (json.load(open(sys.argv[1])).get("quantization_config") or {})
 m, b, g, k = q.get("quant_method"), q.get("bits"), q.get("group_size"), q.get("krot")
 print(f"  quantization_config: quant_method={m} bits={b} group_size={g} krot={k}")
 want_bits = int(sys.argv[2])
-bad = [n for n, v, want in (("quant_method", m, "paroquant"), ("bits", b, want_bits), ("group_size", g, 128))
+bad = [n for n, v, want in (("quant_method", m, sys.argv[3]), ("bits", b, want_bits), ("group_size", g, 128))
        if v != want]
 if not isinstance(k, int) or not 1 <= k <= 8:
     bad.append("krot")

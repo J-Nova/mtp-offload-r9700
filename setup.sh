@@ -11,6 +11,7 @@
 #   ./setup.sh                          # default: MXFP4 (quark_mxfp4)
 #   ./setup.sh --int4                   # ParoQuant int4 W4A8 (z-lab)
 #   ./setup.sh --int5                   # ParoQuant int5 W5A8 (Launch80, ~21 GiB)
+#   ./setup.sh --mxfp6                  # ParoQuant MXFP6 W6A8 (hugypufy, ~24 GiB)
 #   ./setup.sh --no-drafter             # skip the drafter (then --mtp-mode)
 #
 # Environment:
@@ -31,6 +32,7 @@ for a in "$@"; do
     --int4)         QUANT=int4 ;;
     --int5)         QUANT=int5 ;;
     --mxfp4)        QUANT=mxfp4 ;;
+    --mxfp6)        QUANT=mxfp6 ;;
     --no-drafter)   WANT_DRAFTER=0 ;;
     --yes|-y)       ASSUME_YES=1 ;;
     -h|--help)
@@ -56,7 +58,12 @@ case "$QUANT" in
   int5)  SRC_REPO=${SRC_REPO:-Launch80/Qwen3.8-27B-PARO-int5}
          SNAP=${SNAP:-$MODELS/Qwen3.8-27B-PARO-int5}
          NEED_BUILD=0 ; SIZE="~21 GiB" ;;
-  *) echo "unknown QUANT=$QUANT (--mxfp4 / --int4 / --int5)" >&2; exit 2 ;;
+  mxfp6) SRC_REPO=${SRC_REPO:-hugypufy/Qwen3.8-27B-PARO-MXFP6}
+         SNAP=${SNAP:-$MODELS/Qwen3.8-27B-PARO-MXFP6}
+         NEED_BUILD=0 ; SIZE="~24 GiB"
+         . "$(dirname "$0")/gpu-detect.sh"
+         rad_require_tp2 MXFP6-PARO || exit 2 ;;
+  *) echo "unknown QUANT=$QUANT (--mxfp4 / --int4 / --int5 / --mxfp6)" >&2; exit 2 ;;
 esac
 
 step() { echo; echo "=== $* ==="; }
@@ -153,18 +160,20 @@ else
     ok "downloaded: $SNAP"
   fi
   # ParoQuant: validate the bits/group_size/krot contract before serving.
+  WANT_METHOD=paroquant
   case "$QUANT" in
     int4) WANT_BITS=4 ;;
     int5) WANT_BITS=5 ;;
+    mxfp6) WANT_BITS=6; WANT_METHOD=paroquant_mxfp6 ;;
   esac
-  python3 - "$SNAP/config.json" "$WANT_BITS" <<'PY' || die "checkpoint is not servable by this stack" \
-      "the radiance ParoQuant kernels are built for quant_method=paroquant, bits=$WANT_BITS, group_size=128, krot<=8"
+  python3 - "$SNAP/config.json" "$WANT_BITS" "$WANT_METHOD" <<'PY' || die "checkpoint is not servable by this stack" \
+      "the radiance ParoQuant kernels are built for quant_method=$WANT_METHOD, bits=$WANT_BITS, group_size=128, krot<=8"
 import json, sys
 q = (json.load(open(sys.argv[1])).get("quantization_config") or {})
 m, b, g, k = q.get("quant_method"), q.get("bits"), q.get("group_size"), q.get("krot")
 print(f"  quantization_config: quant_method={m} bits={b} group_size={g} krot={k}")
 want_bits = int(sys.argv[2])
-bad = [n for n, v, want in (("quant_method", m, "paroquant"), ("bits", b, want_bits),
+bad = [n for n, v, want in (("quant_method", m, sys.argv[3]), ("bits", b, want_bits),
                             ("group_size", g, 128)) if v != want]
 if not isinstance(k, int) or not 1 <= k <= 8:
     bad.append("krot")
@@ -206,6 +215,7 @@ Start the server:
     ./serve.sh                          # MXFP4
     QUANT=int4 ./serve.sh               # ParoQuant int4
     QUANT=int5 ./serve.sh               # ParoQuant int5
+    QUANT=mxfp6 ./serve.sh              # ParoQuant MXFP6
 
 It listens on http://localhost:8080/v1. The first start compiles inductor
 and Triton kernels and takes several extra minutes; later starts reuse the
