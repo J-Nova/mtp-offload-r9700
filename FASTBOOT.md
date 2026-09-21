@@ -9,9 +9,12 @@ and they need two different fixes. Doing only one of them barely helps.
 | 1. aiter JIT-builds `module_aiter_core.so` | ~7 min | **bake it into the image** (§1) |
 | 2. vLLM traces + compiles the model graphs | the rest | **persist a cache volume** (§2) |
 
-Measured on a 2×R9700 (gfx1201) TP=2 serve: **650 s → 211 s** from §1 alone, and
-a further ~230 s of engine work removed by §2 once the cache is warm. A warm
-boot of the current prod image is **3 min 53 s** wall clock.
+Measured on a 2×R9700 (gfx1201) TP=2 serve, each fix against its own control:
+
+- **§1 saves ~440 s** — 650 s → 211 s, same warm cache either side.
+- **§2 saves ~130 s** — 381 s on a cold cache directory → 251 s warm, same image.
+
+A warm boot of the current prod image is **3 min 53 s** wall clock.
 
 ---
 
@@ -27,18 +30,31 @@ and let it cache. **That does not work, and it is not obvious why.**
 container, which has `AITER_ROOT_DIR=/cache/aiter` set:
 
 ```console
-$ AITER_ROOT_DIR env = /cache/aiter
-$ get_user_jit_dir() = /opt/vllm/lib/python3.12/site-packages/aiter/jit
-$ find /cache/aiter
+$ docker exec <container> printenv AITER_ROOT_DIR
 /cache/aiter
-/cache/aiter/build          <- empty skeleton, nothing else, ever
+
+$ docker exec <container> find /cache/aiter
+/cache/aiter
+/cache/aiter/build                 # empty skeleton, nothing else, ever
+
+$ docker exec <container> /opt/vllm/bin/python3 -c "
+import sys, importlib.util
+J='/opt/vllm/lib/python3.12/site-packages/aiter/jit'
+sys.path.insert(0, J+'/utils')
+s=importlib.util.spec_from_file_location('c', J+'/core.py'); c=importlib.util.module_from_spec(s)
+sys.modules['c']=c; s.loader.exec_module(c)
+print(c.get_user_jit_dir())"
+/opt/vllm/lib/python3.12/site-packages/aiter/jit
 ```
 
-`aiter.jit.core.get_module()` probes `get_user_jit_dir()/module_aiter_core.so`,
-which resolves **inside site-packages** — i.e. inside the container's writable
-layer, which is destroyed on every `docker compose down` / recreate. So the
-mounted cache receives an empty `build/` directory and the ~7 minutes of hipcc
-is paid again on the next boot, forever.
+The mount is never the target. `aiter/jit/core.py` builds its probe path as
+`os.path.join(get_user_jit_dir(), f"{md_name}.so")` and rebuilds when that file
+is absent — and as shown above, `get_user_jit_dir()` resolves **inside
+site-packages**, i.e. inside the container's writable layer. That layer is
+destroyed on every `docker compose down` / recreate (a plain `stop`/`start`
+keeps it, which is why the problem can look intermittent). So the mounted cache
+collects an empty `build/` directory and the ~7 minutes of hipcc is paid again
+on the next recreate, forever.
 
 The fix is therefore not to cache it. It is to put the `.so` somewhere that
 *does* survive: a **read-only image layer**.
@@ -130,8 +146,12 @@ carried onto a new base is a crash, not a slow boot.
 | arch correctness | you set `GPU_ARCHS` / `CU_NUM` by hand | implicit — built on the real device |
 | slow first boot | never | once |
 
-A and B produce the same artifact at the same path and are mutually
-interchangeable; pick by which constraint you have.
+Both put a usable `module_aiter_core.so` at the path aiter probes, so they are
+interchangeable — pick by which constraint you have. They are not byte-for-byte
+equivalent operations, though: A drops the single `.so`, while B overlays the
+**whole** `jit/` tree, `utils/` and all. That is why the stale-base warning
+above bites harder on B — an overlay from an older base can quietly downgrade
+aiter's own python alongside the `.so`.
 
 ---
 
@@ -142,7 +162,7 @@ Point vLLM's caches at a mounted volume:
 ```yaml
 environment:
   VLLM_CACHE_ROOT: /cache/vllm            # traced graphs   (~400 MB here)
-  TORCHINDUCTOR_CACHE_DIR: /cache/inductor
+  TORCHINDUCTOR_CACHE_DIR: /cache/inductor   # stays empty on this stack; harmless
   TRITON_CACHE_DIR: /cache/triton         # triton kernels  (~90 MB here)
   HF_HUB_OFFLINE: "1"                     # no live Hub calls during load
 volumes:
@@ -212,5 +232,6 @@ Read it like this:
 | minutes unaccounted for *before* the worker lines appear | aiter JIT | §1 |
 | `Loading weights took` is minutes | slow disk, or a live HF Hub call | `HF_HUB_OFFLINE=1`, weights on local NVMe |
 
-A cold-cache boot with the aiter bake already in place still reads ~380 s here,
-so ~6 min on a genuinely new cache directory is expected and not a fault.
+A cold-cache boot with the aiter bake already in place reads ~381 s here, against
+251 s warm, so ~6 min on a genuinely new cache directory is expected and not a
+fault.
