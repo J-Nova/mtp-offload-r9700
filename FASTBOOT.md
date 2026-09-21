@@ -1,8 +1,9 @@
-# Fastboot: cutting a vLLM/ROCm boot from ~20 min to ~4 min
+# Fastboot: cutting a vLLM/ROCm boot from ~13 min to ~4 min
 
-If your model takes 14–22 minutes to come up *every* time, nearly all of that is
-work being redone from scratch on each boot. There are two independent costs,
-and they need two different fixes. Doing only one of them barely helps.
+If your model takes minutes to come up *every* time — ~13 min measured on the
+rig below, 14–22 min reported on others — nearly all of that is work being
+redone from scratch on each boot. There are two independent costs, and they need
+two different fixes. Doing only one of them barely helps.
 
 | | cost per boot | fix |
 |---|---|---|
@@ -35,7 +36,7 @@ $ docker exec <container> printenv AITER_ROOT_DIR
 
 $ docker exec <container> find /cache/aiter
 /cache/aiter
-/cache/aiter/build                 # empty skeleton, nothing else, ever
+/cache/aiter/build
 
 $ docker exec <container> /opt/vllm/bin/python3 -c "
 import sys, importlib.util
@@ -47,7 +48,8 @@ print(c.get_user_jit_dir())"
 /opt/vllm/lib/python3.12/site-packages/aiter/jit
 ```
 
-The mount is never the target. `aiter/jit/core.py` builds its probe path as
+That `build/` skeleton is all the mount ever receives. The mount is never the
+target. `aiter/jit/core.py` builds its probe path as
 `os.path.join(get_user_jit_dir(), f"{md_name}.so")` and rebuilds when that file
 is absent — and as shown above, `get_user_jit_dir()` resolves **inside
 site-packages**, i.e. inside the container's writable layer. That layer is
@@ -63,7 +65,7 @@ The fix is therefore not to cache it. It is to put the `.so` somewhere that
 
 This repo ships `bake_aiter_core.py`, which drives aiter's own
 `core.build_module("module_aiter_core")` during `docker build` and drops the
-artifact where `get_module()` will find it:
+artifact at the probe path above:
 
 ```dockerfile
 COPY bake_aiter_core.py /opt/bake_aiter_core.py
@@ -116,7 +118,8 @@ ls -l aiter-jit-prebuilt/module_aiter_core.so     # ~0.67 MB for a single-TU, CK
 
 Check the python version in that path matches your image (`python3.12` above).
 
-**Step 3.** Make a one-layer child image. That is the entire Dockerfile:
+**Step 3.** Make a one-layer child image. Save this as `Dockerfile.fastboot` —
+it is the entire file:
 
 ```dockerfile
 ARG BASE_IMAGE=<your-image>
@@ -161,10 +164,10 @@ Point vLLM's caches at a mounted volume:
 
 ```yaml
 environment:
-  VLLM_CACHE_ROOT: /cache/vllm            # traced graphs   (~400 MB here)
-  TORCHINDUCTOR_CACHE_DIR: /cache/inductor   # stays empty on this stack; harmless
-  TRITON_CACHE_DIR: /cache/triton         # triton kernels  (~90 MB here)
-  HF_HUB_OFFLINE: "1"                     # no live Hub calls during load
+  VLLM_CACHE_ROOT: /cache/vllm             # traced graphs  (~400 MB here)
+  TRITON_CACHE_DIR: /cache/triton          # triton kernels (~90 MB here)
+  TORCHINDUCTOR_CACHE_DIR: /cache/inductor # stays empty on this stack; harmless
+  HF_HUB_OFFLINE: "1"                      # no live Hub calls during load
 volumes:
   - ./cache-<name>:/cache:rw
 ```
@@ -222,6 +225,7 @@ Loading weights took 33.70 seconds
 Model loading took 12.85 GiB memory and 48.80 seconds
 Graph capturing finished in 6 secs, took 2.34 GiB
 init engine (profile, create kv cache, warmup model) took 37.85 s (compilation: 9.40 s)
+INFO:     Application startup complete.
 ```
 
 Read it like this:
