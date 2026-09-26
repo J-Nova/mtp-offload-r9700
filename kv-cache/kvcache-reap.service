@@ -1,0 +1,10 @@
+[Unit]
+Description=Reap oldest blocks from the vLLM fs KV tier (KVCACHE=disk)
+
+[Service]
+Type=oneshot
+# Edit both paths: where you put the script, and your KVCACHE_DISK + /blocks.
+ExecStart=/usr/local/bin/kvcache-reap.sh
+Environment=KVCACHE_ROOT=/path/to/kvcache/blocks
+Nice=10
+IOSchedulingClass=idle
