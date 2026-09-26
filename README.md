@@ -31,7 +31,7 @@ path, with what each step costs and what to do when one of them stops.
 - [Setup](#setup)
 - [Checkpoints](#checkpoints)
 - [Running the server](#running-the-server)
-- [ParoQuant (int4 W4A8 and int5 W5A8)](#paroquant-int4-w4a8-and-int5-w5a8)
+- [ParoQuant (int4 W4A8, int5 W5A8 and MXFP6 W6A8)](#paroquant-int4-w4a8-int5-w5a8-and-mxfp6-w6a8)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Performance](#performance)
@@ -50,7 +50,7 @@ Repo version `0.12.0`; pinned image `stilldeadcode/vllm-radiance:0.9.3`.
 | | |
 |---|---|
 | **Tested hardware** | 2 x Radeon AI PRO R9700 (gfx1201), tensor parallel |
-| **Tested models** | Qwen3.8-27B-FP8, Qwen3.6-27B-FP8, Qwen3.6-35B-A3B-FP8, Gemma-4-31B-it-FP8, Qwen3.8-27B-Quark-AWQ-MXFP4, Qwen3.8-27B-PARO |
+| **Tested models** | Qwen3.8-27B-FP8, Qwen3.6-27B-FP8, Qwen3.6-35B-A3B-FP8, Gemma-4-31B-it-FP8, Qwen3.8-27B-Quark-AWQ-MXFP4, Qwen3.8-27B-PARO, Qwen3.8-27B-PARO-MXFP6 |
 | **Tested KV dtypes** | fp8, bf16, `auto` |
 | **Detected, not assumed** | GPU count, tensor-parallel size, KV cache size |
 | **Untested** | other models, other weight formats, 1 or 4+ GPUs, non-R9700 hardware, TP=3 on a real three-card box |
@@ -391,7 +391,7 @@ file. With podman, `podman compose` takes the same file. The per-model notes (35
 `--max-num-batched-tokens >= 2240`, Gemma-4-31B's template and drafter) are in
 [DOCKERHUB.md](DOCKERHUB.md#tested-so-far).
 
-## ParoQuant (int4 W4A8 and int5 W5A8)
+## ParoQuant (int4 W4A8, int5 W5A8 and MXFP6 W6A8)
 
 MXFP4 is not the only int4 format this stack serves. **ParoQuant** checkpoints
 (`z-lab/Qwen3.8-27B-PARO`: int4 group-128 asymmetric, plus learned pairwise Givens rotations and
@@ -469,6 +469,44 @@ every shape and partition at TP=2; served-path GSM8K 500q **97.60%** (int4 PARO 
 prod decode at parity with int4 PARO (24.53 vs 24.19 ms/step) once the prologue, the stream producers
 and the merged-linear GEMM each became one launch. See
 [PAROQUANT.md](PAROQUANT.md#mxfp4-weights-the-zero-valu-loop).
+
+### MXFP6 weights (W6A8)
+
+A fourth format keeps the rotations and the whole MXFP4-PARO path, and widens the element to OCP
+**MXFP6 E2M3** -- 6.25 bits/weight. It fits the existing kernels for the same reason int5 does, from
+the other side: "six bits needs an int8-WMMA rewrite" is true of *integer* codes (`c - 32` has 16
+values e4m3 cannot hold) but not of E2M3, whose 32 magnitudes are all `k/8` and **all exact e4m3
+bytes**, exactly as e2m1's 8 are. So the fp8 x fp8 WMMA, the per-token prologue, the stream producers,
+partition select and every band carry over; only weight staging changes (the MXFP4 nibble plane
+plus a 2-bit plane, unpacked in two stages -- a bytewise add for normal codes, one 8-entry perm for
+subnormals). The e8m0 block exponent still folds into the e4m3 byte, which for E2M3 is exact up to
+6 binades below the row's largest exponent, so the builder bounds every row's exponent spread to 6
+(<= 4.9e-6 relative SSE on the worst tensors in the model) and the loader refuses a checkpoint that
+does not. On PARO-rotated weights E2M3 halves int5's weight RMSE (0.028 vs 0.049-0.052; E3M2 only
+matches int5 at 0.053).
+
+```bash
+./setup-paroquant.sh --mxfp6   # fetch hugypufy/Qwen3.8-27B-PARO-MXFP6
+MODEL_DIR=Qwen3.8-27B-PARO-MXFP6 MODE=prod SPEC=7 ./paroquant/run_paroquant.sh
+```
+
+That is the whole command. The launcher reads `quant_method: paroquant_mxfp6` off the checkpoint and
+keys the compile cache with `-mxfp6`. MXFP6-PARO needs TP>=2: single-card MXFP6 serving is out of scope,
+so every MXFP6 entry point refuses `TP=1`.
+
+To build one instead of downloading it: `paroquant/build_mxfp6.py` (RTN from the bf16 base and z-lab's
+rotations) or `requant.sh FORMAT=mxfp6 STAGE=finetune` (stage-2 fine-tune). The Swift-Qwen3.8-27B build is
+[`hugypufy/Swift-Qwen3.8-27B-PARO-MXFP6`](https://huggingface.co/hugypufy/Swift-Qwen3.8-27B-PARO-MXFP6):
+`SRC_REPO=hugypufy/Swift-Qwen3.8-27B-PARO-MXFP6 SNAP=~/models/Swift-Qwen3.8-27B-PARO-MXFP6` on the same
+setup command fetches it.
+
+On the images `./build.sh` and `./build.sh --paro` bake, the same checkpoint goes through the downstream
+scripts instead: `./setup.sh --mxfp6`, then `QUANT=mxfp6 ./serve.sh`.
+
+Expect MXFP6 to trade decode and KV for weight fidelity: +47% weight bytes over MXFP4 and a wider
+unpack in the prefill loop. Nothing has been measured through `run_paroquant.sh` yet. Numbers from a
+second 2 x R9700 rig are in [paroquant/RESULTS.md](paroquant/RESULTS.md); the fold window, the served
+layout and the traps are in [PAROQUANT.md](PAROQUANT.md#mxfp6-weights-w6a8).
 
 The format, the kernels, the knob reference and the rejected experiments are in
 [PAROQUANT.md](PAROQUANT.md).
@@ -1007,7 +1045,9 @@ modules the recipes do not pre-bake).
 | `paroquant/radiance_paroquant.hip` | Kernel module. Compiled in-container at launch |
 | `paroquant/par_kernels.h` | The rotation and W4A8 GEMM device code |
 | `paroquant/par_harness.hip` | Standalone gates for the kernels, no server needed (`run.sh`, `run2.sh`) |
-| `paroquant/radiance_paroquant_mxfp4.py` | The `paroquant_mxfp4` quant method: MXFP4 weights + rotations on the W4A8 MXFP4 GEMM, per-token stream producers |
+| `paroquant/radiance_paroquant_mxfp4.py` | The `paroquant_mxfp4` and `paroquant_mxfp6` quant methods: MXFP4 / MXFP6-E2M3 weights + rotations on the fp8-WMMA MXFP4 GEMM (`launch_p` / `launch6_p`), per-token stream producers |
+| `paroquant/build_mxfp6.py` | MXFP6 RTN builder: bf16 base + z-lab rotations, even exponent rule, per-row spread clamp, Quark fp6 packing |
+| `paroquant/test_mxfp6_loader.py` | GPU unit test for `paroquant_mxfp6`: fp32 reference from Quark's bytes, every band, single-launch and stream equivalence |
 | `paroquant/test_mxfp4_loader.py`, `bench_linear_tp2.py` | GPU unit test (fp32 reference, stream equivalence, single-launch equivalence) and the int4-vs-MXFP4 per-shape decode microbench |
 | `paroquant/RESULTS.md` | The change-by-change engineering log |
 

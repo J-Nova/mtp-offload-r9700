@@ -84,10 +84,11 @@ def _partitions(N: int, pb1: int, pb2: int):
     return [(bounds[i], bounds[i + 1]) for i in range(3) if bounds[i + 1] > bounds[i]]
 
 
-def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None):
+def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None, wh=None):
     """Whole dispatch, opaque to dynamo (a data-dependent M branch in apply() would split the
     compiled graph at every linear)."""
     N, K = weight.shape[0], weight.shape[1] * 2
+    tag = "paroquant_mxfp4" if wh is None else "paroquant_mxfp6"
     P, krot = rec.shape[0], rec.shape[1]
     G, G32 = K // GROUP, K // MXBLOCK
     M = x2.shape[0]
@@ -148,7 +149,10 @@ def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None):
         # one launch and no output concatenation; boundaries are 128-aligned (loader-checked).
         if tiled:
             _mx.a_tiled_register(a_codes, M, K)
-        out = torch.ops.radiance.mxfp4_linear_pqp(a_codes, as_tok, weight, ws_t, wref, M, pb1, pb2)
+        if wh is None:
+            out = torch.ops.radiance.mxfp4_linear_pqp(a_codes, as_tok, weight, ws_t, wref, M, pb1, pb2)
+        else:
+            out = torch.ops.radiance.mxfp6_linear_pqp(a_codes, as_tok, weight, wh, ws_t, wref, M, pb1, pb2)
         if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M:
             for p, (n0, n1) in enumerate(_partitions(N, pb1, pb2)):
                 if (N, K, M, p) in _checked:
@@ -156,13 +160,17 @@ def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None):
                 _checked.add((N, K, M, p))
                 x_rm = _pq.untile_a(a_codes, P, M, K)[p] if tiled else a_codes[p]
                 ws_p = ws_t[:, n0:n1].contiguous()
-                ref = _mx._exact_ref(x_rm.view(torch.float8_e4m3fn), as_tok[p].view(M, 1),
-                                     weight[n0:n1], ws_p, n1 - n0, K)
+                if wh is None:
+                    ref = _mx._exact_ref(x_rm.view(torch.float8_e4m3fn), as_tok[p].view(M, 1),
+                                         weight[n0:n1], ws_p, n1 - n0, K)
+                else:
+                    ref = _mx._exact_ref6(x_rm.view(torch.float8_e4m3fn), as_tok[p].view(M, 1),
+                                          weight[n0:n1], wh[n0:n1], ws_p, n1 - n0, K)
                 y = out[:, n0:n1]
                 num = (y.float() - ref.float()).pow(2).sum().sqrt()
                 den = ref.float().pow(2).sum().sqrt()
                 verdict = "zero-input" if float(den) < 1e-20 else f"rel={float(num / den.clamp_min(1e-30)):.5f}"
-                sys.stderr.write(f"[radiance.paroquant_mxfp4] CHECKALL N={N} K={K} M={M} P={P} part={p} "
+                sys.stderr.write(f"[radiance.{tag}] CHECKALL N={N} K={K} M={M} P={P} part={p} "
                                  f"path={'tiled' if tiled else 'rowmajor'}+single"
                                  f"{'+pre' if pre is not None else ''} {verdict}\n")
         return out
@@ -170,6 +178,13 @@ def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None):
     for p, (n0, n1) in enumerate(_partitions(N, pb1, pb2)):
         w_p = weight[n0:n1]                                              # rows: contiguous
         ws_p = ws_t[:, n0:n1].contiguous()      # A/B path only: a column slice is not contiguous
+        if wh is not None:
+            x_p = a_codes[p:p + 1]
+            if tiled:
+                _mx.a_tiled_register(x_p, M, K)
+            ys.append(torch.ops.radiance.mxfp6_linear_pqp(x_p, as_tok[p:p + 1], w_p, wh[n0:n1],
+                                                          ws_p, wref[n0:n1], M, 1 << 30, 1 << 30))
+            continue
         if tiled:
             # an [M, K] view over the padded tiled storage: the kernel reads by data_ptr and its
             # own tiled addressing; the shape only carries M (see mxfp4_linear_pq)
@@ -228,6 +243,35 @@ def paroquant_mxfp4_linear_pre(hs: torch.Tensor, a: torch.Tensor, as_tok: torch.
 
 @paroquant_mxfp4_linear_pre.register_fake
 def _(hs, a, as_tok, weight, ws_t, wref, rec, cs, pb1, pb2):
+    return torch.empty((*hs.shape[:-1], weight.shape[0]), device=hs.device, dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("radiance::paroquant_mxfp6_linear", mutates_args=())
+def paroquant_mxfp6_linear(x: torch.Tensor, weight: torch.Tensor, wh: torch.Tensor,
+                           ws_t: torch.Tensor, wref: torch.Tensor, rec: torch.Tensor,
+                           cs: torch.Tensor, pb1: int, pb2: int) -> torch.Tensor:
+    K = weight.shape[1] * 2
+    out = _linear_impl(x.reshape(-1, K), weight, ws_t, wref, rec, cs, pb1, pb2, wh=wh)
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+@paroquant_mxfp6_linear.register_fake
+def _(x, weight, wh, ws_t, wref, rec, cs, pb1, pb2):
+    return torch.empty((*x.shape[:-1], weight.shape[0]), device=x.device, dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("radiance::paroquant_mxfp6_linear_pre", mutates_args=())
+def paroquant_mxfp6_linear_pre(hs: torch.Tensor, a: torch.Tensor, as_tok: torch.Tensor,
+                               weight: torch.Tensor, wh: torch.Tensor, ws_t: torch.Tensor,
+                               wref: torch.Tensor, rec: torch.Tensor, cs: torch.Tensor,
+                               pb1: int, pb2: int) -> torch.Tensor:
+    K = weight.shape[1] * 2
+    out = _linear_impl(hs.reshape(-1, K), weight, ws_t, wref, rec, cs, pb1, pb2, pre=(a, as_tok), wh=wh)
+    return out.view(*hs.shape[:-1], weight.shape[0])
+
+
+@paroquant_mxfp6_linear_pre.register_fake
+def _(hs, a, as_tok, weight, wh, ws_t, wref, rec, cs, pb1, pb2):
     return torch.empty((*hs.shape[:-1], weight.shape[0]), device=hs.device, dtype=torch.bfloat16)
 
 
@@ -318,10 +362,12 @@ def _(mode, x, y, w, eps, rec, cs):
 class ParoQuantMXFP4Config(QuantizationConfig):
     """MXFP4 weights + pairwise rotations, W4A8 through the radiance MXFP4 kernel."""
 
+    WEIGHT_BITS = 4
+
     def __init__(self, bits: int, group_size: int, krot: int, fp16_patterns: list[str]):
         super().__init__()
-        if bits != 4:
-            raise ValueError(f"paroquant_mxfp4 is 4-bit by definition, got {bits}")
+        if bits != self.WEIGHT_BITS:
+            raise ValueError(f"{self.get_name()} is {self.WEIGHT_BITS}-bit by definition, got {bits}")
         if group_size != GROUP:
             raise ValueError(f"rotation group must be {GROUP}, got {group_size}")
         if not (1 <= krot <= KROT_MAX):
@@ -331,7 +377,8 @@ class ParoQuantMXFP4Config(QuantizationConfig):
         self._fp16_re = [re.compile(p) for p in fp16_patterns]
 
     def __repr__(self):
-        return f"ParoQuantMXFP4Config(krot={self.krot}, unquantized_patterns={len(self.fp16_patterns)})"
+        return (f"{type(self).__name__}(krot={self.krot}, "
+                f"unquantized_patterns={len(self.fp16_patterns)})")
 
     @classmethod
     def get_name(cls):
@@ -351,7 +398,7 @@ class ParoQuantMXFP4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict) -> "ParoQuantMXFP4Config":
-        bits = cls.get_from_keys_or(config, ["bits"], 4)
+        bits = cls.get_from_keys_or(config, ["bits"], cls.WEIGHT_BITS)
         group_size = cls.get_from_keys_or(config, ["group_size"], GROUP)
         krot = cls.get_from_keys_or(config, ["krot"], 8)
         pats = [r".*visual.*", r".*in_proj_a.*", r".*in_proj_b.*"]
@@ -501,8 +548,69 @@ class ParoQuantMXFP4LinearMethod(LinearMethodBase):
         return out
 
 
+MXFP6_MAX_EXP_SPREAD = 6
+
+
+@register_quantization_config("paroquant_mxfp6")
+class ParoQuantMXFP6Config(ParoQuantMXFP4Config):
+    """The same config and rotations, with E2M3 weights: only the weight grid differs."""
+
+    WEIGHT_BITS = 6
+
+    @classmethod
+    def get_name(cls):
+        return "paroquant_mxfp6"
+
+    def get_quant_method(self, layer, prefix: str):
+        method = super().get_quant_method(layer, prefix)
+        return ParoQuantMXFP6LinearMethod(self) if isinstance(method, ParoQuantMXFP4LinearMethod) else method
+
+
+class ParoQuantMXFP6LinearMethod(ParoQuantMXFP4LinearMethod):
+    def create_weights(self, layer, input_size_per_partition, output_partition_sizes,
+                       input_size, output_size, params_dtype, **extra_weight_attrs):
+        super().create_weights(layer, input_size_per_partition, output_partition_sizes,
+                               input_size, output_size, params_dtype, **extra_weight_attrs)
+        layer.register_parameter("weight", ModelWeightParameter(
+            data=torch.empty(sum(output_partition_sizes), 3 * input_size_per_partition // 4,
+                             dtype=torch.uint8),
+            input_dim=1, output_dim=0, weight_loader=extra_weight_attrs.get("weight_loader")))
+
+    def process_weights_after_loading(self, layer) -> None:
+        N, K = layer.weight.shape[0], layer.weight_scale.shape[1] * MXBLOCK
+        if not _mx.WPERM:
+            raise RuntimeError("paroquant_mxfp6 needs RADIANCE_MXFP4_WPERM=1 (the kernel reads fragment order only)")
+        ws = layer.weight_scale.data
+        spread = int((ws.max(dim=1, keepdim=True).values.to(torch.int16) - ws.to(torch.int16)).max())
+        if spread > MXFP6_MAX_EXP_SPREAD:
+            raise ValueError(f"paroquant_mxfp6: per-row block-exponent spread {spread} > {MXFP6_MAX_EXP_SPREAD} "
+                             f"(N={N} K={K}); the fp8 fold is exact only within {MXFP6_MAX_EXP_SPREAD} -- "
+                             "rebuild with the spread clamp")
+
+        nib, wh = _mx.split_fp6(layer.weight.data, N, K)
+        layer.weight = torch.nn.Parameter(nib, requires_grad=False)
+        super().process_weights_after_loading(layer)
+        layer.wh = torch.nn.Parameter(_mx.permute_wh(wh, N, K), requires_grad=False)
+
+    def apply(self, layer, x, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if isinstance(x, tuple):
+            hs, a, as_tok = x
+            out = torch.ops.radiance.paroquant_mxfp6_linear_pre(hs, a, as_tok, layer.weight, layer.wh,
+                                                                layer.ws_t, layer.wref, layer.rec,
+                                                                layer.cs, layer.pq_pb1, layer.pq_pb2)
+        else:
+            out = torch.ops.radiance.paroquant_mxfp6_linear(x, layer.weight, layer.wh, layer.ws_t,
+                                                            layer.wref, layer.rec, layer.cs,
+                                                            layer.pq_pb1, layer.pq_pb2)
+        if bias is not None:
+            out = out + bias
+        return out
+
+
 if os.environ.get("RADIANCE_PAROQUANT", "0") == "1":
     sys.stderr.write("[radiance.paroquant_mxfp4] registered (e2m1+e8m0/32 weights, z-lab rotations, "
                      f"per-token W4A8 -> MXFP4 GEMM; fused prologue {'on' if FUSED_TOKQ else 'off'}, single launch {'on' if SINGLE_LAUNCH else 'off'}, "
                      f"rot stream {'on' if _pq.ROT_STREAM else 'off'}{'+2' if _pq.ROT_STREAM2 else ''}, WPERM={'on' if _mx.WPERM else 'off'}, "
                      f"decode band M<={_mx.DECODE_MAX_M})\n")
+    sys.stderr.write("[radiance.paroquant_mxfp6] registered (e2m3+e8m0/32 weights, "
+                     "per-token W6A8 -> fp8-WMMA GEMM)\n")

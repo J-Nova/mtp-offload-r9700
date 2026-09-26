@@ -25,6 +25,7 @@ It serves `z-lab/Qwen3.8-27B-PARO` at **GSM8K 97.4-98.0%** (MXFP4 97.8) with **c
 - [Traps](#traps)
 - [Results](#results)
 - [MXFP4 weights: the zero-VALU loop](#mxfp4-weights-the-zero-valu-loop)
+  - [MXFP6 weights (W6A8)](#mxfp6-weights-w6a8)
 
 ## Setup and running
 
@@ -227,6 +228,7 @@ extendable with `RADIANCE_PQ_SKIP`.
 | Variable | Default | What it does |
 |---|---|---|
 | `RADIANCE_PAROQUANT` | `1` | Registration is import-time; this only gates logging |
+| `RADIANCE_VERIFY_HEAD` | `1` | The int2 verify head on the target's `lm_head`. **Set `0` for any serve that takes `prompt_logprobs`** (perplexity, KL): with it on, a perplexity request hung the engine for ~10 min and then killed it with triton `OutOfResources` (seen at TP=1; see paroquant/RESULTS.md) |
 | `RADIANCE_PQ_DECODE_MAX_M` | `64` | Top of the decode band. Must cover `MAXSEQS x (SPEC+1)` rows or the widest verify batches fall onto the prefill tile |
 | `RADIANCE_PQ_WPERM` | `1` | Fragment-order weight layout. Must agree with the compiled kernel |
 | `RADIANCE_PQ_DECODE_NT` | `1` | Non-temporal decode loads. Honoured only under `WPERM` |
@@ -471,6 +473,181 @@ Five-bit codes are exact in e4m3 as `(c - 16)`, so int5 rides the int4 kernel wi
 Weights-only (no activation quant) the int5 checkpoint is at 0.011 nats; the rest is the e4m3
 activation element, a floor shared by every W*A8 build here. Per-group activation scales recover 6% of
 it for 19% of prefill (off). Details and the PTOK=0 loader fix: paroquant/RESULTS.md 2026-09-10/11.
+
+### MXFP6 weights (W6A8)
+
+README.md's int5 section says six bits would need an int8-WMMA rewrite. That is true of **integer**
+codes -- `c - 32` spans -32..31 and the odd magnitudes from 17 up are not e4m3 bytes -- and false of the OCP
+**MXFP6 E2M3** float element. E2M3 (sign bit 5, exponent bits 4:3, mantissa bits 2:0, bias 1, max 7.5)
+has 32 magnitudes that are all `k/8` with `k` an integer in 0..60, and **every one is an exact e4m3
+byte**, exactly as e2m1's 8 are. So MXFP6 rides the existing fp8 x fp8 WMMA with the rest of
+MXFP4-PARO unchanged: the e8m0/32 block scale, the per-token e4m3 prologue, the `pqm_*` rotation-stream
+producers, partition select, split-K decode, the folded TN2/TN4 prefill and the A-tiled band. Only
+weight staging differs. `quant_method: paroquant_mxfp6`, built by `paroquant/build_mxfp6.py` (RTN
+from a bf16 base plus z-lab's rotations) or `requant.sh FORMAT=mxfp6 STAGE=finetune` (stage-2 fine-tune), served by
+`ParoQuantMXFP6Config` in `paroquant/radiance_paroquant_mxfp4.py`. Weight traffic is `6 + 8/32 =`
+**6.25 bits/weight**.
+
+**The fold is exact inside a window, and the builder keeps every block inside it.** The kernel
+stages each weight byte as `value * 2^-d`, with `d = Wref - Ws` the block's distance below its row's
+largest exponent, and applies `2^Wref` once per row in the epilogue. For e2m1 the finest mantissa bit
+is `2^-1` and e4m3 resolves `2^-9`, so the fold is exact to `d <= 8`. E2M3's finest bit is `2^-3`, so
+**it is exact for `d <= 6`**, and past that it is not rounded but *wrong*: a `d = 7` block clamped
+onto the `d = 6` row is served at exactly 2x. The builder therefore raises every block exponent to
+at least `rowmax(X) - 6` and re-rounds that block's codes. What that costs, on PARO-rotated
+Swift-Qwen3.8-27B weights (`even` exponent rule, relative SSE increase over the unclamped build):
+
+| tensor | blocks re-exponented | SSE increase | max spread before the clamp |
+|---|---|---|---|
+| L15 `q_proj` (the widest spread in the model) | 7.3e-4 | +3.4e-6 | 10 |
+| L58 `down_proj` | 1.7e-5 | +4.9e-6 | 8 |
+| L11 `q_proj` | 2.4e-5 | +1.9e-8 | 7 |
+
+Model-wide, at most 5.0e-5 of any projection's blocks sit past `d = 6` (`v_proj`; the MLP projections
+<= 4.5e-7), so the clamp touches almost nothing. It is TP-safe: a row-parallel
+shard's spread can only shrink, and a column-parallel shard does not split rows.
+
+**Why E2M3 and not E3M2, int6 or int5.** Weight relative RMSE, round-to-nearest, on the same rotated
+tensors (MX formats block 32 with the `even` exponent rule; intN asymmetric group 128):
+
+| tensor (rotated) | MXFP4 | int4 g128 | int5 g128 | E3M2 | **E2M3** | int6 g128 |
+|---|---|---|---|---|---|---|
+| L11 `down_proj` | 0.1130 | 0.1023 | 0.0495 | 0.0527 | **0.0281** | 0.0244 |
+| L11 `gate_proj` | 0.1128 | 0.1014 | 0.0491 | 0.0527 | **0.0280** | 0.0241 |
+| L11 `q_proj` | 0.1138 | 0.1066 | 0.0516 | 0.0528 | **0.0285** | 0.0254 |
+| L15 `q_proj` | 0.1134 | 0.1049 | 0.0508 | 0.0528 | **0.0284** | 0.0250 |
+| L58 `down_proj` | 0.1136 | 0.1034 | 0.0500 | 0.0527 | **0.0283** | 0.0246 |
+
+E2M3 roughly halves int5's weight error (0.028 vs 0.049-0.052). E3M2 is only as good as int5 with a
+bit more per weight, and its fold is exact only to `d <= 5`. int6 g128 is 11-14% lower RMSE on these
+near-Gaussian rotated weights, but it has no exact e4m3 path and would need the int8-WMMA rewrite. The
+case for MXFP6 is the kernel it runs on and a standard OCP on-disk format, not RMSE per bit.
+
+**Checkpoint** (per quantized linear; the same 400 modules and fp16 skips as MXFP4-PARO):
+
+| Tensor | Shape | Notes |
+|---|---|---|
+| `weight` | `[N, 3K/4]` u8 | Quark / OCP fp6 packing: per 4 codes `c0 \| c1<<6 \| c2<<12 \| c3<<18`, 3 bytes little-endian; code `S<<5 \| E<<3 \| M`; -0 written as code 0 |
+| `weight_scale` | `[N, K/32]` u8 | e8m0, byte = `X + 127`, row-major. **Per-row spread <= 6** (the loader refuses more). Never 0xFF |
+| `pairs` / `theta` / `channel_scales` | `[krot, K]` i16 / `[krot, K/2]` f16 / `[1, K]` f16 | z-lab's, copied byte-identical. `channel_scales` pre-inverted |
+
+`quantization_config`: `{"quant_method": "paroquant_mxfp6", "format": "mxfp6_e2m3", "bits": 6,
+"group_size": 128, "krot": 8}`. The full checkpoint is 23.4 GiB, against 20.4 GiB for int5 and 18 GB
+for MXFP4-PARO.
+
+**Served layout.** `process_weights_after_loading` unpacks Quark's bytes, row-chunked, into two planes,
+then permutes both into fragment order:
+
+| Param | Shape | Contents |
+|---|---|---|
+| `weight` | `[N, K/2]` u8 | Low four bits of each code, in **exactly MXFP4's layout** (even `k` in the low nibble). `permute_w` makes it one 32-lane u32 slot per (n-tile, k-step), as for MXFP4-PARO |
+| `wh` | `[N, K/4]` u8 | Bits 4-5 of each code, element `4i + t` at bits `2t`. Fragment order: 16 bits per slot, slot-local code `i` at bits `2i`, read at `WH + 2*slot` next to the nibble word at `W + 4*slot` |
+| `ws_t`, `wref`, `rec`, `cs`, `pq_pb1/2` | as MXFP4-PARO | Transposed scale, per-row reference exponent, rotation records, channel scales, partition boundaries |
+
+That is 0.75 bytes per element served, the same as on disk. `K` stays `weight.shape[1] * 2`, so
+everything that derives it from the nibble plane is unchanged. Loading needs `N % 16 == 0` and
+`K % 32 == 0` (every Qwen3.8 shape at TP=2 meets both).
+
+**The kernel change: a two-stage unpack.** One `v_perm_b32` cannot index 32 magnitudes (its selectors
+are 3 bits), but E2M3 splits in two. Per 4 codes:
+
+1. **Assemble 6-bit codes.** The 2-bit plane is spread to bits 4-5 of each code byte with two disjoint
+   `__umul24` (a single multiply would let collision carries reach kept bits) and OR'd onto the
+   nibbles.
+2. **Fold.** For `E >= 1`, `(1 + M/8) * 2^(E-1)` shifted down `d` binades is the e4m3 normal with
+   exponent field `E + 6 - d` and the *same* three mantissa bits, so the byte is `c5 + ((6 - d) << 3)`:
+   a bytewise add with no lookup. Only `E == 0` (subnormal `M/8`, which would need a renormalising CLZ)
+   takes a table, and that half has 8 entries -- one perm. A second perm selects between them on
+   `E != 0`, and the sign moves from bit 5 to bit 7. A row of `kE2M3[7][4]` is `{E==0 bytes for M=0..3,
+   M=4..7, the bias in every byte, 0}`. At `d = 6` the byte *is* the 5-bit magnitude code.
+
+A final pair of perms interleaves the even and odd codes into the 8-byte staging word, so everything
+downstream of the staging loop -- the WMMA, the epilogue, the partition select -- sees the same `sW`
+tile MXFP4 produces. The kernels take a trailing template flag `E6` (default false, as `BITS` was for
+int5) on the folded, A-tiled and decode bands, fragment order only, plus a trailing `WH` pointer. New
+pybind entries `launch6_p` / `launch6_at_p` take `wh` after `w`; the MXFP4 entries and ABI are
+untouched. On the E2M1 side the 142 existing kernels compile to identical device instruction streams.
+There are 86 E6 instantiations (80 decode + 4 folded + 2 A-tiled). The four
+`decode<BK=128, KS=2|4, TM=8>` cells (NT on and off) spill in E6, as their E2M1 twins already do; the
+other 82 have no VGPR spill and no scratch, at 242 VGPR maximum. The spilling cells are reachable only
+with `DECODE_MAX_M >= 113`, and `run_paroquant.sh` and the baked images default to 64.
+
+**MXFP6-PARO is TP>=2 only.** Every MXFP6 entry point (`run_paroquant.sh`, `setup.sh --mxfp6`,
+`setup-paroquant.sh --mxfp6`, `QUANT=mxfp6 ./serve.sh`) refuses a resolved TP below 2 (`TP`, else what
+`gpu-detect.sh` picks). Nothing in the kernel or the loader rejects TP=1, but every MXFP6 serving number
+in paroquant/RESULTS.md is TP=2; TP=1 has only loader-test, eager CHECKALL and perplexity runs.
+
+**Serve** with the same launcher. It reads `quant_method` off the checkpoint, sets the MXFP4 kernel
+knobs below, and keys the compile cache with `-mxfp6`:
+
+```bash
+MODEL_DIR=Qwen3.8-27B-PARO-MXFP6 MODE=prod SPEC=7 ./paroquant/run_paroquant.sh
+MODEL_DIR=Qwen3.8-27B-PARO-MXFP6 MODE=eval ./paroquant/run_paroquant.sh   # CHECKALL vs an fp32 dequant of both planes
+```
+
+| Variable | Default for an MXFP6 checkpoint | What it does |
+|---|---|---|
+| `RADIANCE_MXFP4_WPERM` | `1`, **required** | Fragment-order weight layout. Off by default; the loader permutes the nibble plane only under it and refuses the checkpoint without it |
+| `RADIANCE_MXFP4_DECODE_MAX_M` | `64` | Top of the split-K decode band. Must cover `MAXSEQS x (SPEC+1)` rows |
+| `RADIANCE_MXFP4_DECODE_NT` | `1` | Non-temporal decode weight loads (fragment order only) |
+| `RADIANCE_MXFP4_A_TILED_MIN_M` | `513` | Lowest M on the A-tiled prefill band. Must exceed 512 and `DECODE_MAX_M` |
+| `RADIANCE_MXFP4_TN4_MIN_M` | `2048` | Folded prefill switches from TN=2 to TN=4 tiles |
+| `RADIANCE_MXFP4_EPIFAST` / `RADIANCE_MXFP4_W4A8` | `1` / `1` | As MXFP4-PARO |
+| `RADIANCE_PQ_ROT_STREAM` / `RADIANCE_PQ_ROT_STREAM2` | `1` / `1` | The per-token `pqm_add_rms_rot` / `pqm_ew_rot` producers, shared with MXFP4-PARO. Keys the cache (`-rs`, `-rs2`) |
+| `RADIANCE_PQM_FUSED_TOKQ` | `1` | One-launch rotate + per-token quant prologue |
+| `RADIANCE_PQM_SINGLE_LAUNCH` | `1` | One GEMM launch per merged linear. `0` is the per-partition A/B loop: one `launch6_p` / `launch6_at_p` per partition at P=1 |
+| `RADIANCE_PQM_CHECKALL` | the eval shapes | Kernel vs an exact fp32 dequant of both planes, per partition. Eval only |
+| `SCALE_RULE` (builder, `requant.sh`) | `even` | Block exponent rule: `even` (Quark's), `ocp` (floor), `mse2` (per-block best of X, X+1) |
+| `MAX_EXP_SPREAD` (`build_mxfp6.py`) | `6` | Per-row exponent clamp, or `off`. The loader refuses a shard with any row spread above 6, so a larger value or `off` builds a checkpoint for format studies, not serving |
+
+**From the baked image.** `Dockerfile.ggz14.top` and `paroquant/Dockerfile` already bake
+`radiance_mxfp4_fp8.hip`, `radiance_mxfp4.py` and `radiance_paroquant_mxfp4.py`, so both images built
+by `./build.sh` and `./build.sh --paro` serve `paroquant_mxfp6` with nothing added. The downstream
+scripts take it like int4 and int5:
+
+```bash
+./setup.sh --mxfp6   # hugypufy/Qwen3.8-27B-PARO-MXFP6, or a local build already at ~/models/Qwen3.8-27B-PARO-MXFP6
+QUANT=mxfp6 ./serve.sh
+```
+
+`setup.sh --mxfp6` validates `quant_method: paroquant_mxfp6` and the same bits / group_size / krot
+contract as `setup-paroquant.sh`. `serve.sh` exports the ParoQuant profile and takes the MXFP4 kernel
+knobs above from the image ENV, which already carries them at these values.
+`SRC_REPO=hugypufy/Swift-Qwen3.8-27B-PARO-MXFP6 ./setup.sh --mxfp6` fetches the Swift-Qwen3.8-27B build
+into that same directory instead.
+
+**Traps, so nobody re-hits them:**
+
+- **`RADIANCE_MXFP4_WPERM=1` is not optional.** The 2-bit plane has no checkpoint-order form and the E6
+  kernels read fragment order only, but the loader permutes the nibble plane only under `WPERM`. A
+  serve without it would feed those kernels checkpoint-order nibbles. That is why the loader refuses
+  the checkpoint rather than warn.
+- **The spread clamp is load-bearing, not a quality knob.** Stock Quark MXFP6 codes carry blocks at
+  `d = 7..10`; relabelled `paroquant_mxfp6`, they are refused at load with `per-row block-exponent
+  spread N > 6`. Rebuild with `build_mxfp6.py`. The kernel only clamps `d`, so were the check removed, those
+  blocks would serve at 2x-16x.
+- **One exponent rule everywhere.** Quark's `even` rule bumps `X = floor(log2 amax) - 2` by one iff
+  `amax / 2^floor(log2 amax) >= 1.9375` (`2 - 2^-(mbits+1)`). The OCP spec's plain floor rule is 0.5-0.7%
+  worse RMSE on E2M3. The builder, the optimizer's fake quant and convert must apply the same rule
+  and clamp, or the exported codes disagree with the exported scales.
+- **Element rounding is ties-to-even on the code**, as Quark does. Exact ties are rare (56-63 per
+  63-89M rotated float32 elements) and cost the same error either way. The rule matters only so that
+  the builder, the optimizer and convert produce byte-identical codes for the same weight.
+- **No `torch_dtype` in `config.json`.** A `float16` stamp makes vLLM pick fp16, and R4D attention
+  then refuses to start (`dtype not supported`). Convert drops it for mxfp6. Check any hand-edited config.
+
+**Results.** The `run_paroquant.sh` numbers are an open item: nothing has been measured through this
+launcher and its default template yet.
+
+| served, TP=2, SPEC=7 | GSM8K 500q | wikitext PPL | ms/step @ctx25 / 8k / 32k | prefill @2k / 64k | KV |
+|---|---|---|---|---|---|
+| PARO-MXFP4 (recorded) | 97.40 | -- | 23.38 / 24.91 / 25.80 | 4770 / 4273 | 862k |
+| int5 fine-tuned, I8 + PG + ZPE (recorded) | 97.40 | -- | 25.90 / 27.46 / 28.19 | 3941 / 3436 | 760k |
+| **MXFP6 RTN** | open | open | open | open | open |
+| **MXFP6 fine-tuned** | open | open | open | open | open |
+
+What has been measured -- the kernel and loader gates, and TP=2 serving numbers from a second R9700
+rig against that rig's own int5 runs -- is in paroquant/RESULTS.md, 2026-09-16.
 
 ### Same-stack fidelity ranking (2026-09-11)
 

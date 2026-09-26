@@ -149,6 +149,13 @@ rad_kv_lookup() {
   echo "$hit"
 }
 
+# Shared by every MXFP6 entry point: a single-card MXFP6-PARO serve is not supported.
+rad_require_tp2() {
+  [ "${RAD_TP:-1}" -ge 2 ] && return 0
+  echo "${1:-this checkpoint} needs TP>=2 (detected TP=${RAD_TP:-1})" >&2
+  return 1
+}
+
 rad_detect_gpus
 
 # Run directly (not sourced) -> report. `return` fails outside a function in a sourced file

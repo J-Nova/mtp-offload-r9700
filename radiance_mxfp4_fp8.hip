@@ -77,6 +77,42 @@ __device__ __constant__ unsigned int kMag[16][2] = {
   {0x00000000u, 0x00000000u},
 };
 
+// E2M3 (MXFP6) staging. The 6-bit code is split across two planes -- MXFP4's nibble plane carries
+// bits 0-3, a second plane 2 bits per weight -- and rejoins here. Every E2M3 magnitude is k/8, so
+// every code is an exact e4m3 byte and the block exponent still folds into it, but only 6 binades
+// below the row's largest (the builder clamps the spread and the loader rechecks it), hence 7 rows
+// of d. Per d: t0/t1 are the 8 subnormal bytes (exponent field 0, magnitude k/8) for one v_perm,
+// and b4 is the bias the normal half takes as ONE bytewise add, since its e4m3 byte is affine in
+// the code. The fourth word pads the row to a uint4 for the A-tiled kernel's LDS copy.
+__device__ __constant__ unsigned int kE2M3[7][4] = {
+  {0x2c282000u, 0x36343230u, 0x30303030u, 0u},
+  {0x24201800u, 0x2e2c2a28u, 0x28282828u, 0u},
+  {0x1c181000u, 0x26242220u, 0x20202020u, 0u},
+  {0x14100800u, 0x1e1c1a18u, 0x18181818u, 0u},
+  {0x0c080400u, 0x16141210u, 0x10101010u, 0u},
+  {0x06040200u, 0x0e0c0a08u, 0x08080808u, 0u},
+  {0x03020100u, 0x07060504u, 0x00000000u, 0u},
+};
+
+static __device__ __forceinline__ unsigned int e2m3_spread2(unsigned int x) {
+  return (__umul24(x & 0x3003u, 0x00010010u) | __umul24(x & 0x0330u, 0x00001100u)) & 0x30303030u;
+}
+static __device__ __forceinline__ unsigned int e2m3_fold4(unsigned int c6, unsigned int t0,
+                                                          unsigned int t1, unsigned int b4) {
+  const unsigned int sub = __builtin_amdgcn_perm(t1, t0, c6 & 0x07070707u);
+  const unsigned int arit = (c6 & 0x1F1F1F1Fu) + b4;
+  const unsigned int nz = (((c6 >> 3) & 0x03030303u) + 0x03030303u) & 0x04040404u;
+  return __builtin_amdgcn_perm(arit, sub, 0x03020100u | nz) | ((c6 & 0x20202020u) << 2);
+}
+static __device__ __forceinline__ uint2_t e2m3_unpack8(unsigned int wv, unsigned int h2,
+                                                       unsigned int t0, unsigned int t1,
+                                                       unsigned int b4) {
+  const unsigned int be = e2m3_fold4((wv & 0x0F0F0F0Fu) | e2m3_spread2(h2), t0, t1, b4);
+  const unsigned int bo = e2m3_fold4(((wv >> 4) & 0x0F0F0F0Fu) | e2m3_spread2(h2 >> 2), t0, t1, b4);
+  return uint2_t{__builtin_amdgcn_perm(bo, be, 0x05010400u),
+                 __builtin_amdgcn_perm(bo, be, 0x07030602u)};
+}
+
 #define BM 128
 #define BN 64
 #define BK 64
@@ -236,12 +272,12 @@ __global__ __launch_bounds__(NWAVE * 32) void radiance_mxfp4_fp8_gemm(
 // r4d_gemm_mxfp4a8_nt_m64 reads and what makes a wave's weight read 128 contiguous bytes instead
 // of sixteen rows K/2 bytes apart. Both paths produce the SAME sW tile, so everything downstream
 // of the staging loop is untouched.
-template <int TN, bool WPERM, bool EPIFAST = true>
+template <int TN, bool WPERM, bool EPIFAST = true, bool E6 = false>
 __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
     const unsigned char *__restrict__ A, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
     const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K,
-    int pb1, int pb2, long astride) {
+    int pb1, int pb2, long astride, const unsigned char *__restrict__ WH = nullptr) {
   __shared__ unsigned char sA[BMF * ASTR];
   __shared__ unsigned char sW[WN * TN * 16 * WSTR];
 
@@ -329,6 +365,17 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
           const uint2_t v = *(const uint2_t *)src;
           wq[0] = v[0]; wq[1] = v[1];
         }
+        unsigned int hq[WSLOTS];
+        if constexpr (E6) {
+          const unsigned char *srch = &WH[(((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec) * 2];
+          if constexpr (WSLOTS == 4) {
+            const uint2_t h = *(const uint2_t *)srch;
+            hq[0] = h[0] & 0xFFFFu; hq[1] = h[0] >> 16; hq[2] = h[1] & 0xFFFFu; hq[3] = h[1] >> 16;
+          } else {
+            const unsigned int h = *(const unsigned int *)srch;
+            hq[0] = h & 0xFFFFu; hq[1] = h >> 16;
+          }
+        }
         const int blk = (k0 + kst * 16) / 32;
         // One dword read each for the WSLOTS reference and block exponents instead of 2*WSLOTS
         // byte reads: gc is WSLOTS-aligned and N % 16 == 0, so both reads are aligned.
@@ -340,6 +387,15 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
           refw = *(const unsigned short *)(Wref + gc);
           wsw = *(const unsigned short *)(Ws + (size_t)blk * N + gc);
         }
+        if constexpr (E6) {
+#pragma unroll
+          for (int q = 0; q < WSLOTS; ++q) {
+            int d = (int)((refw >> (8 * q)) & 0xFF) - (int)((wsw >> (8 * q)) & 0xFF);
+            d = d < 0 ? 0 : (d > 6 ? 6 : d);
+            const unsigned int t0 = kE2M3[d][0], t1 = kE2M3[d][1], b4 = kE2M3[d][2];
+            *(uint2_t *)(&sW[(r + q) * WSTR + kloc]) = e2m3_unpack8(wq[q], hq[q], t0, t1, b4);
+          }
+        } else
 #pragma unroll
         for (int q = 0; q < WSLOTS; ++q) {
           int d = (int)((refw >> (8 * q)) & 0xFF) - (int)((wsw >> (8 * q)) & 0xFF);
@@ -527,12 +583,12 @@ static __device__ __forceinline__ void radiance_lds_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-template <int TN, bool WPERM, int LBK = BK>
+template <int TN, bool WPERM, int LBK = BK, bool E6 = false>
 __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
     const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K,
-    int pb1, int pb2, long astride) {
+    int pb1, int pb2, long astride, const unsigned char *__restrict__ WH = nullptr) {
   constexpr int NS = LBK / 16;
   constexpr int LWSTR = LBK + PAD;
   constexpr int BNF_T = WN * TN * 16;
@@ -540,6 +596,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
   static_assert(NIT >= 1 && NIT * NTHREADS * 8 == BNF_T * LBK / 2, "W tile must be 8 B/thread multiples");
   __shared__ unsigned char sW[BNF_T * LWSTR];
   __shared__ unsigned int sMag[32];   // kMag, 128 B: ds_load keeps the lookup off the loadcnt chain
+  __shared__ unsigned int sTab[7 * 4];
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int wm = wave / WN, wn = wave % WN;
@@ -556,7 +613,8 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
   const int ksteps_g = K / 16;
   const int Mt = (M + 15) >> 4;
 
-  if (tid < 32) sMag[tid] = ((const unsigned int *)kMag)[tid];
+  if constexpr (E6) { if (tid < 28) sTab[tid] = ((const unsigned int *)kE2M3)[tid]; }
+  else if (tid < 32) sMag[tid] = ((const unsigned int *)kMag)[tid];
   radiance_lds_barrier();
 
   // A tile bases, one per M-fragment: wave-uniform, forced into SGPRs; the lane part is an
@@ -635,6 +693,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
 
     // ---- W tile -> LDS, folded to e4m3 (kMag[d] via v_perm, see the folded kernel) ----
     uint4_t pk[NW]; unsigned int wsv[NW];
+    uint2_t hp[NW];
     if constexpr (WPERM) {
       const unsigned int *__restrict__ Wp = (const unsigned int *)W;
       const int kstep0 = k0 / 16;
@@ -643,6 +702,11 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
         const unsigned int *src = &Wp[((size_t)(wrc[it] >> 4) * ksteps_g + kstep0 + wkst[it]) * 32 + wlanec[it]];
         if constexpr (WSLOTS == 4) pk[it] = *(const uint4_t *)src;
         else { const uint2_t v = *(const uint2_t *)src; pk[it] = uint4_t{v[0], v[1], 0u, 0u}; }
+        if constexpr (E6) {
+          const unsigned char *srch = &WH[(((size_t)(wrc[it] >> 4) * ksteps_g + kstep0 + wkst[it]) * 32 + wlanec[it]) * 2];
+          if constexpr (WSLOTS == 4) hp[it] = *(const uint2_t *)srch;
+          else                       hp[it] = uint2_t{*(const unsigned int *)srch, 0u};
+        }
         const int blk = (k0 + wkst[it] * 16) / 32;
         if constexpr (WSLOTS == 4) wsv[it] = *(const unsigned int *)(Ws + (size_t)blk * N + wrc[it]);
         else                       wsv[it] = *(const unsigned short *)(Ws + (size_t)blk * N + wrc[it]);
@@ -658,6 +722,18 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
       }
     }
     if constexpr (WPERM) {
+      if constexpr (E6) {
+#pragma unroll
+        for (int it = 0; it < NW; ++it)
+#pragma unroll
+          for (int q = 0; q < WSLOTS; ++q) {
+            int d = (int)((wref[it] >> (8 * q)) & 0xFF) - (int)((wsv[it] >> (8 * q)) & 0xFF);
+            d = d < 0 ? 0 : (d > 6 ? 6 : d);
+            const uint4_t t = *(const uint4_t *)&sTab[d * 4];
+            *(uint2_t *)(&sW[(wrow[it] + q) * LWSTR + wcol[it]]) =
+                e2m3_unpack8(pk[it][q], (hp[it][q >> 1] >> (16 * (q & 1))) & 0xFFFFu, t[0], t[1], t[2]);
+          }
+      } else
 #pragma unroll
       for (int it = 0; it < NW; ++it)
 #pragma unroll
@@ -790,12 +866,14 @@ static __device__ __forceinline__ T ld_w(const T *p) {
 // at SPEC=7, which reaches 64 at max_num_seqs=8. DTM 1..4 covers every reachable batch of both.
 // Use the SMALLEST DTM that covers M: measured at M=20, DTM=2 beats DTM=3 by 12% (89.1 vs 99.9 us
 // on gate_up) purely because the wider tile computes rows nobody asked for.
-template <int DWN, int DBK, int DKS, int DTM, bool WPERM, bool DIRECT = true, bool NT = false>
+template <int DWN, int DBK, int DKS, int DTM, bool WPERM, bool DIRECT = true, bool NT = false,
+          bool E6 = false>
 __global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
     const unsigned char *__restrict__ A, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
     const float *__restrict__ As, float *__restrict__ P, int *__restrict__ cnt,
-    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2, long astride) {
+    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2, long astride,
+    const unsigned char *__restrict__ WH = nullptr) {
   constexpr int BND = DWN * 16;
   constexpr int DASTR = DBK + DEC_PAD, DWSTR = DBK + DEC_PAD;
   constexpr int DNTHREADS = DWN * 32;
@@ -892,7 +970,20 @@ __global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
         const int lanec = (lane_ & 16) | (gc & 15);
         const uint2_t wv = ld_w<NT>(
             (const uint2_t *)&Wp[((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec]);
+        unsigned int hv = 0;
+        if constexpr (E6)
+          hv = ld_w<NT>((const unsigned int *)&WH[(((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec) * 2]);
         const int blk = (k0 + kst * 16) / 32;
+        if constexpr (E6) {
+#pragma unroll
+          for (int q = 0; q < 2; ++q) {
+            int d = (int)Wref[gc + q] - (int)Ws[(size_t)blk * N + gc + q];
+            d = d < 0 ? 0 : (d > 6 ? 6 : d);
+            const unsigned int t0 = kE2M3[d][0], t1 = kE2M3[d][1], b4 = kE2M3[d][2];
+            *(uint2_t *)(&sW[(r + q) * DWSTR + kloc]) =
+                e2m3_unpack8(wq_dec(wv, q), (hv >> (16 * q)) & 0xFFFFu, t0, t1, b4);
+          }
+        } else
 #pragma unroll
         for (int q = 0; q < 2; ++q) {
           int d = (int)Wref[gc + q] - (int)Ws[(size_t)blk * N + gc + q];
@@ -1135,7 +1226,7 @@ static void set_decode_scratch(uintptr_t ptr, size_t bytes, uintptr_t cnt) {
 
 static void launch_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
                         uintptr_t c, int M, int N, int K, int pb1, int pb2, long astride,
-                        uintptr_t stream) {
+                        uintptr_t stream, uintptr_t wh = 0) {
   if (K % BK) throw std::runtime_error("radiance_mxfp4_fp8: K must be a multiple of 64");
   // partition boundaries must be n-tile aligned for every kernel below (decode 128, folded 64/128)
   if ((pb1 < N && pb1 % 128) || (pb2 < N && pb2 % 128))
@@ -1225,12 +1316,12 @@ static void launch_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, 
       if (bkx == 0) bkx = decode_bk64(tm, dks) ? 64 : 128;
 #define RAD_DEC_LAUNCH(BK_, KS_, TM_)                                                         \
       hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_decode<DWN, BK_, KS_, TM_, RAD_WPERM, true,  \
-                                                          RAD_NT>),                           \
+                                                          RAD_NT, RAD_E6>),                   \
                          dim3(dec_nblk, 1, KS_), dblock,                                       \
                          0, (hipStream_t)stream, (const unsigned char *)a,                     \
                          (const unsigned char *)w, (const unsigned char *)ws,                  \
                          (const unsigned char *)wref, (const float *)as, P, g_decode_cnt,      \
-                         (__bf16 *)c, M, N, K, pb1, pb2, astride)
+                         (__bf16 *)c, M, N, K, pb1, pb2, astride, (const unsigned char *)wh)
 #define RAD_DEC_BY_TM(BK_, KS_)                                                               \
       if (tm == 1)      RAD_DEC_LAUNCH(BK_, KS_, 1);                                           \
       else if (tm == 2) RAD_DEC_LAUNCH(BK_, KS_, 2);                                           \
@@ -1254,6 +1345,23 @@ static void launch_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, 
       // Two restagings that batch a thread's loads for the whole line (8 B x G, then one 16 B
       // per lane / 4 rows per wave) were STILL 1.4-1.8x under NT and -5..-19% without it, so
       // the row layout keeps plain loads and dec_nt is ignored there.
+      if (wh) {
+#define RAD_E6 true
+#define RAD_WPERM true
+        if (dec_nt) {
+#define RAD_NT true
+          RAD_DEC_BY_KS;
+#undef RAD_NT
+        } else {
+#define RAD_NT false
+          RAD_DEC_BY_KS;
+#undef RAD_NT
+        }
+#undef RAD_WPERM
+#undef RAD_E6
+        return;
+      }
+#define RAD_E6 false
       if (dec_wperm) {
 #define RAD_WPERM true
         if (dec_nt) {
@@ -1273,32 +1381,35 @@ static void launch_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, 
 #undef RAD_NT
 #undef RAD_WPERM
       }
+#undef RAD_E6
 #undef RAD_DEC_BY_KS
 #undef RAD_DEC_BY_TM
 #undef RAD_DEC_LAUNCH
       return;
       // no scratch (alloc failed) -- fall through to the folded kernel, never produce nothing
     }
-#define RAD_FOLDED_E(TN_, WP_, EF_)                                                             \
+#define RAD_FOLDED_E(TN_, WP_, EF_, E6_)                                                        \
     do {                                                                                        \
       constexpr int B_ = BNF_OF(TN_);                                                           \
       dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);                                       \
-      hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_folded<TN_, WP_, EF_>), fgrid, fblock, 0,     \
+      hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_folded<TN_, WP_, EF_, E6_>), fgrid, fblock, 0, \
                          (hipStream_t)stream, (const unsigned char *)a,                         \
                          (const unsigned char *)w, (const unsigned char *)ws,                   \
                          (const unsigned char *)wref, (const float *)as, (__bf16 *)c, M, N, K, \
-                         pb1, pb2, astride);                                                    \
+                         pb1, pb2, astride, (const unsigned char *)wh);                         \
     } while (0)
-#define RAD_FOLDED(TN_, WP_)                                                                    \
-    do { if (epifast) RAD_FOLDED_E(TN_, WP_, true); else RAD_FOLDED_E(TN_, WP_, false); } while (0)
+#define RAD_FOLDED(TN_, WP_, E6_)                                                               \
+    do { if (epifast) RAD_FOLDED_E(TN_, WP_, true, E6_); else RAD_FOLDED_E(TN_, WP_, false, E6_); } while (0)
     // TN=4 only when the shape is wide enough to use the 128-wide tile: at N=48 (gdn gate)
     // TN=4 computes 128 columns against 48 real ones and measures 1.8-2x SLOWER than TN=2 at
     // every M >= 2048 (56 vs 101-115 us, ~/mxfp4_work/tier7 tnx). The M crossover itself
     // re-measured within noise of 2048 on all large-N shapes with branchless staging.
     if (M >= tn4_min_m && N >= BNF_OF(4)) {
-      if (dec_wperm) RAD_FOLDED(4, true); else RAD_FOLDED(4, false);
+      if (wh) RAD_FOLDED(4, true, true);
+      else if (dec_wperm) RAD_FOLDED(4, true, false); else RAD_FOLDED(4, false, false);
     } else {
-      if (dec_wperm) RAD_FOLDED(2, true); else RAD_FOLDED(2, false);
+      if (wh) RAD_FOLDED(2, true, true);
+      else if (dec_wperm) RAD_FOLDED(2, true, false); else RAD_FOLDED(2, false, false);
     }
 #undef RAD_FOLDED
 #undef RAD_FOLDED_E
@@ -1319,6 +1430,11 @@ static void launch_p(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uin
                      uintptr_t c, int M, int N, int K, int pb1, int pb2, long astride,
                      uintptr_t stream) {
   launch_impl(a, w, ws, wref, as, c, M, N, K, pb1, pb2, astride, stream);
+}
+static void launch6_p(uintptr_t a, uintptr_t w, uintptr_t wh, uintptr_t ws, uintptr_t wref,
+                      uintptr_t as, uintptr_t c, int M, int N, int K, int pb1, int pb2,
+                      long astride, uintptr_t stream) {
+  launch_impl(a, w, ws, wref, as, c, M, N, K, pb1, pb2, astride, stream, wh);
 }
 
 
@@ -1659,7 +1775,7 @@ static void launch_add_rms_quant(uintptr_t y, uintptr_t res, uintptr_t w, uintpt
 // only: the decode kernel reads row-major A, so the Python side never tiles below its band.
 static void launch_at_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
                            uintptr_t c, int M, int N, int K, int pb1, int pb2, long astride,
-                           uintptr_t stream) {
+                           uintptr_t stream, uintptr_t wh = 0) {
   if (K % 128) throw std::runtime_error("radiance_mxfp4_fp8: tiled A needs K % 128 == 0");
   if ((pb1 < N && pb1 % 128) || (pb2 < N && pb2 % 128))
     throw std::runtime_error("radiance_mxfp4_fp8: partition boundaries must be multiples of 128");
@@ -1673,18 +1789,21 @@ static void launch_at_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wre
     return e && atoi(e) != 0;
   }();
   dim3 fblock(NTHREADS);
-#define RAD_AT(TN_, WP_)                                                                        \
+#define RAD_AT(TN_, WP_, E6_)                                                                   \
   do {                                                                                          \
     constexpr int B_ = BNF_OF(TN_);                                                             \
     dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);                                         \
-    hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<TN_, WP_, (TN_ == 2 ? 128 : 64)>),      \
+    hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<TN_, WP_, (TN_ == 2 ? 128 : 64), E6_>), \
                        fgrid, fblock, 0,                                                        \
                        (hipStream_t)stream, (const unsigned char *)a, (const unsigned char *)w, \
                        (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, \
-                       (__bf16 *)c, M, N, K, pb1, pb2, astride);                               \
+                       (__bf16 *)c, M, N, K, pb1, pb2, astride, (const unsigned char *)wh);    \
   } while (0)
-  if (M >= tn4_min_m && N >= BNF_OF(4)) { if (wperm) RAD_AT(4, true); else RAD_AT(4, false); }
-  else                                  { if (wperm) RAD_AT(2, true); else RAD_AT(2, false); }
+  if (M >= tn4_min_m && N >= BNF_OF(4)) {
+    if (wh) RAD_AT(4, true, true); else if (wperm) RAD_AT(4, true, false); else RAD_AT(4, false, false);
+  } else {
+    if (wh) RAD_AT(2, true, true); else if (wperm) RAD_AT(2, true, false); else RAD_AT(2, false, false);
+  }
 #undef RAD_AT
 }
 static void launch_at(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
@@ -1696,12 +1815,19 @@ static void launch_at_p(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, 
                         uintptr_t stream) {
   launch_at_impl(a, w, ws, wref, as, c, M, N, K, pb1, pb2, astride, stream);
 }
+static void launch6_at_p(uintptr_t a, uintptr_t w, uintptr_t wh, uintptr_t ws, uintptr_t wref,
+                         uintptr_t as, uintptr_t c, int M, int N, int K, int pb1, int pb2,
+                         long astride, uintptr_t stream) {
+  launch_at_impl(a, w, ws, wref, as, c, M, N, K, pb1, pb2, astride, stream, wh);
+}
 
 PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
   m.def("launch_at", &launch_at, "MXFP4 x FP8 WMMA GEMM on a fragment-tiled activation");
   m.def("launch", &launch, "MXFP4 x FP8 WMMA GEMM (gfx1201)");
   m.def("launch_p", &launch_p, "MXFP4 x FP8 GEMM over a merged linear: P rotated A copies, partition by n-block (pb1, pb2, astride)");
   m.def("launch_at_p", &launch_at_p, "fragment-tiled A variant of launch_p");
+  m.def("launch6_p", &launch6_p, "MXFP6 (E2M3) x FP8 GEMM: launch_p plus the 2-bit plane wh after w (WPERM=1, wref)");
+  m.def("launch6_at_p", &launch6_at_p, "fragment-tiled A variant of launch6_p");
   m.def("launch_silu_mul_quant", &launch_silu_mul_quant,
         "fused silu(gate)*up + per-token e4m3 quant, one WG per row",
         py::arg("gu"), py::arg("q"), py::arg("scale"), py::arg("M"), py::arg("N"),

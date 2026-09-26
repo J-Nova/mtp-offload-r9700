@@ -137,6 +137,44 @@ def unpermute_w(packed: "torch.Tensor", N: int, K: int) -> "torch.Tensor":
                   .permute(0, 3, 1, 2, 4)      # [n-tile][row][k-step][half][4 bytes]
                   .contiguous()
                   .view(N, K // 2))
+
+
+def split_fp6(packed: "torch.Tensor", N: int, K: int, rows: int = 0):
+    if K % 32 or tuple(packed.shape) != (N, 3 * K // 4):
+        raise ValueError(f"radiance.mxfp6: packed weight {tuple(packed.shape)} is not [N, 3K/4] "
+                         f"for N={N} K={K} (K must be a multiple of 32)")
+    nib = torch.empty((N, K // 2), dtype=torch.uint8, device=packed.device)
+    wh = torch.empty((N, K // 4), dtype=torch.uint8, device=packed.device)
+    step = rows or max(1, (1 << 28) // (12 * K))
+    for a in range(0, N, step):
+        b = min(a + step, N)
+        t = packed[a:b].reshape(b - a, K // 4, 3).to(torch.int32)
+        comb = t[..., 0] | (t[..., 1] << 8) | (t[..., 2] << 16)
+        del t
+        codes = torch.stack([(comb >> (6 * i)) & 63 for i in range(4)], -1).view(b - a, K).to(torch.uint8)
+        del comb
+        nib[a:b] = (codes[:, 0::2] & 15) | ((codes[:, 1::2] & 15) << 4)
+        h = (codes >> 4).view(b - a, K // 4, 4)
+        wh[a:b] = h[..., 0] | (h[..., 1] << 2) | (h[..., 2] << 4) | (h[..., 3] << 6)
+    return nib, wh
+
+
+def permute_wh(wh: "torch.Tensor", N: int, K: int) -> "torch.Tensor":
+    nt, ks = N // 16, K // 16
+    return (wh.view(nt, 16, ks, 2, 2)
+              .permute(0, 2, 3, 1, 4)
+              .contiguous()
+              .view(N, K // 4))
+
+
+def unpermute_wh(wh: "torch.Tensor", N: int, K: int) -> "torch.Tensor":
+    nt, ks = N // 16, K // 16
+    return (wh.view(nt, ks, 2, 16, 2)
+              .permute(0, 3, 1, 2, 4)
+              .contiguous()
+              .view(N, K // 4))
+
+
 # Hoist the activation quant into the traced graph so the rms+quant fusion can match it.
 # Needs MIN_M <= 0 (see apply_weights); refuses rather than producing wrong results.
 HOIST_QUANT = os.environ.get("RADIANCE_MXFP4_HOIST_QUANT", "0") == "1"
@@ -295,6 +333,33 @@ def _exact_ref(x_fp8, x_scale, weight, weight_scale, N, K, chunk=2048):
         codes = torch.stack([wc & 0x0F, (wc >> 4) & 0x0F], -1).reshape(b - a, K)
         sc = torch.pow(2.0, weight_scale[:, a:b].float() - 127.0).T.repeat_interleave(32, dim=1)
         outs.append(xr @ (_E2M1[codes.long()] * sc).T.float())
+    return torch.cat(outs, dim=1)
+
+
+_E2M3 = None
+
+
+def _dequant6(nib, wh, ws, K):
+    global _E2M3
+    if _E2M3 is None or _E2M3.device != nib.device:
+        mag = [(c & 7) / 8.0 if c < 8 else 2.0 ** ((c >> 3) - 1) * (1 + (c & 7) / 8.0)
+               for c in range(32)]
+        _E2M3 = torch.tensor(mag + [-v for v in mag], dtype=torch.float32, device=nib.device)
+    R = nib.shape[0]
+    lo = torch.stack([nib & 0x0F, (nib >> 4) & 0x0F], -1).reshape(R, K)
+    hi = torch.stack([(wh >> (2 * t)) & 3 for t in range(4)], -1).reshape(R, K)
+    sc = torch.pow(2.0, ws.float() - 127.0).T.repeat_interleave(32, dim=1)
+    return _E2M3[(lo | (hi << 4)).long()] * sc
+
+
+def _exact_ref6(x_fp8, x_scale, weight, wh, weight_scale, N, K, chunk=2048):
+    nib = unpermute_w(weight, N, K)
+    whr = unpermute_wh(wh, N, K)
+    xr = x_fp8.float() * x_scale.view(-1, 1).float()
+    outs = []
+    for a in range(0, N, chunk):
+        b = min(a + chunk, N)
+        outs.append(xr @ _dequant6(nib[a:b], whr[a:b], weight_scale[:, a:b], K).T)
     return torch.cat(outs, dim=1)
 
 
@@ -585,6 +650,32 @@ def mxfp4_linear_pqp(a: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tenso
 
 @mxfp4_linear_pqp.register_fake
 def _(a, x_scale, weight, weight_scale, weight_ref, M, pb1, pb2):
+    return torch.empty((M, weight.shape[0]), device=a.device, dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("radiance::mxfp6_linear_pqp", mutates_args=())
+def mxfp6_linear_pqp(a: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor,
+                     wh: torch.Tensor, weight_scale: torch.Tensor, weight_ref: torch.Tensor,
+                     M: int, pb1: int, pb2: int) -> torch.Tensor:
+    if not _stats_reported[0]:
+        report_stats()
+    N = weight.shape[0]
+    K = weight_scale.shape[0] * 32
+    P = x_scale.shape[0]
+    astride = a.numel() // P
+    out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    tiled = bool(A_TILED_MIN_M) and a_tiled_take(a, M, K)
+    if tiled:
+        _A_TILED_STATS[0] += 1
+    launch = _ext.launch6_at_p if tiled else _ext.launch6_p
+    launch(a.data_ptr(), weight.data_ptr(), wh.data_ptr(), weight_scale.data_ptr(),
+           weight_ref.data_ptr(), x_scale.data_ptr(), out.data_ptr(), M, N, K, pb1, pb2, astride,
+           torch.cuda.current_stream().cuda_stream)
+    return out
+
+
+@mxfp6_linear_pqp.register_fake
+def _(a, x_scale, weight, wh, weight_scale, weight_ref, M, pb1, pb2):
     return torch.empty((M, weight.shape[0]), device=a.device, dtype=torch.bfloat16)
 
 

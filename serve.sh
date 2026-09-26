@@ -22,6 +22,7 @@
 #   ./serve.sh                          # MXFP4 (quark_mxfp4)
 #   QUANT=int4 ./serve.sh               # ParoQuant int4 W4A8
 #   QUANT=int5 ./serve.sh               # ParoQuant int5 W5A8
+#   QUANT=mxfp6 ./serve.sh              # ParoQuant MXFP6 W6A8 (TP>=2)
 #
 # Environment:
 #   IMAGE=ggz14/vllm-radiance-mxfp4:latest  # image to run (the prod-bake image)
@@ -69,7 +70,11 @@ case "$QUANT" in
          SERVED=Qwen3.8-PARO
          DRAFTER_REL=Qwen3.8-27B-DFlash2-FP8
          GPU_UTIL=${GPU_UTIL:-0.92} ;;
-  *) echo "unknown QUANT=$QUANT (mxfp4 / int4 / int5)" >&2; exit 2 ;;
+  mxfp6) SNAP_REL=Qwen3.8-27B-PARO-MXFP6
+         SERVED=Qwen3.8-PARO
+         DRAFTER_REL=Qwen3.8-27B-DFlash2-FP8
+         GPU_UTIL=${GPU_UTIL:-0.92} ;;
+  *) echo "unknown QUANT=$QUANT (mxfp4 / int4 / int5 / mxfp6)" >&2; exit 2 ;;
 esac
 
 SNAP="$MODELS/$SNAP_REL"
@@ -84,7 +89,7 @@ e() { # e NAME VALUE  -> add -e only if NAME is not already set in the shell
 }
 
 case "$QUANT" in
-  int4|int5)
+  int4|int5|mxfp6)
     # The ParoQuant profile (run_paroquant.sh, MODE=prod): the rotation_supply
     # producers on, the int4-default I8/PG/ZPE (int5 reads them off the
     # checkpoint, exactly as the launcher does), GDN merge off (in_proj_a/b are
@@ -114,6 +119,10 @@ case "$QUANT" in
       e RADIANCE_PQ_I8 0
       e RADIANCE_PQ_PG 0
       e RADIANCE_PQ_ZPE 0
+    fi
+    if [ "$QUANT" = mxfp6 ]; then
+      . "$(dirname "$0")/gpu-detect.sh"
+      rad_require_tp2 MXFP6-PARO || exit 1
     fi
     ;;
   mxfp4)

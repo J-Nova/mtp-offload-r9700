@@ -190,19 +190,27 @@ MODEL=/models/$MODEL_DIR
 # user has to set. An explicit RADIANCE_PQ_* in the environment still wins. This has to happen
 # BEFORE the cache suffix below, which is keyed on exactly these flags -- a mismatch here serves
 # the wrong compiled graph out of a stale cache dir.
-PQ_BITS=$(python3 -c '
+PQ_INFO=$(python3 -c '
 import json, sys
 try:
-    print((json.load(open(sys.argv[1])).get("quantization_config") or {}).get("bits", 4))
+    q = json.load(open(sys.argv[1])).get("quantization_config") or {}
+    print(q.get("bits", 4), q.get("quant_method", "-"))
 except Exception:
-    print(4)
-' "$MODELS/$MODEL_DIR/config.json" 2>/dev/null || echo 4)
+    print(4, "-")
+' "$MODELS/$MODEL_DIR/config.json" 2>/dev/null || echo "4 -")
+read -r PQ_BITS PQ_METHOD <<<"$PQ_INFO"
 if [ "$PQ_BITS" = 5 ]; then
   RADIANCE_PQ_I8=${RADIANCE_PQ_I8:-1}
   RADIANCE_PQ_PG=${RADIANCE_PQ_PG:-1}
   RADIANCE_PQ_ZPE=${RADIANCE_PQ_ZPE:-1}
   export RADIANCE_PQ_I8 RADIANCE_PQ_PG RADIANCE_PQ_ZPE
   echo "[paro] int5 checkpoint -> W5A8 defaults I8=$RADIANCE_PQ_I8 PG=$RADIANCE_PQ_PG ZPE=$RADIANCE_PQ_ZPE (set them explicitly to override)"
+fi
+PQ_FMT_SUF=""
+if [ "$PQ_METHOD" = paroquant_mxfp6 ]; then
+  . "$SCRIPT_DIR/../gpu-detect.sh"
+  rad_require_tp2 MXFP6-PARO || exit 1
+  PQ_FMT_SUF="-mxfp6"
 fi
 
 CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && CACHE_SUF="$CACHE_SUF-rs"
@@ -212,6 +220,7 @@ CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && 
 [ "${RADIANCE_PQ_I8:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-i8"
 [ "${RADIANCE_PQ_PG:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-pg"
 [ "${RADIANCE_PQ_ZPE:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-zpe"
+CACHE_SUF="${CACHE_SUF}${PQ_FMT_SUF}"
 # The ssm state width changes the mamba cache spec, so the warm/compile cache must not be
 # shared with a serve of the other width.
 [ -n "$GDN_SSM_DTYPE" ] && CACHE_SUF="${CACHE_SUF}-ssm${GDN_SSM_DTYPE}"
@@ -323,7 +332,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -e RADIANCE_PQ_ROT_V2="${RADIANCE_PQ_ROT_V2:-1}" \
   -e RADIANCE_PQ_HIPCC_FLAGS="${RADIANCE_PQ_HIPCC_FLAGS:-}" \
   -e RADIANCE_FAST_DRAFT=1 -e RADIANCE_DRAFT_TAU=0.20 -e RADIANCE_DRAFT_RERANK=80 \
-  -e RADIANCE_VERIFY_HEAD=1 -e RADIANCE_VERIFY_HEAD_MAX_M=32 \
+  -e RADIANCE_VERIFY_HEAD="${RADIANCE_VERIFY_HEAD:-1}" -e RADIANCE_VERIFY_HEAD_MAX_M=32 \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS=1 -e RADIANCE_SKINNY_GEMM="${RADIANCE_SKINNY_GEMM:-1}" \
   -e RADIANCE_GDN_PATHS=both \
   -e RADIANCE_KV_GROUP_OPT=1 \
