@@ -887,6 +887,87 @@ echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME s
 # docker has no --replace, so a container left behind by a previous run has to go first.
 if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || true; fi
 
+# ---------------------------------------------------------------------------
+# KVCACHE: opt-in KV-cache offload (off by default; see kv-cache/README.md).
+#   off  (default; also the state when KVCACHE is unset) -- stock behaviour. When off,
+#        KVCACHE_MOUNT/ENV/TIER are empty and KVCACHE_PRELUDE is empty, so the generated
+#        serve command is byte-identical to the unmodified script.
+#   ram  -- GPU -> RAM tier (KVCACHE_RAM_GIB in /dev/shm) + the 6 "always" behavioural
+#        patches (mixed-hit, eagle-groups, mamba-stride, reconcile-reask, swa-align/touch,
+#        align-last-block).
+#   disk -- GPU -> RAM -> disk (KVCACHE_DISK) + the full 15-patch instrumented set.
+# The patch set, kvwatch.py and turnbench.py live in ./kv-cache/, which rides the repo's
+# existing /patches mount (-> /patches/kv-cache). PYTHONPATH=/patches lets the patches import
+# the repo's _patchlib the same way the in-repo patches do. The 6 "always" patch gates are
+# set to the validated (exactness) values; mixed-hit and instrumentation are FATAL (required
+# for correct bit-identical serving), the rest are non-fatal (a missed hunk degrades, never
+# blocks serving).
+# ---------------------------------------------------------------------------
+KVCACHE=${KVCACHE:-off}
+KVCACHE_RAM_GIB=${KVCACHE_RAM_GIB:-16}
+KVCACHE_DISK=${KVCACHE_DISK:-}
+KVCACHE_MOUNT=()
+KVCACHE_ENV=()
+KVCACHE_TIER=()
+KVCACHE_PRELUDE=""
+_kvp() { KVCACHE_PRELUDE+="    $1"$'\n'; }   # one prelude line (4-space indented, newline-terminated)
+case "$KVCACHE" in
+  off|"")
+    : ;;
+  ram|disk)
+    KVCACHE_ENV=(-e RADIANCE_OFFLOAD_MIXED_HIT=1 -e RADIANCE_OFFLOAD_EAGLE_GROUPS=1 \
+      -e RADIANCE_MAMBA_STORE_STRIDE=4 -e RADIANCE_RECONCILE_REASK=1 \
+      -e RADIANCE_SWA_STORE_MAMBA_ALIGN=1 -e RADIANCE_TOUCH_ALL_GROUPS=1 \
+      -e RADIANCE_TOUCH_POSITION_ORDER=1 -e RADIANCE_ALIGN_PROMPT_LAST_BLOCK=1)
+    KVCACHE_TIER=(--kv-offloading-size "$KVCACHE_RAM_GIB" --kv-offloading-backend native)
+    # vLLM leaves its RAM tier behind in /dev/shm when the container stops, and the next boot
+    # then cannot fit its own. Remove regions no live process holds (fuser/lsof decide; with
+    # neither available nothing is touched, so a second running server keeps its buffer).
+    shopt -s nullglob
+    for _f in /dev/shm/vllm_offload_*.mmap; do
+      if command -v fuser >/dev/null 2>&1; then fuser -s "$_f" 2>/dev/null && continue
+      elif command -v lsof >/dev/null 2>&1; then lsof -t -- "$_f" >/dev/null 2>&1 && continue
+      else continue; fi
+      echo "[kv-cache] removing stale RAM tier $(basename "$_f") ($(( $(stat -c %s "$_f") >> 20 )) MiB)" >&2
+      [ -n "${DRY_RUN:-}" ] || rm -f -- "$_f"
+    done
+    shopt -u nullglob
+    _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_offload_mixed_hit.py'
+    if [ "$KVCACHE" = disk ]; then
+      # instrumentation (FATAL: mixed-hit reports through it) + lookup metrics
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_offload_instrumentation.py'
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_offload_lookup_metrics.py || echo "[kv-cache] WARNING: lookup-metrics did not apply"'
+    fi
+    _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_eagle_groups.py || echo "[kv-cache] WARNING: eagle-groups did not apply"'
+    _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_mamba_stride.py || echo "[kv-cache] WARNING: mamba-stride did not apply"'
+    _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_reconcile_reask.py || echo "[kv-cache] WARNING: reconcile-reask did not apply"'
+    _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_swa_align_touch.py || echo "[kv-cache] WARNING: swa-align/touch did not apply"'
+    _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_sched_align_last_block.py || echo "[kv-cache] WARNING: align-last-block did not apply"'
+    if [ "$KVCACHE" = disk ]; then
+      # disk-only setup: mount the host fs at /kvcache, pin PYTHONHASHSEED (block filenames
+      # are content hashes), wire the fs secondary tier.
+      [ -n "$KVCACHE_DISK" ] || die "KVCACHE=disk needs KVCACHE_DISK=/path (a dedicated filesystem)."
+      [ -d "$KVCACHE_DISK" ] || die "KVCACHE_DISK=$KVCACHE_DISK does not exist."
+      mkdir -p "$KVCACHE_DISK/blocks"
+      # One bind spec, not two words: `-v HOST CONTAINER` would make podman mount an anonymous
+      # volume at HOST and then treat /kvcache as a positional argument.
+      KVCACHE_MOUNT=(-v "$KVCACHE_DISK":/kvcache:z -e PYTHONHASHSEED=0)
+      KVCACHE_TIER+=(--kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":"/kvcache/blocks","n_read_threads":8,"n_write_threads":4}]}}')
+      # the disk-tier fixes and their metrics, in the order they are validated in
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_offload_debug_instrument.py || echo "[kv-cache] WARNING: debug-instrument did not apply"'
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_offload_fs_fanout.py || echo "[kv-cache] WARNING: fs-fanout did not apply"'
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_offload_tier_report.py || echo "[kv-cache] WARNING: tier-report did not apply"'
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_offload_promotion_wallclock.py || echo "[kv-cache] WARNING: promotion/wallclock did not apply"'
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_lookup_invalidate.py || echo "[kv-cache] WARNING: lookup-invalidate did not apply"'
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_fs_failed_load.py || echo "[kv-cache] WARNING: failed-load-forget did not apply"'
+      _kvp 'PYTHONPATH=/patches python3 /patches/kv-cache/patch_offload_miss_deferral_metrics.py || echo "[kv-cache] WARNING: deferral/miss-reason did not apply"'
+    fi
+    ;;
+  *)
+    die "KVCACHE must be off, ram or disk (got: $KVCACHE)."
+    ;;
+esac
+
 # DRY_RUN=1 prints the command instead of running it -- for checking what a set of environment
 # overrides actually produces, and for lifting the invocation into a unit file.
 # No CPU pin: --cpuset-cpus needs a cpuset cgroup controller rootless podman does not get, a host
@@ -998,6 +1079,8 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   ${CT_MOUNT[@]+"${CT_MOUNT[@]}"} \
   ${R4D_SO:+-v "$R4D_SO":/r4d:z} \
   ${R4D_SO:+-e R4D_SO="$R4D_SO"} \
+  ${KVCACHE_MOUNT[@]+"${KVCACHE_MOUNT[@]}"} \
+  ${KVCACHE_ENV[@]+"${KVCACHE_ENV[@]}"} \
   --entrypoint bash \
   "$IMAGE" -lc '
     set -e
@@ -1028,7 +1111,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     if [ "${RADIANCE_GDN_LAZY:-0}" = 1 ]; then python3 patch_gdn_lazy.py; fi   # TP=1 profile only; after the gdn builder patches it anchors on
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
-    cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
+    '"${KVCACHE_PRELUDE}"'cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
     # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
     # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
     cp radiance_preamble.py /opt/radiance_preamble.py      # banner/preamble from the repo, not the baked copy
@@ -1057,6 +1140,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     --kv-cache-dtype fp8 --tensor-parallel-size "$TP" \
     --gpu-memory-utilization "$GPU_UTIL" \
     ${KV_MEM:+--kv-cache-memory "$KV_MEM"} \
+    ${KVCACHE_TIER[@]+"${KVCACHE_TIER[@]}"} \
     --max-model-len "$MAXLEN" --max-num-seqs "${MAXSEQS:-8}" --max-num-batched-tokens "$CHUNK" \
     --attention-backend "$ATTN" \
     --speculative-config "$SPEC_CFG" \
