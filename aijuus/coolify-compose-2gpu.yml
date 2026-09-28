@@ -441,6 +441,29 @@ services:
         printf 'radiance_serve_info{instance="%s",max_num_seqs="%s",max_model_len="%s",max_num_batched_tokens="%s",kv_source="%s",spec_method="%s",spec_tokens="%s",offload_policy="%s",offload_mode="%s",async_sched="%s",read_threads="%s",write_threads="%s",fanout_max="%s"} 1\n' \
           "$$RID" "$$SEQS" "$$MLEN" "$$CHUNK" "$$KV_SRC" "$$SMETHOD" "$$SPEC" "$$OPOLICY" "$$OVMODE" "$$ASCHED" "$$RTHREADS" "$$WTHREADS" "$$FANOUT" > /tmp/serve-shape/serve_shape_$$RID.prom
         echo "[run] shape labels: kv=$$KV_SRC spec=$$SMETHOD/$$SPEC"
+        # ---- stale CPU-KV-offload region sweep (THIS instance only) ----
+        # vLLM names its CPU offload tier /dev/shm/vllm_offload_<engine_id>.mmap
+        # and only unlinks it in cleanup(), so a crashed/killed start leaks one
+        # (it used a fresh uuid each boot). Enough leaks fill the 32G host tmpfs
+        # and the next start then dies in MADV_POPULATE_WRITE with EFAULT
+        # (Errno 14) -- the 2026-09-28 outage. engine_id is pinned per instance
+        # below (radrank$$SERVE_RANK), so our own stale region has a known name and is
+        # removed here BEFORE the engine re-creates it. Only our own name is
+        # matched: ipc: host shares /dev/shm with the peer instance, whose live
+        # region must never be touched.
+        # Hardening: engine_id names the shared /dev/shm region, so it MUST
+        # be distinct per instance. Fail fast if SERVE_RANK is unset/empty --
+        # a blank rank would alias the peer (both use 0) and make each
+        # instance sweep the other's live region. A uuid is un-sweepable and
+        # a hostname changes on container recreate (would orphan the sweep),
+        # so the stable, unique per-instance rank is the right token.
+        : "$${SERVE_RANK:?SERVE_RANK must be set to a distinct value per instance (0/1)}"
+        ENG_ID="radrank$$SERVE_RANK"
+        for _f in /dev/shm/vllm_offload_$${ENG_ID}*.mmap; do
+          [ -e "$${_f}" ] || continue
+          echo "[run] sweeping stale KV-offload region $$_f"
+          rm -f "$${_f}"
+        done
         cd /
         # Final argv assembled here from the resolved shape (no static command:
         # compose cannot do arithmetic or conditionals, the entrypoint can).
@@ -470,7 +493,7 @@ services:
             export RADIANCE_LOOKUP_INVALIDATE=1 RADIANCE_FS_FAILED_LOAD_FORGET=1
             echo "[run] fs KV tier ON: root_dir=$$KV_OFFLOAD_DISK_DIR (host-side reaper REQUIRED)"
           fi
-          OFF_ARG="--kv-offloading-size $$KV_OFFLOAD_GIB --kv-transfer-config {\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$$EC}}"
+          OFF_ARG="--kv-offloading-size $$KV_OFFLOAD_GIB --kv-transfer-config {\"kv_connector\":\"OffloadingConnector\",\"engine_id\":\"$$ENG_ID\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$$EC}}"
           echo "[run] KV offload ON: cpu tier=$${KV_OFFLOAD_GIB}GiB, head cap=$$HC"
         fi
         ASYNC_ARG="--no-async-scheduling"
@@ -877,6 +900,29 @@ services:
         printf 'radiance_serve_info{instance="%s",max_num_seqs="%s",max_model_len="%s",max_num_batched_tokens="%s",kv_source="%s",spec_method="%s",spec_tokens="%s",offload_policy="%s",offload_mode="%s",async_sched="%s",read_threads="%s",write_threads="%s",fanout_max="%s"} 1\n' \
           "$$RID" "$$SEQS" "$$MLEN" "$$CHUNK" "$$KV_SRC" "$$SMETHOD" "$$SPEC" "$$OPOLICY" "$$OVMODE" "$$ASCHED" "$$RTHREADS" "$$WTHREADS" "$$FANOUT" > /tmp/serve-shape/serve_shape_$$RID.prom
         echo "[run] shape labels: kv=$$KV_SRC spec=$$SMETHOD/$$SPEC"
+        # ---- stale CPU-KV-offload region sweep (THIS instance only) ----
+        # vLLM names its CPU offload tier /dev/shm/vllm_offload_<engine_id>.mmap
+        # and only unlinks it in cleanup(), so a crashed/killed start leaks one
+        # (it used a fresh uuid each boot). Enough leaks fill the 32G host tmpfs
+        # and the next start then dies in MADV_POPULATE_WRITE with EFAULT
+        # (Errno 14) -- the 2026-09-28 outage. engine_id is pinned per instance
+        # below (radrank$$SERVE_RANK), so our own stale region has a known name and is
+        # removed here BEFORE the engine re-creates it. Only our own name is
+        # matched: ipc: host shares /dev/shm with the peer instance, whose live
+        # region must never be touched.
+        # Hardening: engine_id names the shared /dev/shm region, so it MUST
+        # be distinct per instance. Fail fast if SERVE_RANK is unset/empty --
+        # a blank rank would alias the peer (both use 0) and make each
+        # instance sweep the other's live region. A uuid is un-sweepable and
+        # a hostname changes on container recreate (would orphan the sweep),
+        # so the stable, unique per-instance rank is the right token.
+        : "$${SERVE_RANK:?SERVE_RANK must be set to a distinct value per instance (0/1)}"
+        ENG_ID="radrank$$SERVE_RANK"
+        for _f in /dev/shm/vllm_offload_$${ENG_ID}*.mmap; do
+          [ -e "$${_f}" ] || continue
+          echo "[run] sweeping stale KV-offload region $$_f"
+          rm -f "$${_f}"
+        done
         cd /
         # Final argv assembled here from the resolved shape (no static command:
         # compose cannot do arithmetic or conditionals, the entrypoint can).
@@ -906,7 +952,7 @@ services:
             export RADIANCE_LOOKUP_INVALIDATE=1 RADIANCE_FS_FAILED_LOAD_FORGET=1
             echo "[run] fs KV tier ON: root_dir=$$KV_OFFLOAD_DISK_DIR (host-side reaper REQUIRED)"
           fi
-          OFF_ARG="--kv-offloading-size $$KV_OFFLOAD_GIB --kv-transfer-config {\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$$EC}}"
+          OFF_ARG="--kv-offloading-size $$KV_OFFLOAD_GIB --kv-transfer-config {\"kv_connector\":\"OffloadingConnector\",\"engine_id\":\"$$ENG_ID\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$$EC}}"
           echo "[run] KV offload ON: cpu tier=$${KV_OFFLOAD_GIB}GiB, head cap=$$HC"
         fi
         ASYNC_ARG="--no-async-scheduling"

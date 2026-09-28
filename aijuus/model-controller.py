@@ -112,6 +112,28 @@ def write_state(st):
     os.rename(tmp, STATE)
 
 
+def _dechunk(body):
+    """Decode an HTTP chunked transfer-encoding body.
+
+    Docker's unix-socket API replies with `Transfer-Encoding: chunked` for
+    large responses (e.g. /containers/json), so the raw body starts with a hex
+    chunk size followed by CRLF. Without this, json.loads(body) parses the
+    leading size digits and fails with "Extra data"."""
+    out = bytearray()
+    i = 0
+    while True:
+        j = body.find(b"\r\n", i)
+        if j == -1:
+            break
+        size = int(body[i:j].split(b";", 1)[0].strip(), 16)
+        i = j + 2
+        if size == 0:
+            break
+        out += body[i:i + size]
+        i += size + 2
+    return bytes(out)
+
+
 def sock_request(method, path):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(SOCK)
@@ -128,6 +150,18 @@ def sock_request(method, path):
         s.close()
     head, _, body = data.partition(b"\r\n\r\n")
     status = int(head.split(b" ")[1]) if head else 0
+    headers = {}
+    for line in head.split(b"\r\n")[1:]:
+        if b":" in line:
+            k, _, v = line.partition(b":")
+            headers[k.strip().lower()] = v.strip().lower()
+    if headers.get(b"transfer-encoding", b"") == b"chunked":
+        body = _dechunk(body)
+    elif b"content-length" in headers:
+        try:
+            body = body[:int(headers[b"content-length"])]
+        except ValueError:
+            pass
     return status, body
 
 

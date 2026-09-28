@@ -49,7 +49,10 @@ import sys
 import sysconfig
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# _patchlib.py lives at the repo root (one level up from aijuus/). The
+# entrypoint runs this as `python3 aijuus/patch_offload_eagle_groups.py`, so
+# sys.path[0] is aijuus/ -- insert the repo root explicitly or the import fails.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _patchlib import apply, apply_any  # noqa: E402
 
 SP = Path(os.environ.get("RADIANCE_VLLM_DIR", sysconfig.get_paths()["purelib"]))
