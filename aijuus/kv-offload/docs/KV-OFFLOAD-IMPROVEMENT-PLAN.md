@@ -166,6 +166,15 @@ These improve correctness for hybrid (Mamba/SWA) models.
 - Only runs when `KV_OFFLOAD_GIB` is set
 - Prevents stale RAM tier files from consuming memory and preventing new boots
 
+**HA correction (2026-09-28)**: the fuser/lsof sweep above cannot see the peer from
+inside the container (separate PID namespace, shared `ipc: host` /dev/shm), so HA mode
+passes a per-instance `ENG_ID` (`radrank0`/`radrank1`). The first implementation skipped
+*every* `radrank[01]*.mmap` when an `ENG_ID` was given, which also skipped the instance's
+OWN leaked region -- so the next start still died in `SharedOffloadRegion`
+(`FileExistsError` -> `_wait_for_file_size` timeout). Correct behavior: with `ENG_ID`,
+remove exactly `/dev/shm/vllm_offload_<ENG_ID>.mmap` and never the peer's; without it,
+fall back to the fuser/lsof sweep. See `ops/clean-stale-ram-tier.sh`.
+
 #### 7. PYTHONHASHSEED=0 for disk mode
 
 **Purpose**: Block filenames are content hashes, so consistent hashing is required.

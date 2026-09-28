@@ -277,44 +277,8 @@ index d787440..7242fab 100755
  fi
  echo "[run] cache=$CACHE"
  echo "[run] chat-template=$CHAT_TEMPLATE"
-+# ---- KV offload (env-gated, default off). Mirrors coolify-compose-2gpu.yml. ------------------
-+# KV_OFFLOAD_GIB>0 turns on OffloadingConnector (CPU/RAM primary tier). KV_OFFLOAD_DISK_DIR (or a
-+# KV_OFFLOAD_DISK_HOST_DIR, which implies /kvcache) adds the shared fs secondary tier and requires
-+# the host reaper; the fs-patch gates (lookup invalidation, failed-load forget) are turned on
-+# automatically. Head cap: Mode A (CPU only) auto-fits the CPU tier; Mode B (disk) has no cap.
-+# NOTE: offload KV state is MODEL-SPECIFIC -- never point two different models at one disk tier.
-+OPOLICY=${KV_OFFLOAD_EVICTION_POLICY:-lru}
-+OFF_READ=${KV_OFFLOAD_READ_THREADS:-32}
-+OFF_WRITE=${KV_OFFLOAD_WRITE_THREADS:-16}
-+if [ -z "${KV_OFFLOAD_DISK_DIR:-}" ] && [ -n "${KV_OFFLOAD_DISK_HOST_DIR:-}" ]; then
-+  KV_OFFLOAD_DISK_DIR=/kvcache
-+fi
-+# Stale RAM tier cleanup: remove /dev/shm/vllm_offload_*.mmap left by stopped containers.
-+# Only removes files not held by a live process (fuser/lsof check). In HA mode, skips
-+# files matching any known instance pattern (radrank0*, radrank1*) to protect the peer.
-+if [ -n "${KV_OFFLOAD_GIB:-}" ] && [ "$KV_OFFLOAD_GIB" != 0 ]; then
-+  bash aijuus/kv-offload/ops/clean-stale-ram-tier.sh "${SERVE_RANK:+radrank$SERVE_RANK}"
-+fi
-+OFF_ARG=""
-+if [ -n "${KV_OFFLOAD_GIB:-}" ] && [ "$KV_OFFLOAD_GIB" != 0 ]; then
-+  HC=${KV_OFFLOAD_HEAD_CAP:-}
-+  if [ -z "$HC" ]; then
-+    if [ -n "${KV_OFFLOAD_DISK_DIR:-}" ]; then HC=off; else HC=auto; fi
-+  fi
-+  EC="\"offload_prompt_only\":true"
-+  if [ "$HC" != off ] && [ "$HC" != 0 ]; then
-+    EC="\"max_offload_tokens\":\"$HC\",$EC"
-+  fi
-+  if [ -n "${KV_OFFLOAD_DISK_DIR:-}" ]; then
-+    EC="$EC,\"spec_name\":\"TieringOffloadingSpec\",\"eviction_policy\":\"$OPOLICY\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$KV_OFFLOAD_DISK_DIR\",\"n_read_threads\":$OFF_READ,\"n_write_threads\":$OFF_WRITE}]"
-+    export RADIANCE_LOOKUP_INVALIDATE=1 RADIANCE_FS_FAILED_LOAD_FORGET=1
-+    echo "[radiance] fs KV tier ON: root_dir=$KV_OFFLOAD_DISK_DIR (host-side reaper REQUIRED)"
-+  fi
-+  OFF_ARG="--kv-offloading-size $KV_OFFLOAD_GIB --kv-transfer-config {\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$EC}}"
-+  echo "[radiance] KV offload ON: cpu tier=${KV_OFFLOAD_GIB}GiB head_cap=$HC policy=$OPOLICY"
-+else
-+  echo "[radiance] KV offload OFF (plain serving)"
-+fi
++# ---- KV offload (env-gated, default off). Shared logic in build-offload-args.sh. ----
++source aijuus/kv-offload/ops/build-offload-args.sh
  echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME stop $NAME"
  
  # docker has no --replace, so a container left behind by a previous run has to go first.
