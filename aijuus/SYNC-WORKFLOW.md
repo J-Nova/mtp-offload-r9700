@@ -36,7 +36,7 @@ Invoke by telling the agent any of: `sync aijuus`, `aijuus sync`, or
    - KEEP MINE — upstream changed unrelated lines, patch still applies → keep.
    - MERGE — both changed the same region → propose the exact merged result.
    Say which is better and why (correctness, completeness, perf, maintainability).
-   Flag duplicated work (e.g. my `aijuus/patch_offload_*` vs upstream
+   Flag duplicated work (e.g. my `aijuus/kv-offload/patches/patch_offload_*` vs upstream
    `kv-cache/patch_*`) and anything removable from either side.
 
 6. Report concisely:

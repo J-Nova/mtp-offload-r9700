@@ -289,6 +289,12 @@ index d787440..7242fab 100755
 +if [ -z "${KV_OFFLOAD_DISK_DIR:-}" ] && [ -n "${KV_OFFLOAD_DISK_HOST_DIR:-}" ]; then
 +  KV_OFFLOAD_DISK_DIR=/kvcache
 +fi
++# Stale RAM tier cleanup: remove /dev/shm/vllm_offload_*.mmap left by stopped containers.
++# Only removes files not held by a live process (fuser/lsof check). In HA mode, skips
++# files matching any known instance pattern (radrank0*, radrank1*) to protect the peer.
++if [ -n "${KV_OFFLOAD_GIB:-}" ] && [ "$KV_OFFLOAD_GIB" != 0 ]; then
++  bash aijuus/kv-offload/ops/clean-stale-ram-tier.sh "${SERVE_RANK:+radrank$SERVE_RANK}"
++fi
 +OFF_ARG=""
 +if [ -n "${KV_OFFLOAD_GIB:-}" ] && [ "$KV_OFFLOAD_GIB" != 0 ]; then
 +  HC=${KV_OFFLOAD_HEAD_CAP:-}
@@ -331,6 +337,15 @@ index d787440..7242fab 100755
 +  ${RADIANCE_FS_FANOUT_MAX:+-e RADIANCE_FS_FANOUT_MAX="$RADIANCE_FS_FANOUT_MAX"} \
 +  ${RADIANCE_OFFLOAD_TRACE:+-e RADIANCE_OFFLOAD_TRACE="$RADIANCE_OFFLOAD_TRACE"} \
 +  ${RADIANCE_OFFLOAD_MAX_TOKENS:+-e RADIANCE_OFFLOAD_MAX_TOKENS="$RADIANCE_OFFLOAD_MAX_TOKENS"} \
++  ${RADIANCE_OFFLOAD_MIXED_HIT:+-e RADIANCE_OFFLOAD_MIXED_HIT="$RADIANCE_OFFLOAD_MIXED_HIT"} \
++  ${RADIANCE_OFFLOAD_INSTRUMENTATION:+-e RADIANCE_OFFLOAD_INSTRUMENTATION="$RADIANCE_OFFLOAD_INSTRUMENTATION"} \
++  ${RADIANCE_RECONCILE_REASK:+-e RADIANCE_RECONCILE_REASK="$RADIANCE_RECONCILE_REASK"} \
++  ${RADIANCE_ALIGN_PROMPT_LAST_BLOCK:+-e RADIANCE_ALIGN_PROMPT_LAST_BLOCK="$RADIANCE_ALIGN_PROMPT_LAST_BLOCK"} \
++  ${RADIANCE_OFFLOAD_LOOKUP_METRICS:+-e RADIANCE_OFFLOAD_LOOKUP_METRICS="$RADIANCE_OFFLOAD_LOOKUP_METRICS"} \
++  ${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:+-e RADIANCE_OFFLOAD_DEBUG_INSTRUMENT="$RADIANCE_OFFLOAD_DEBUG_INSTRUMENT"} \
++  ${RADIANCE_OFFLOAD_TIER_REPORT:+-e RADIANCE_OFFLOAD_TIER_REPORT="$RADIANCE_OFFLOAD_TIER_REPORT"} \
++  ${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:+-e RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK="$RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK"} \
++  ${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:+-e RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS="$RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS"} \
    -e VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}" \
    -e VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}" \
    -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
@@ -384,30 +399,8 @@ index d787440..7242fab 100755
      if [ "${RADIANCE_GDN_LAZY:-0}" = 1 ]; then python3 patch_gdn_lazy.py; fi   # TP=1 profile only; after the gdn builder patches it anchors on
      python3 patch_qwen3_thinkoff.py \
        || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
-+    if [ "${RADIANCE_OFFLOAD_DEBUG:-0}" = 1 ]; then python3 aijuus/patch_offload_debug.py; fi   # diagnostic only; see patch_offload_debug.py
-+    if [ "${RADIANCE_OFFLOAD_EAGLE_FIX:-1}" != 0 ]; then python3 aijuus/patch_offload_eagle_fallback.py; fi   # hybrid (Mamba/SWA) offload correctness; see patch_offload_eagle_fallback.py
-+    # Principled draft-group annotation (upstream candidate); supersedes the coarse fallback.
-+    # Default ON (validated 2026-09-23: only the real draft group is volatile, so twice as much
-+    # prefix is stored/served and restores are ~2x faster). RADIANCE_OFFLOAD_EAGLE_GROUPS=0 falls
-+    # back to the coarse non-Mamba fallback. See patch_offload_eagle_groups.py.
-+    if [ "${RADIANCE_OFFLOAD_EAGLE_GROUPS:-1}" != 0 ]; then python3 aijuus/patch_offload_eagle_groups.py; fi
-+    # Mamba/GDN snapshot store cadence (the CPU-tier density lever). Inert unless
-+    # RADIANCE_MAMBA_STORE_STRIDE>1; see patch_mamba_stride.py.
-+    python3 aijuus/patch_mamba_stride.py \
-+      || echo "[radiance] WARNING: mamba store-cadence patch did NOT apply -- every chunk stores all six Mamba groups"
-+    # Head-preserving retention (touch-all + position order) is the partial-reuse fix: a request
-+    # restores the contiguous head that survives instead of nothing. swa-align keeps the drafter
-+    # store grid aligned to the Mamba stride. All gated, default off. See patch_offload_swa_touch.py.
-+    python3 aijuus/patch_offload_swa_touch.py \
-+      || echo "[radiance] WARNING: swa-align/touch-order patch did NOT apply -- heads still age out"
-+    # fs secondary tier: I/O fanout + lookup invalidation + failed-load forget. Inert unless the
-+    # fs tier is configured and its gates are set (KV_OFFLOAD_DISK_DIR does both). Without it the
-+    # disk tier is unsafe: a reaped block makes a request re-promote a missing file forever. See
-+    # patch_offload_fs_tier.py and ops/kvcache-reap.sh (the mandatory reaper).
-+    python3 aijuus/patch_offload_fs_tier.py \
-+      || echo "[radiance] WARNING: fs-tier patch did NOT apply -- do NOT enable the fs disk tier"
-+    python3 aijuus/patch_offload_head_cap.py   # head-only CPU retention; inert unless max_offload_tokens/RADIANCE_OFFLOAD_MAX_TOKENS is set
-+    if [ "${RADIANCE_OFFLOAD_TRACE:-0}" = 1 ]; then python3 aijuus/patch_offload_trace.py; fi   # deep diagnostic; see patch_offload_trace.py
++    # ---- KV offload patches (centralized in apply-kv-patches.sh) ----
++    bash aijuus/kv-offload/ops/apply-kv-patches.sh
      '"${KVCACHE_PRELUDE}"'cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
      # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
      # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.

@@ -153,6 +153,18 @@ services:
       - RADIANCE_OFFLOAD_EAGLE_GROUPS=${RADIANCE_OFFLOAD_EAGLE_GROUPS:-1}
       - RADIANCE_OFFLOAD_DEBUG=${RADIANCE_OFFLOAD_DEBUG:-0}
       - RADIANCE_OFFLOAD_TRACE=${RADIANCE_OFFLOAD_TRACE:-0}
+      # Phase 1 (FATAL): mixed-hit safety + instrumentation.
+      - RADIANCE_OFFLOAD_MIXED_HIT=${RADIANCE_OFFLOAD_MIXED_HIT:-1}
+      - RADIANCE_OFFLOAD_INSTRUMENTATION=${RADIANCE_OFFLOAD_INSTRUMENTATION:-1}
+      # Phase 2 (behavioral): reconcile re-ask + prompt last-block alignment.
+      - RADIANCE_RECONCILE_REASK=${RADIANCE_RECONCILE_REASK:-1}
+      - RADIANCE_ALIGN_PROMPT_LAST_BLOCK=${RADIANCE_ALIGN_PROMPT_LAST_BLOCK:-1}
+      # Phase 5 (optional metrics): lookup counters, debug instrument, tier report, promotion wallclock, miss deferral.
+      - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-1}
+      - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-1}
+      - RADIANCE_OFFLOAD_TIER_REPORT=${RADIANCE_OFFLOAD_TIER_REPORT:-1}
+      - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-1}
+      - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-1}
       # Optional fs-tier host bind; set KV_OFFLOAD_DISK_HOST_DIR to put the shared disk store elsewhere.
       # Optional SHARED fs secondary tier: both instances point at the same directory, so a
       # prefix cached by one is loadable by the other (and it survives restarts). This is a
@@ -416,17 +428,7 @@ services:
         python3 patch_qwen3_thinkoff.py || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
         # ---- KV offload patches (mirror serve-mxfp4.sh). All inert unless KV_OFFLOAD_GIB
         # turns the OffloadingConnector on; they are what make the CPU/fs tiers correct.
-        if [ "$${RADIANCE_OFFLOAD_DEBUG:-0}" = 1 ]; then python3 aijuus/patch_offload_debug.py; fi   # diagnostic only
-        if [ "$${RADIANCE_OFFLOAD_EAGLE_FIX:-1}" != 0 ]; then python3 aijuus/patch_offload_eagle_fallback.py; fi   # hybrid (Mamba/SWA) correctness
-        if [ "$${RADIANCE_OFFLOAD_EAGLE_GROUPS:-1}" != 0 ]; then python3 aijuus/patch_offload_eagle_groups.py; fi   # per-group restore (~2x faster); 0 = coarse fallback
-        python3 aijuus/patch_mamba_stride.py \
-          || echo "[radiance] WARNING: mamba store-cadence patch did NOT apply -- every chunk stores all six Mamba groups"
-        python3 aijuus/patch_offload_swa_touch.py \
-          || echo "[radiance] WARNING: swa-align/touch-order patch did NOT apply -- heads still age out"
-        python3 aijuus/patch_offload_fs_tier.py \
-          || echo "[radiance] WARNING: fs-tier patch did NOT apply -- do NOT enable the fs disk tier"
-        python3 aijuus/patch_offload_head_cap.py   # head-only CPU retention; inert unless max_offload_tokens/RADIANCE_OFFLOAD_MAX_TOKENS is set
-        if [ "$${RADIANCE_OFFLOAD_TRACE:-0}" = 1 ]; then python3 aijuus/patch_offload_trace.py; fi   # deep diagnostic
+        bash aijuus/kv-offload/ops/apply-kv-patches.sh
         cp mxfp4-configs/*.json "$$SP"/aiter/ops/triton/configs/gemm/
         cp radiance_preamble.py /opt/radiance_preamble.py
         cp radiance_nvfp4.py radiance_mxfp4.py radiance_gdn.py radiance_gdn_lazy.py radiance_rmsquant.py radiance_drafthead.py radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py radiance_topk.py radiance_arnq.py radiance_tp3pad.py "$$SP"/
@@ -459,11 +461,7 @@ services:
         # so the stable, unique per-instance rank is the right token.
         : "$${SERVE_RANK:?SERVE_RANK must be set to a distinct value per instance (0/1)}"
         ENG_ID="radrank$$SERVE_RANK"
-        for _f in /dev/shm/vllm_offload_$${ENG_ID}*.mmap; do
-          [ -e "$${_f}" ] || continue
-          echo "[run] sweeping stale KV-offload region $$_f"
-          rm -f "$${_f}"
-        done
+        bash aijuus/kv-offload/ops/clean-stale-ram-tier.sh "$$ENG_ID"
         cd /
         # Final argv assembled here from the resolved shape (no static command:
         # compose cannot do arithmetic or conditionals, the entrypoint can).
@@ -611,6 +609,18 @@ services:
       - RADIANCE_OFFLOAD_EAGLE_GROUPS=${RADIANCE_OFFLOAD_EAGLE_GROUPS:-1}
       - RADIANCE_OFFLOAD_DEBUG=${RADIANCE_OFFLOAD_DEBUG:-0}
       - RADIANCE_OFFLOAD_TRACE=${RADIANCE_OFFLOAD_TRACE:-0}
+      # Phase 1 (FATAL): mixed-hit safety + instrumentation.
+      - RADIANCE_OFFLOAD_MIXED_HIT=${RADIANCE_OFFLOAD_MIXED_HIT:-1}
+      - RADIANCE_OFFLOAD_INSTRUMENTATION=${RADIANCE_OFFLOAD_INSTRUMENTATION:-1}
+      # Phase 2 (behavioral): reconcile re-ask + prompt last-block alignment.
+      - RADIANCE_RECONCILE_REASK=${RADIANCE_RECONCILE_REASK:-1}
+      - RADIANCE_ALIGN_PROMPT_LAST_BLOCK=${RADIANCE_ALIGN_PROMPT_LAST_BLOCK:-1}
+      # Phase 5 (optional metrics): lookup counters, debug instrument, tier report, promotion wallclock, miss deferral.
+      - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-1}
+      - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-1}
+      - RADIANCE_OFFLOAD_TIER_REPORT=${RADIANCE_OFFLOAD_TIER_REPORT:-1}
+      - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-1}
+      - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-1}
       # Optional fs-tier host bind; set KV_OFFLOAD_DISK_HOST_DIR to put the shared disk store elsewhere.
       # Optional SHARED fs secondary tier: both instances point at the same directory, so a
       # prefix cached by one is loadable by the other (and it survives restarts). This is a
@@ -874,17 +884,7 @@ services:
         python3 patch_qwen3_thinkoff.py || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
         # ---- KV offload patches (mirror serve-mxfp4.sh). All inert unless KV_OFFLOAD_GIB
         # turns the OffloadingConnector on; they are what make the CPU/fs tiers correct.
-        if [ "$${RADIANCE_OFFLOAD_DEBUG:-0}" = 1 ]; then python3 aijuus/patch_offload_debug.py; fi   # diagnostic only
-        if [ "$${RADIANCE_OFFLOAD_EAGLE_FIX:-1}" != 0 ]; then python3 aijuus/patch_offload_eagle_fallback.py; fi   # hybrid (Mamba/SWA) correctness
-        if [ "$${RADIANCE_OFFLOAD_EAGLE_GROUPS:-1}" != 0 ]; then python3 aijuus/patch_offload_eagle_groups.py; fi   # per-group restore (~2x faster); 0 = coarse fallback
-        python3 aijuus/patch_mamba_stride.py \
-          || echo "[radiance] WARNING: mamba store-cadence patch did NOT apply -- every chunk stores all six Mamba groups"
-        python3 aijuus/patch_offload_swa_touch.py \
-          || echo "[radiance] WARNING: swa-align/touch-order patch did NOT apply -- heads still age out"
-        python3 aijuus/patch_offload_fs_tier.py \
-          || echo "[radiance] WARNING: fs-tier patch did NOT apply -- do NOT enable the fs disk tier"
-        python3 aijuus/patch_offload_head_cap.py   # head-only CPU retention; inert unless max_offload_tokens/RADIANCE_OFFLOAD_MAX_TOKENS is set
-        if [ "$${RADIANCE_OFFLOAD_TRACE:-0}" = 1 ]; then python3 aijuus/patch_offload_trace.py; fi   # deep diagnostic
+        bash aijuus/kv-offload/ops/apply-kv-patches.sh
         cp mxfp4-configs/*.json "$$SP"/aiter/ops/triton/configs/gemm/
         cp radiance_preamble.py /opt/radiance_preamble.py
         cp radiance_nvfp4.py radiance_mxfp4.py radiance_gdn.py radiance_gdn_lazy.py radiance_rmsquant.py radiance_drafthead.py radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py radiance_topk.py radiance_arnq.py radiance_tp3pad.py "$$SP"/
@@ -918,11 +918,7 @@ services:
         # so the stable, unique per-instance rank is the right token.
         : "$${SERVE_RANK:?SERVE_RANK must be set to a distinct value per instance (0/1)}"
         ENG_ID="radrank$$SERVE_RANK"
-        for _f in /dev/shm/vllm_offload_$${ENG_ID}*.mmap; do
-          [ -e "$${_f}" ] || continue
-          echo "[run] sweeping stale KV-offload region $$_f"
-          rm -f "$${_f}"
-        done
+        bash aijuus/kv-offload/ops/clean-stale-ram-tier.sh "$$ENG_ID"
         cd /
         # Final argv assembled here from the resolved shape (no static command:
         # compose cannot do arithmetic or conditionals, the entrypoint can).
@@ -3424,10 +3420,509 @@ services:
                   "unit": "none"
                 }
               },
-              "description": "PCIe link speed in GT/s. Sustained current < max indicates link degradation or a link negotiated down (brief idle power-save drops are normal)."
-            }
-          ]
-        }
+               "description": "PCIe link speed in GT/s. Sustained current < max indicates link degradation or a link negotiated down (brief idle power-save drops are normal)."
+             },
+             {
+               "id": 200,
+               "type": "row",
+               "title": "KV Offload Deep Diagnostics (Phase 1 + Phase 5 patches)",
+               "collapsed": false,
+               "gridPos": {
+                 "h": 1,
+                 "w": 24,
+                 "x": 0,
+                 "y": 174
+               }
+             },
+             {
+               "id": 201,
+               "type": "timeseries",
+               "title": "CPU tier admission headroom (%)",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 0,
+                 "y": 175
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "max(vllm:kv_offload_cpu_cache_evictable_perc)*100",
+                   "legendFormat": "evictable"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "max(vllm:kv_offload_cpu_cache_free_perc)*100",
+                   "legendFormat": "free"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "percent"
+                 }
+               },
+               "description": "Admission headroom that prepare_store() tests: a batch is admitted iff len(keys_to_store) <= free + evictable. When both reach 0, stores are refused and nothing is retained. From patch_offload_instrumentation.py."
+             },
+             {
+               "id": 202,
+               "type": "timeseries",
+               "title": "FS tier cascade backlog (jobs)",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 12,
+                 "y": 175
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum(vllm:kv_offload_fs_inflight_jobs)",
+                   "legendFormat": "inflight jobs"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "short"
+                 }
+               },
+               "description": "KV offload jobs queued or in flight on the filesystem tier's thread pool. Each job holds a ref on the CPU-tier blocks it is reading, so a sustained backlog starves prepare_store() of evictable blocks. From patch_offload_instrumentation.py."
+             },
+             {
+               "id": 203,
+               "type": "timeseries",
+               "title": "Lookup terminal outcomes (per s)",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 0,
+                 "y": 183
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_calls[5m]))",
+                   "legendFormat": "calls"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_skip_short_window[5m]))",
+                   "legendFormat": "skip short_window"
+                 },
+                 {
+                   "refId": "C",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_skip_zero_hit[5m]))",
+                   "legendFormat": "skip zero_hit"
+                 },
+                 {
+                   "refId": "D",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_skip_short_result[5m]))",
+                   "legendFormat": "skip short_result"
+                 },
+                 {
+                   "refId": "E",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_deferred_backend[5m]))",
+                   "legendFormat": "deferred backend"
+                 },
+                 {
+                   "refId": "F",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_deferred_loading[5m]))",
+                   "legendFormat": "deferred loading"
+                 },
+                 {
+                   "refId": "G",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_served[5m]))",
+                   "legendFormat": "served"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "ops"
+                 }
+               },
+               "description": "Terminal outcomes of a whole _lookup call. These partition every exit: calls = skip_short_window + skip_zero_hit + skip_short_result + deferred_backend + deferred_loading + served. From patch_offload_lookup_metrics.py."
+             },
+             {
+               "id": 204,
+               "type": "timeseries",
+               "title": "Lookup chunk outcomes (per s)",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 12,
+                 "y": 183
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_chunk_hit[5m]))",
+                   "legendFormat": "hit"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_chunk_hit_pending[5m]))",
+                   "legendFormat": "hit_pending"
+                 },
+                 {
+                   "refId": "C",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_chunk_retry[5m]))",
+                   "legendFormat": "retry"
+                 },
+                 {
+                   "refId": "D",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_chunk_miss[5m]))",
+                   "legendFormat": "miss"
+                 },
+                 {
+                   "refId": "E",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_chunk_other[5m])) or vector(0)",
+                   "legendFormat": "other"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "ops"
+                 }
+               },
+               "description": "Per-chunk results from the backend, at both lookup sites. A high retry count against a low served count is the retry livelock. 'other' should stay at zero. From patch_offload_lookup_metrics.py."
+             },
+             {
+               "id": 205,
+               "type": "timeseries",
+               "title": "Lookup served tokens/s",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 0,
+                 "y": 191
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_served_tokens[5m]))",
+                   "legendFormat": "served tokens/s"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "short"
+                 }
+               },
+               "description": "Tokens returned by successful offload lookups. From patch_offload_lookup_metrics.py."
+             },
+             {
+               "id": 206,
+               "type": "timeseries",
+               "title": "Tier capacity vs used bytes",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 12,
+                 "y": 191
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "vllm:kv_offload_tier_capacity_bytes",
+                   "legendFormat": "{{tier}} capacity"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "vllm:kv_offload_tier_used_bytes",
+                   "legendFormat": "{{tier}} used"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "bytes"
+                 }
+               },
+               "description": "Configured capacity vs bytes currently held, per tier. For the fs tier this is the filesystem's used bytes, which may include data that is not KV blocks. From patch_offload_tier_report.py."
+             },
+             {
+               "id": 207,
+               "type": "timeseries",
+               "title": "Tier hit blocks / tokens",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 0,
+                 "y": 199
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_tier_hit_blocks{tier}[5m]))",
+                   "legendFormat": "{{tier}} hit blocks/s"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_tier_hit_tokens{tier}[5m]))",
+                   "legendFormat": "{{tier}} hit tokens/s"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "short"
+                 }
+               },
+               "description": "Distinct KV blocks and tokens served by each tier. The CPU tier count INCLUDES blocks a secondary tier promoted into it; subtract the secondary tiers to get the volume that originated in CPU. From patch_offload_tier_report.py."
+             },
+             {
+               "id": 208,
+               "type": "timeseries",
+               "title": "Tier stall seconds/s",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 12,
+                 "y": 199
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_tier_stall_seconds{tier}[5m]))",
+                   "legendFormat": "{{tier}} stall s/s"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "s"
+                 }
+               },
+               "description": "Seconds requests spent waiting on each tier before being allocated. This is what a slow device costs -- the number that says a tier is not merely failing to help but actively hurting. From patch_offload_tier_report.py."
+             },
+             {
+               "id": 209,
+               "type": "timeseries",
+               "title": "Tier evictions / miss-evicted",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 0,
+                 "y": 207
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_tier_evictions{tier}[5m]))",
+                   "legendFormat": "{{tier}} evictions/s"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_tier_lookup_miss_evicted{tier}[5m])) or vector(0)",
+                   "legendFormat": "{{tier}} miss-evicted/s"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "ops"
+                 }
+               },
+               "description": "Blocks evicted from each tier, and lookups that missed on a block the tier previously held and evicted. Distinguishes 'never cached' from 'cached and thrown away too early'; only the second justifies buying capacity. From patch_offload_tier_report.py."
+             },
+             {
+               "id": 210,
+               "type": "timeseries",
+               "title": "Promotion refused vs initiated",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 12,
+                 "y": 207
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_promotion_initiated{tier}[5m]))",
+                   "legendFormat": "{{tier}} initiated/s"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_promotion_refused{tier}[5m])) or vector(0)",
+                   "legendFormat": "{{tier}} refused/s"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "ops"
+                 }
+               },
+               "description": "Secondary-tier hits that could not be promoted because the primary tier was full, vs promotions that landed. Refusal rate = refused / (refused + initiated). Labelled by source tier. From patch_offload_promotion_wallclock.py."
+             },
+             {
+               "id": 211,
+               "type": "timeseries",
+               "title": "Promotion refusal reasons",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 0,
+                 "y": 215
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_promotion_refused_no_evictable{tier}[5m])) or vector(0)",
+                   "legendFormat": "{{tier}} no_evictable/s"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "sum by (tier) (rate(vllm:kv_offload_promotion_refused_protected{tier}[5m])) or vector(0)",
+                   "legendFormat": "{{tier}} protected/s"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "ops"
+                 }
+               },
+               "description": "Refusal reasons: no_evictable = not enough evictable blocks (fix: reserved headroom); protected = evictable blocks held by concurrent references (fix: bounded retry). From patch_offload_promotion_wallclock.py."
+             },
+             {
+               "id": 212,
+               "type": "timeseries",
+               "title": "Deferral lifecycle (per s)",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 12,
+                 "y": 215
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_deferral_total[5m]))",
+                   "legendFormat": "deferral total"
+                 },
+                 {
+                   "refId": "B",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_deferral_served_total[5m]))",
+                   "legendFormat": "served"
+                 },
+                 {
+                   "refId": "C",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_deferral_gave_up_total[5m]))",
+                   "legendFormat": "gave_up"
+                 },
+                 {
+                   "refId": "D",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_deferral_unresolved_total[5m])) or vector(0)",
+                   "legendFormat": "unresolved"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "ops"
+                 }
+               },
+               "description": "Per-request lifecycle of a deferred lookup: total = served + gave_up + unresolved. served = resolved to a usable hit after the wait; gave_up = resolved to 0 and prefilled; unresolved = finished/aborted with the lookup still pending (cost of unbounded deferral). From patch_offload_miss_deferral_metrics.py."
+             },
+             {
+               "id": 213,
+               "type": "timeseries",
+               "title": "Deferral depth (avg steps)",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 0,
+                 "y": 223
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_deferral_depth_sum[5m])) / sum(rate(vllm:kv_offload_lookup_deferral_depth_count[5m]))",
+                   "legendFormat": "avg deferral depth"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "none"
+                 }
+               },
+               "description": "Average scheduler steps a deferred request waited, first deferral to resolution/finish. Steps decouple the wait from batch size and separate the normal 1-2-step async round-trip from a long one (hung fs read / livelock). From patch_offload_miss_deferral_metrics.py."
+             },
+             {
+               "id": 214,
+               "type": "timeseries",
+               "title": "Transfer jobs deferred (per s)",
+               "gridPos": {
+                 "h": 8,
+                 "w": 12,
+                 "x": 12,
+                 "y": 223
+               },
+               "datasource": {
+                 "type": "prometheus",
+                 "uid": "prometheus"
+               },
+               "targets": [
+                 {
+                   "refId": "A",
+                   "expr": "sum(rate(vllm:kv_offload_lookup_transfer_jobs_deferred_total[5m])) or vector(0)",
+                   "legendFormat": "transfer_jobs deferred/s"
+                 }
+               ],
+               "fieldConfig": {
+                 "defaults": {
+                   "unit": "ops"
+                 }
+               },
+               "description": "Times get_num_new_matched_tokens declined a request because it still had in-flight transfers. The only lookup-path exit that records no outcome counter, so it was invisible; it returns a WAIT (query again later), not a miss. From patch_offload_miss_deferral_metrics.py."
+             }
+           ]
+         }
         EOF
         cat > /out/gpu-exporter/gpu-exporter.py <<'PYEOF'
         #!/usr/bin/env python3

@@ -57,9 +57,9 @@ import sys
 import sysconfig
 from pathlib import Path
 
-# _patchlib.py lives at the repo root (one level up from aijuus/); insert it
+# _patchlib.py lives at the repo root (four levels up from patches/); insert it
 # explicitly since sys.path[0] is aijuus/ when run as `python3 aijuus/<script>.py`.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 from _patchlib import apply  # noqa: E402
 
 SP = Path(os.environ.get("RADIANCE_VLLM_DIR", sysconfig.get_paths()["purelib"]))

@@ -9,7 +9,7 @@ Everything personal lives here. Upstream files are never edited, so
    files (Dockerfile, serve-mxfp4.sh, radiance_*.py, docs, …). Applied on demand
    by `aijuus/apply.sh`, never committed. These are **build-time** (baked into the
    image), except two files the entrypoint also re-copies at runtime.
-2. **Runtime patch scripts** — `aijuus/patch_*.py` (plus upstream `patch_*.py`):
+2. **Runtime patch scripts** — `aijuus/kv-offload/patches/patch_*.py` (plus upstream `patch_*.py`):
    executed by the vLLM entrypoint from the `/patches` mount on every container
    start. Idempotent; editing one needs only a container restart, no rebuild.
 
@@ -47,10 +47,10 @@ compose templates) to the tag `build.sh` prints
 ## Coolify never builds — don't rebuild unless you must
 
 Coolify only pulls the image and runs the compose; the vLLM entrypoint then
-applies `aijuus/patch_*.py`, copies the runtime files, and compiles the kernel at
+applies `aijuus/kv-offload/patches/patch_*.py`, copies the runtime files, and compiles the kernel at
 every boot. So:
 
-- **No rebuild** (redeploy/restart is enough): `aijuus/patch_*.py`, `patch_*.py`,
+- **No rebuild** (redeploy/restart is enough): `aijuus/kv-offload/patches/patch_*.py`, `patch_*.py`,
   compose/env, `model-registry.json`, `model-router.py`, `model-controller.py`,
   and overlay `062`/`063` (apply the overlay + restart).
 - **Rebuild only for** build-time files: Dockerfile / base image (overlay `010`/
@@ -66,7 +66,7 @@ every boot. So:
 
 | Change | Action |
 |---|---|
-| `aijuus/patch_*.py`, `patch_*.py`, compose/env, model registry/router/controller | restart/redeploy containers — no apply, no rebuild |
+| `aijuus/kv-offload/patches/patch_*.py`, `patch_*.py`, compose/env, model registry/router/controller | restart/redeploy containers — no apply, no rebuild |
 | overlay `062-radiance-drafthead` / `063-radiance-preamble` | `apply.sh` + restart vLLM — no rebuild |
 | overlay on baked/ops files (`060`/`061` radiance_draft*.py, `050`/`051` fp8/quantize, `080` serve-mxfp4.sh, `010`/`011` Dockerfile, `030`-`032` ops, docs, `070`/`071` paroquant) | `apply.sh` + rebuild + push + point Coolify `IMAGE` at the new tag |
 

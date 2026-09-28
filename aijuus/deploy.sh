@@ -6,7 +6,7 @@
 #     * build.sh bakes whatever the working tree contains -- if the overlay is
 #       not applied, it silently bakes the pristine upstream files;
 #     * Coolify never rebuilds -- it pulls the prebuilt image and only runs the
-#       runtime aijuus/patch_*.py scripts from the /patches mount.
+#       runtime aijuus/kv-offload/patches/patch_*.py scripts from the /patches mount.
 #   This wrapper closes that gap and makes the "when do I apply / rebuild?"
 #   decision explicit.
 #
@@ -111,7 +111,7 @@ runtime_patch_state() {
 
 rebuild_guidance() {
   cat <<'EOF'
-rebuild needed?:   NO for runtime-deliverable changes (aijuus/patch_*.py, compose/env,
+rebuild needed?:   NO for runtime-deliverable changes (aijuus/kv-offload/patches/patch_*.py, compose/env,
                    registry/router/controller, and 062/063 via apply + restart)
                    -> just redeploy/restart the containers; the entrypoint applies them.
                    YES only for build-time files: Dockerfile/base (overlay 010/011, or
