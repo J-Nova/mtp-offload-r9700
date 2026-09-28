@@ -1,0 +1,110 @@
+{
+  "_schema": {
+    "note": "Model registry for the 2-GPU hot-swap deployment. Every key not starting with '_' is a servable model; the key is the OpenAI `model` name clients request. Read by both vllm entrypoints (model selection at boot), model-controller (swap orchestration), and model-router (routing via state.json). Per-model serving config lives HERE, not in the compose env: the entrypoint evals the selected entry and exports these into the server process.",
+    "_defaults": "Optional block shared by every model. Any field here can be overridden per model, and per-model `server_env` entries are merged over `_defaults.server_env` (model wins).",
+    "fields": {
+      "path": "model dir as seen inside the container (/models/...)",
+      "served_name": "optional, defaults to the key",
+      "drafter": "drafter checkpoint for spec decode. OMIT for spec_method=mtp (mtp uses the head inside the target) and for none",
+      "spec_method": "dflash | mtp | none",
+      "spec_tokens": "speculative depth (this deployment: dflash=16, mtp=8)",
+      "verify_head": "0 | 1 -- int2 verify-head GEMM (RADIANCE_VERIFY_HEAD). +2.9% decode under dflash, neutral under mtp; 1 for dflash entries, 0 for mtp. Omitted -> method default (dflash=1, mtp=0).",
+      "max_model_len": "--max-model-len. Per-model context length; keep in sync with kv_cache_memory (the pin key includes maxlen).",
+      "kv_cache_dtype": "--kv-cache-dtype (fp8).",
+      "chat_template": "--chat-template path (container path).",
+      "tool_call_parser": "--tool-call-parser value; empty -> no --enable-auto-tool-choice.",
+      "reasoning_parser": "--reasoning-parser value; empty -> omitted.",
+      "generation_config": "object passed to --override-generation-config (default {}).",
+      "server_env": "object of extra env exported into the vLLM process (e.g. RADIANCE_MXFP4*, spec-draft tuning). Merged over _defaults.server_env.",
+      "kv_cache_memory": "calibrated KV pin in BYTES for the (seqs=8, chunk=4096, maxlen) shape. The pin key is (sig, maxseqs, chunk, maxlen, method:depth) -- the model does NOT enter the key, but method:depth DOES, so dflash:16 and mtp:8 are different keys. Calibrate with ./calibrate-kv.sh; omit to fall back to vLLM profiling.",
+      "note": "operator note, not read by any service"
+    }
+  },
+
+  "_defaults": {
+    "max_model_len": 160000,
+    "kv_cache_dtype": "fp8",
+    "chat_template": "/patches/qwen-fixed-v22.3.jinja",
+    "tool_call_parser": "qwen3_coder",
+    "reasoning_parser": "qwen3",
+    "generation_config": {"temperature": 0.7, "top_p": 0.95, "top_k": 20},
+    "server_env": {
+      "RADIANCE_PRESHUFFLE": "1",
+      "RADIANCE_FUSE_RMS_QUANT": "1",
+      "RADIANCE_MXFP4": "1",
+      "RADIANCE_MXFP4_W4A8": "1",
+      "RADIANCE_MXFP4_W4A8_MIN_M": "0",
+      "RADIANCE_MXFP4_DEBUG": "0",
+      "RADIANCE_MXFP4_PUREQUANT": "0",
+      "RADIANCE_MXFP4_SYNC": "0",
+      "RADIANCE_MXFP4_CLONE": "0",
+      "RADIANCE_MXFP4_CHECKX": "0",
+      "RADIANCE_MXFP4_PADOUT": "0",
+      "RADIANCE_MXFP4_TN4_MIN_M": "2048",
+      "RADIANCE_MXFP4_DECODE_MAX_M": "192",
+      "RADIANCE_MXFP4_DECODE_NT": "1",
+      "RADIANCE_MXFP4_A_TILED_MIN_M": "513",
+      "RADIANCE_MXFP4_WPERM": "1",
+      "RADIANCE_MXFP4_EPIFAST": "1",
+      "RADIANCE_MXFP4_R4D_DECODE_MAX_M": "0",
+      "RADIANCE_MXFP4_HOIST_QUANT": "1",
+      "RADIANCE_MXFP4_TRACED_QUANT": "1",
+      "RADIANCE_MXFP4_SANITIZE": "0",
+      "RADIANCE_MXFP4_MHIST": "0",
+      "RADIANCE_MXFP4_CHECK_MAX_M": "128",
+      "RADIANCE_MXFP4_REFLINEAR": "0",
+      "RADIANCE_FAST_DRAFT": "1",
+      "RADIANCE_DRAFT_TAU": "0.20",
+      "RADIANCE_DRAFT_RERANK": "80",
+      "RADIANCE_VERIFY_HEAD_MAX_M": "32",
+      "RADIANCE_DYNAMIC_WIDTH": "1",
+      "RADIANCE_DYNW_ALPHA": "0.35",
+      "RADIANCE_DYNW_MARGIN": "2",
+      "RADIANCE_DYNW_MIN": "2",
+      "RADIANCE_DYNW_MIN_BATCH": "3"
+    }
+  },
+
+  "ThinkingCap-Qwen3.8-27B-MXFP4-OCP-GPTQ": {
+    "path": "/models/ThinkingCap-Qwen3.8-27B-MXFP4-OCP-GPTQ",
+    "drafter": "/models/Qwen3.8-27B-DFlash2-FP8",
+    "spec_method": "dflash",
+    "spec_tokens": 16,
+    "verify_head": 1,
+    "kv_cache_memory": 8761733283,
+    "note": "ThinkingCap finetune. dflash:16 pin measured 2026-09-27 on this host for seqs8/chunk4096/maxlen160000."
+  },
+
+  "Qwen3.8-27B-MXFP4-mtpfp8": {
+    "path": "/models/Qwen3.8-27B-MXFP4-mtpfp8",
+    "drafter": "/models/Qwen3.8-27B-DFlash2-FP8",
+    "spec_method": "dflash",
+    "spec_tokens": 16,
+    "verify_head": 1,
+    "kv_cache_memory": 8761733283,
+    "note": "Base/standard 27B: AMD amd/Qwen3.8-27B-Quark-AWQ-MXFP4, built by ./setup-mxfp4.sh (SNAP default Qwen3.8-27B-MXFP4-mtpfp8). Shares the ThinkingCap dflash drafter. NOT on disk yet -- run ./setup-mxfp4.sh before requesting it (a request before then fails the swap; the other instance keeps serving)."
+  },
+
+  "Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ": {
+    "path": "/models/Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ",
+    "drafter": "/models/Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-DFlash2-FP8",
+    "spec_method": "dflash",
+    "spec_tokens": 16,
+    "verify_head": 1,
+    "kv_cache_memory": 8761733283,
+    "note": "Blend, dflash variant (dedicated blend drafter). Same weights as the -mtp entry below; different model name, so switching between the two reloads the instance."
+  },
+
+  "Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp": {
+    "path": "/models/Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ",
+    "spec_method": "mtp",
+    "spec_tokens": 8,
+    "verify_head": 0,
+    "server_env": {
+      "RADIANCE_DYNAMIC_DRAFT": "1",
+      "RADIANCE_DRAFT_NGRAM_STRONG": "8",
+      "RADIANCE_DRAFT_RERANK": "32"
+    },
+    "note": "Blend, MTP variant: uses the MTP head inside the blend (no drafter). Spec tuning from the MTP sweep: SPEC=8; DYNAMIC_DRAFT=1, FAST_DRAFT=1, TAU=0.20, NGRAM_STRONG=8 (from _defaults + here); RERANK=32 (MTP's argmax needs only 32 -- README.md:561, MTP-DECODE-OPT-PLAN.md:214; _defaults' 80 is the dflash value); VERIFY_HEAD=0 via the field above. kv_cache_memory intentionally omitted -- no mtp:8 pin calibrated at seqs8/chunk4096/maxlen160000, so it falls back to vLLM profiling. Run ./calibrate-kv.sh SPEC_METHOD=mtp SPEC=8 before relying on MAXLEN=160000."
+  }
+}

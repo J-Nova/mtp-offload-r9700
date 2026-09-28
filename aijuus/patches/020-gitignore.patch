@@ -1,0 +1,9 @@
+diff --git a/.gitignore b/.gitignore
+index de5e38d..c1c3062 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,3 +16,4 @@ libr4d/
+ # editor / os
+ *.swp
+ .DS_Store
++.radiance-knobs.json

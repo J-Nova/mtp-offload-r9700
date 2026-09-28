@@ -1,0 +1,17 @@
+{
+  "_comment": "Capability group -> the corpus domains that belong to it. protect.py's per-group strategy picks top-N per GROUP, not per domain: five separate code_* domains would otherwise each claim their own top-N and inflate the protected set by ~40% for no extra capability coverage. Any domain not listed here becomes its own group.",
+  "code": ["code_files", "code_breadth", "code_gen", "code_doc", "code_proj", "code_long"],
+  "prose": ["prose_wiki", "prose_long", "literary", "books_long", "books_xlong"],
+  "multilingual": ["multilingual", "ml_knowledge"],
+  "knowledge": ["knowledge", "science_hard"],
+  "commonsense": ["cs_arc", "cs_hellaswag", "cs_winogrande"],
+  "math": ["math_grade", "math_comp"],
+  "dialogue": ["dialogue"],
+  "instruct": ["instruct"],
+  "tools": ["tools"],
+  "cot": ["cot"],
+  "summarize": ["summarize"],
+  "creative": ["creative"],
+  "safety": ["safety"],
+  "vision": ["vision"]
+}

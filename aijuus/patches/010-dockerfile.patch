@@ -1,0 +1,14 @@
+diff --git a/Dockerfile b/Dockerfile
+index 48bbdf2..ac713fe 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -379,7 +379,8 @@ ENV VIRTUAL_ENV=/opt/vllm \
+ ENV RADIANCE_USE_R4D=1 \
+     RADIANCE_USE_R4D_AR=1 RADIANCE_USE_R4D_AR_QUANT=1 \
+     RADIANCE_PRESHUFFLE=1 RADIANCE_FUSE_RMS_QUANT=1 \
+-    RADIANCE_DYNAMIC_DRAFT=1 RADIANCE_DRAFT_SCHEDULE=1:8,2:7,4:6,8:5,16:4 RADIANCE_DRAFT_TAU=0.35 \
++    RADIANCE_FAST_DRAFT=1 \
++    RADIANCE_DYNAMIC_DRAFT=1 RADIANCE_DRAFT_SCHEDULE=1:8,2:7,4:6,8:5,16:4 RADIANCE_DRAFT_TAU=0.20 \
+     RADIANCE_RUN_BWTEST=1
+ 
+ # Fail the build if the native stack does not import, or if a wheel reports a version that does not

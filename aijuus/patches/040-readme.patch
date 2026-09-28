@@ -1,0 +1,83 @@
+diff --git a/README.md b/README.md
+index 9968537..2a8e189 100644
+--- a/README.md
++++ b/README.md
+@@ -539,7 +539,7 @@ of overrides produces without running it.
+ | Variable | Default | What it does |
+ |---|---|---|
+ | `SPEC_METHOD` | `dflash` | `dflash` (block-diffusion drafter, one graphed pass, needs the second checkpoint) or `mtp` (the head inside the target, no extra download) |
+-| `SPEC` | `7` dflash / `4` mtp | Speculative depth. Under dflash it is content-dependent: 7 wins on a weighted mix (code/JSON run 4.7-6.0 tok/update), 5 wins on prose-heavy or batch-throughput serving. `RADIANCE_DYNAMIC_WIDTH` mostly dissolves the trade-off |
++| `SPEC` | `7` dflash / `8` mtp | Speculative depth. Under dflash it is content-dependent: 7 wins on a weighted mix (code/JSON run 4.7-6.0 tok/update), 5 wins on prose-heavy or batch-throughput serving. Under `mtp` it is a ceiling for the dynamic n-gram controller, so 8 leaves room for free verbatim tails; the forward schedule caps serial drafts at concurrency. `RADIANCE_DYNAMIC_WIDTH` mostly dissolves the dflash trade-off |
+ | `MAXSEQS` | `8` | Max concurrent sequences. Above 8 the decode band widens to `RADIANCE_MXFP4_DECODE_MAX_M=128` automatically and the `KV_MEM` lookup misses, so re-run `./calibrate-kv.sh` if you standardise on another value |
+ | `MAXLEN` | `262144` | Context length. Only lower it for diagnostics: the FLA GDN fallback allocates against this, not against the chunk size |
+ | `CHUNK` | `8192` | Prefill chunk. `RADIANCE_AR_MAX_KB` is derived from it, so raising it cannot silently drop prefill onto RCCL |
+@@ -595,6 +595,7 @@ content. The patch targets the engine, so it applies under either parser name.
+ | `MIN_M` | `0` | M above which the hand-written W4A8 kernel takes over from aiter. `0` means always: the comparison is `>`, so `1` would still send M=1 to aiter |
+ | `RADIANCE_MXFP4_DECODE_MAX_M` | `64` (`128` if `MAXSEQS>8`) | The small-M decode GEMM band. Must cover `MAXSEQS x (SPEC+1)` rows or the biggest verify batches fall onto the prefill tile |
+ | `FAST_DRAFT` | `1` | The int2 draft head with an exact rerank: +6.5% decode under mtp, +5.1% under dflash |
++| `RADIANCE_DRAFT_HEAD_TOP1` | `0` | Fused int2 draft-head top-1 (B2): the head emits block maxima and per-block sum-exp instead of the full logit row; top-1 id and confidence recovered from candidate arrays with no Y read. Removes 2 capture kernels + the 248320-wide argmax + the Y store. Default off; A/B pending |
+ | `RADIANCE_DRAFT_RERANK` | `80` dflash / `32` mtp | The candidate pool a top-k caller can draw from, not just a rescoring budget. Under dflash, 32 costs 5.3% of acceptance; 80 covers 4x the drafter's `selector_top_k` and 4x the sampler's `top_k` |
+ | `RADIANCE_VERIFY_HEAD` | `1` dflash / `0` mtp | The int2 head applied to the target's verify `lm_head` (one 2.02 ms GEMM per step, 5.9% of wall). +2.9% combined decode, output-equivalent |
+ | `RADIANCE_DYNAMIC_WIDTH` | `1` | Scheduler-side per-request verify width from an acceptance EMA. Recovers static `SPEC=5`'s batch efficiency at `SPEC=7` without losing code depth. Lossless by construction |
+@@ -927,7 +928,7 @@ Everything below is baked into the image, and the tuned paths are env-gated and
+ | **Fine-grained MoE support** | RDNA4-tuned fused-MoE Triton configs (always on; removes the stock config's `M>=96` cliff, lossless), plus the skinny bf16 GEMM on the MoE gate. Inert on models they do not apply to |
+ | **Skinny bf16 GEMM** (`RADIANCE_SKINNY_GEMM`) | Projections too small for rocBLAS to fill the machine go to the R4D split-K kernel for `M` in `[6,64]`. `all` adds shapes that differ from rocBLAS at a bf16 ULP, most importantly GDN `in_proj_ba`, 480 KiB run 48 times per step: 28.5us against 3.6us |
+ | **Native MXFP4** (`RADIANCE_MXFP4`) | Bit-identical to vLLM's emulation and multiples faster, plus the optional hand-written fp8-WMMA W4A8 GEMM (`RADIANCE_MXFP4_W4A8`). See [How the MXFP4 path works](#how-the-mxfp4-path-works) |
+-| **Lossless dynamic MTP drafting** | A per-request confidence gate plus verbatim n-gram tail that varies draft depth without changing what the model verifies. `mtp` only: it stops a serial loop of draft forwards early, and a `dflash` drafter has no such loop |
++| **Lossless dynamic MTP drafting** | A per-request confidence gate plus a top-2 verbatim n-gram tail that varies draft depth without changing what the model verifies. A long exact match (default length 8) is taken even when MTP's top-1 disagrees, so prompt-lookup covers repetitive code/JSON/file-edit steps for free; short matches keep the strict agreement rule. `mtp` only: it stops a serial loop of draft forwards early, and a `dflash` drafter has no such loop. See [NGRAM-MTP-PLAN.md](NGRAM-MTP-PLAN.md) |
+ | **The tuned drafter stack** (`RADIANCE_FAST_DRAFT`) | The draft head at 2 bits with an exact rerank (any drafter), plus a `dflash` drafter's decoder projections packed to signed symmetric int4 (one f16 scale per 128 input channels, no zero point, 4.25 bits per weight) on two purpose-built gfx1201 kernels (f16 matrix-core below 16 rows, int8 above). Codes are derived at load, so there is no calibration data and nothing on disk. Draft pass -9.1% at a drafter batch of 64; decode step -5.1% for +3.5% tokens/s |
+ | **Prefix caching on the GDN hybrid** | Hybrid models leave APC off by default, so the compose turns it on with `--enable-prefix-caching --mamba-cache-mode=align`. Align mode snapshots and restores the GDN recurrent state at block boundaries (verified bit-identical to full recompute, including under MTP), giving a large TTFT drop on shared prefixes |
+ | **Startup topology + bandwidth sweep** (`RADIANCE_RUN_BWTEST`) | Device list, P2P access matrix, NUMA distances, peak copy bandwidth per agent pair. Backgrounded, about a second. Set `0` to skip |
+@@ -1029,12 +1030,52 @@ modules the recipes do not pre-bake).
+ | `docker-compose-setup.sh` | Writes the `.env` `docker-compose.yml` needs on this host (GPU group ids, HIP indices, paths), and optionally fetches the FP8 checkpoint |
+ | `gpu-detect.sh` | GPU/TP/KV detection, sourced by the launcher. Run it directly to see what it finds |
+ | `calibrate-kv.sh` | Measures a `--kv-cache-memory` pin for your hardware and saves it |
++| `offload-size.py` | Recommends `cpu_bytes_to_use` for the CPU KV-offload tier from your context and concurrent long-prefix count; `--mamba-stride` resizes for the Mamba store cadence; emits a `max_offload_tokens` head cap when the tier is too small (also `--capacity`, `--json`) |
++| `patch_offload_eagle_groups.py` | Annotates the real EAGLE/MTP draft KV group positionally (hybrid Mamba+attention), so only g8 is volatile instead of all nine. Default on; `RADIANCE_OFFLOAD_EAGLE_GROUPS=0` falls back (upstream candidate) |
++| `patch_mamba_stride.py` | Stores Mamba/GDN snapshots every Nth chunk instead of every chunk — the CPU-tier density lever (~2.4x at N=8). `RADIANCE_MAMBA_STORE_STRIDE` (default 1 = inert) |
++| `patch_offload_swa_touch.py` | Head-preserving retention: touches every group's chunks in one position-ordered (head-to-tail) call, so eviction takes tails and a prefix keeps a contiguous head to restore PARTIALLY. Also aligns the sliding-window store grid to the Mamba stride. `RADIANCE_TOUCH_ALL_GROUPS` / `RADIANCE_TOUCH_POSITION_ORDER` / `RADIANCE_SWA_STORE_MAMBA_ALIGN` (default off; measured neutral at stride 1 with a fitting cap) |
++| `patch_offload_head_cap.py` | Server-level `max_offload_tokens` default: caps each request from token 0 so the CPU tier keeps a contiguous HEAD and a returning request restores partially instead of nothing. `"auto"` derives a fair share per concurrent request (validated). `extra_config` or `RADIANCE_OFFLOAD_MAX_TOKENS` |
++| `patch_offload_fs_tier.py` | Makes the fs secondary tier production-safe: I/O fan-out (upstream PR #49225), drop the stale `absent` lookup verdict on store, and forget a failed load instead of re-promoting a missing file forever. Gated (`RADIANCE_FS_FANOUT_*`, `RADIANCE_LOOKUP_INVALIDATE`, `RADIANCE_FS_FAILED_LOAD_FORGET`); the launcher enables the fixes when the fs tier is on |
++| `ops/setup-kv-offload.sh` | **One-command Mode B host setup** (dir/volume + mandatory reaper + GiB cap + deployment env), with `--uninstall` and `--dry-run`. Front door for the three scripts below |
++| `ops/kvcache-reap.sh` (+ `.service`/`.timer`) | **The fs tier's eviction policy** — the tier has no capacity/quota/TTL. Oldest-mtime-first with a hard min-age floor and an emergency stage; `KVCACHE_MAX_GIB`/`KVCACHE_MAX_MB` caps the KV directory in bytes. Install and run it whenever the fs tier is enabled |
++| `ops/make-kvcache-volume.sh` | Creates a dedicated fixed-size (default 200 GiB) `fallocate`d ext4 loopback volume for the fs tier — a hard cap and a reservation so nothing else on the host can take the space |
+ | `kv-profiles.tsv` | Pins measured so far, keyed on hardware and batch shape |
+ | `fp8_mtp.py` | Builds the loadable checkpoint from AMD's release (setup drives it) |
+ | `tp3pad_selftest.py` | Checks the TP=3 padding rules against the safetensors headers, no GPU needed |
+ | `run_mxfp4_074.sh` | Compatibility shim: the launcher's old name, forwards to `serve-mxfp4.sh` |
+ | `run_mxfp4_minm.sh` | The 0.5.8 launch, frozen. The only way to reproduce the baseline the numbers here are measured against |
+ 
++**CPU KV offload in the deployment.** Offload is off by default. Set `KV_OFFLOAD_GIB` (GiB, e.g. 12
++on both `vllm-0`/`vllm-1`) to enable it; both instances share the host `/dev/shm`, so the two tiers
++must sum to <= ~28 G.
++
++**Shared fs (disk) tier — the recommended mode.** One command sets up the whole host side:
++
++```bash
++sudo ./ops/setup-kv-offload.sh              # 12 GiB RAM/instance, 100 GiB disk cap
++# sudo ./ops/setup-kv-offload.sh --volume-gib 500   # reserve a fixed 500 GiB volume instead
++# sudo ./ops/setup-kv-offload.sh --uninstall        # reverse it
++# ./ops/setup-kv-offload.sh --dry-run               # preview, change nothing
++```
++
++It prepares the disk-tier directory (or a reserved fixed-size volume), installs and starts the
++**mandatory reaper** (the tier never deletes on its own) with the GiB cap, and prints the two
++Coolify variables to set on **both** services:
++
++```
++KV_OFFLOAD_GIB=12
++KV_OFFLOAD_DISK_HOST_DIR=/var/lib/radiance-kvcache
++```
++
++The compose mounts that host dir at `/kvcache` in both instances and `KV_OFFLOAD_DISK_DIR`
++defaults to `/kvcache/blocks`, so a prefix cached by one replica is loadable by the other and
++survives restarts. With the disk holding the overflow, **no per-request head cap is needed**.
++
++A prefix cache is per instance, so send a stable `x-session-id` header to keep a conversation on one
++replica (HAProxy sticks on it; clients without the header keep `leastconn`). Full analysis, tier
++comparison, disk sizing, and runbook: `PERFORMANCE.md` -> "Productionizing the CPU/disk KV offload".
++
++
+ ### ParoQuant entry points
+ 
+ | File | What it is |

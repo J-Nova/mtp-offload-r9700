@@ -1,0 +1,16 @@
+{
+  "reference_model": "/home/juup/models/Qwen3.8-27B-MXFP4-mtpfp8",
+  "global": {
+    "scheme": "mxfp4",
+    "algo": "awq"
+  },
+  "exclude": {
+    "mode": "reference"
+  },
+  "mtp": {
+    "mode": "fp8",
+    "keep_in_exclude": true
+  },
+  "version": "0.13+unknown",
+  "retain_algo_config": false
+}

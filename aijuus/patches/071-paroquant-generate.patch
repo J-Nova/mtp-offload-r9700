@@ -1,0 +1,35 @@
+diff --git a/paroquant/drafter/generate.py b/paroquant/drafter/generate.py
+index 46036f1..24bc46b 100644
+--- a/paroquant/drafter/generate.py
++++ b/paroquant/drafter/generate.py
+@@ -1,8 +1,13 @@
+ """Drive the served target over prompts.jsonl so the capture hook records its own generations.
+-Server sampling defaults apply (prod: temperature 0.7, top_p 0.95, top_k 20, reasoning on)."""
+-import json, sys, time, urllib.request, concurrent.futures as cf
++Server sampling defaults apply (prod: temperature 0.7, top_p 0.95, top_k 20, reasoning on).
++
++Target override via env, so this works against any serve-mxfp4.sh target (not just PARO on :8080):
++  BENCH_URL=http://localhost:8000/v1/chat/completions   BENCH_MODEL=<served model name>
++"""
++import json, os, sys, time, urllib.request, concurrent.futures as cf
+ prompts, out, conc, max_tokens = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+-URL = "http://localhost:8080/v1/chat/completions"; MODEL = "Qwen3.8-PARO-MXFP4"
++URL = os.environ.get("BENCH_URL", "http://localhost:8080/v1/chat/completions")
++MODEL = os.environ.get("BENCH_MODEL", "Qwen3.8-PARO-MXFP4")
+ rows = [json.loads(l) for l in open(prompts)]
+ done = set()
+ try:
+@@ -26,6 +31,10 @@ with open(out, "a") as f, cf.ThreadPoolExecutor(conc) as ex:
+     for res in ex.map(one, todo):
+         f.write(json.dumps(res) + "\n"); f.flush(); n += 1
+         toks += (res.get("usage") or {}).get("completion_tokens", 0)
+-        if n % 50 == 0:
+-            el = time.time() - t0; print(f"{n}/{len(todo)} done, {toks} completion tokens, {toks/el:.0f} tok/s, {el/60:.1f} min", flush=True)
+-print("DONE", n, "responses,", toks, "completion tokens", flush=True)
++        if n % 10 == 0 or n == len(todo):
++            el = max(time.time() - t0, 1e-9)
++            eta = (len(todo) - n) * el / n
++            print(f"  [gen] {n}/{len(todo)} ({100*n/max(len(todo),1):.0f}%) "
++                  f"{toks} tok, {toks/el:.0f} tok/s, {el/60:.1f} min, ETA {eta/60:.1f} min",
++                  flush=True)
++print(f"DONE {n} responses, {toks} completion tokens in {(time.time()-t0)/60:.1f} min", flush=True)

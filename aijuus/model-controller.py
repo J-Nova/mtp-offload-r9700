@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Model hot-swap controller for the 2-GPU Radiance deployment.
+
+Watches /model-state/trigger.json (written by model-router when a request
+arrives for a registered model no instance is ready to serve) and performs a
+ONE-AT-A-TIME swap:
+
+  1. pick an IDLE instance (no in-flight requests), so a swap does not drop
+     active work; when both are busy, the less-busy one (the busier keeps
+     serving). Idle picks rotate, so swaps spread across the cards.
+  2. record it in state.json as {model, ready:false}
+     -> model-router stops routing to it and (if another model is ready)
+        serves its traffic with that model meanwhile, so the previously-loaded
+        model keeps serving throughout (no error window)
+  3. drain: wait up to IDLE_WAIT_SECONDS for its in-flight requests to finish
+     (bounded, so a never-ending generation cannot block a swap forever)
+  4. docker restart that container (its entrypoint re-reads state.json +
+     model-registry.json and boots the new model)
+  5. poll /health until ready, then flip ready:true
+     -> model-router routes the new model to it
+
+state.json also self-heals against /v1/models, so a crash or a manual
+docker restart converges back to the real state. Only this process writes
+state.json; the vllm containers mount it read-only and model-router only
+writes trigger.json.
+
+state.json schema (read by model-router):
+    { "<instance>": {"model": "<name>", "ready": bool,
+                     "endpoint": "http://host:port", "rank": <int>}, ... }
+`endpoint`/`rank` let the router collapse tensor-parallel ranks (which share
+an endpoint) into one routing target -- the path to TP=2 support later.
+"""
+import json
+import os
+import re
+import socket
+import time
+import urllib.request
+
+STATE = "/model-state/state.json"
+TRIGGER = "/model-state/trigger.json"
+USAGE = "/model-state/usage.json"   # written by model-router; may not exist yet
+REGISTRY = "/model-registry.json"
+SOCK = "/var/run/docker.sock"
+API_KEY = os.environ.get("VLLM_API_KEY", "")
+DEFAULT_MODEL = os.environ.get("MODEL_DEFAULT", "")
+SWAP_TIMEOUT = int(os.environ.get("SWAP_TIMEOUT", "3600"))
+POLL = int(os.environ.get("POLL_SECONDS", "10"))
+TICK = int(os.environ.get("TICK_SECONDS", "5"))
+# Back off this long after a swap fails, so a bad registry entry cannot restart
+# the target on every arriving request.
+FAIL_COOLDOWN = int(os.environ.get("FAIL_COOLDOWN_SECONDS", "120"))
+# Drain: before restarting an instance, wait up to IDLE_WAIT for its in-flight
+# requests to finish (polled every IDLE_POLL), so a swap does not drop active
+# work. 0 disables the wait (swap immediately).
+IDLE_WAIT = int(os.environ.get("IDLE_WAIT_SECONDS", "300"))
+IDLE_POLL = int(os.environ.get("IDLE_POLL_SECONDS", "5"))
+
+# compose service name -> in-network base URL (+ tensor-parallel rank)
+INSTANCES = {"vllm-0": "http://vllm-0:8000", "vllm-1": "http://vllm-1:8001"}
+RANKS = {"vllm-0": 0, "vllm-1": 1}
+
+_last_fail = {}   # model -> monotonic time of the last failed swap
+_rr = 0           # rotating pick among equally-suitable (idle) instances
+
+
+def entry(svc, model, ready):
+    return {"model": model, "ready": ready,
+            "endpoint": INSTANCES[svc], "rank": RANKS[svc]}
+
+
+def served_to_key(reg):
+    """Map each instance's advertised /v1/models name back to its registry key,
+    so state["model"] is always the key the router matches requests against."""
+    return {v.get("served_name", k): k for k, v in reg.items()}
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg, flush=True)
+
+
+def load_registry():
+    with open(REGISTRY) as f:
+        reg = json.load(f)
+    return {k: v for k, v in reg.items() if not k.startswith("_")}
+
+
+def read_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def read_usage():
+    """Last-request epoch per model, written by model-router (MRU hint)."""
+    try:
+        with open(USAGE) as f:
+            u = json.load(f)
+            return u if isinstance(u, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_state(st):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, STATE)
+
+
+def sock_request(method, path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCK)
+    try:
+        s.sendall(("%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+                   % (method, path, socket.gethostname())).encode())
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    status = int(head.split(b" ")[1]) if head else 0
+    return status, body
+
+
+def find_container(service):
+    """Container id by compose service label (Coolify renames containers,
+    so never rely on the bare service name)."""
+    status, body = sock_request("GET", "/containers/json?all=1")
+    if status != 200:
+        return None
+    for c in json.loads(body):
+        if (c.get("Labels") or {}).get("com.docker.compose.service") == service:
+            return c["Id"]
+    return None
+
+
+def _get(url):
+    req = urllib.request.Request(url)
+    if API_KEY:
+        req.add_header("Authorization", "Bearer " + API_KEY)
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r
+
+
+def instance_model(base):
+    """Model the instance actually serves right now (None if unreachable)."""
+    try:
+        data = json.loads(_get(base + "/v1/models").read().decode())
+        models = [m.get("id") for m in data.get("data", []) if m.get("id")]
+        return models[0] if models else None
+    except Exception:
+        return None
+
+
+_RUNNING_RE = re.compile(r"^vllm:num_requests_running(?:\{[^}]*\})?\s+(\S+)$")
+
+
+def running_requests(base):
+    """Sum of vllm:num_requests_running across label sets (0.0 if unavailable).
+
+    vLLM emits the gauge with labels (e.g.
+    `vllm:num_requests_running{engine="0",model_name="..."} 0.0`), so a plain
+    `startswith(name + " ")` never matches -- parse tolerantly of the label
+    block and sum all series.
+    """
+    total = 0.0
+    try:
+        for line in _get(base + "/metrics").read().decode().splitlines():
+            m = _RUNNING_RE.match(line)
+            if m:
+                total += float(m.group(1))
+    except Exception:
+        pass
+    return total
+
+
+def health_ok(base):
+    try:
+        return _get(base + "/health").status == 200
+    except Exception:
+        return False
+
+
+def reconcile(st, reg):
+    """Self-heal state against what the instances actually serve."""
+    s2k = served_to_key(reg)
+    changed = False
+    for svc, base in INSTANCES.items():
+        e = st.get(svc)
+        actual = instance_model(base)          # advertised name, or None
+        key = s2k.get(actual, actual) if actual else None
+        if e is None:
+            e = entry(svc, key or DEFAULT_MODEL, key is not None)
+            st[svc] = e
+            changed = True
+        # keep endpoint/rank current (older state.json may lack them)
+        if e.get("endpoint") != INSTANCES[svc] or e.get("rank") != RANKS[svc]:
+            e["endpoint"] = INSTANCES[svc]
+            e["rank"] = RANKS[svc]
+            changed = True
+        if key is None:
+            if e.get("ready"):
+                e["ready"] = False
+                changed = True
+            continue
+        if e.get("model") != key:
+            e["model"] = key
+            e["ready"] = True
+            changed = True
+        elif not e.get("ready") and health_ok(base):
+            e["ready"] = True
+            changed = True
+    return changed
+
+
+def pick_target(st, usage=None):
+    """Choose which instance to swap.
+
+    Policy, in order:
+      * do NOT evict the most-recently-used loaded model if another instance can
+        host the new model without doing so (usage.json, written by
+        model-router) -- avoids substituting a model people are actively using;
+      * prefer an instance with NO in-flight requests (so the drain is instant);
+      * rotate among equally-suitable instances so swaps spread across cards;
+      * only when neither is idle, take the less-busy one (the busier keeps
+        serving).
+    """
+    global _rr
+    loads = {svc: running_requests(INSTANCES[svc]) for svc in INSTANCES}
+    pool = ["vllm-0", "vllm-1"]
+    if usage:
+        mru = max(usage, key=usage.get)
+        keep = [svc for svc in pool if st.get(svc, {}).get("model") != mru]
+        if keep:
+            pool = keep
+    idle = [svc for svc in pool if loads[svc] <= 0]
+    if idle:
+        svc = idle[_rr % len(idle)]
+        _rr += 1
+        return svc
+    return min(pool, key=lambda s: loads[s])
+
+
+def wait_until_idle(svc):
+    """Block until the instance has no running requests, bounded by IDLE_WAIT.
+
+    Returns True if it went idle, False if the bound elapsed with work still
+    running (the caller then proceeds and knowingly drops it).
+    """
+    if IDLE_WAIT <= 0:
+        return running_requests(INSTANCES[svc]) <= 0
+    deadline = time.time() + IDLE_WAIT
+    while True:
+        if running_requests(INSTANCES[svc]) <= 0:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(IDLE_POLL)
+
+
+def clear_trigger(model):
+    """Remove trigger.json only if it still names `model`. The router keeps
+    rewriting it during a long swap and may have written a different model, so
+    an unconditional remove would silently drop that request."""
+    try:
+        with open(TRIGGER) as f:
+            cur = json.load(f).get("model")
+    except Exception:
+        cur = None
+    if cur is None or cur == model:
+        try:
+            os.remove(TRIGGER)
+        except FileNotFoundError:
+            pass
+
+
+def handle_trigger(reg):
+    try:
+        with open(TRIGGER) as f:
+            model = json.load(f).get("model")
+    except Exception:
+        return
+    if not model:
+        clear_trigger(None)
+        return
+    if model not in reg:
+        log("trigger for unknown model %r -- ignored (not in registry)" % model)
+        clear_trigger(model)
+        return
+    st = read_state()
+    for svc in INSTANCES:
+        e = st.get(svc, {})
+        if e.get("model") == model and e.get("ready"):
+            # already serving it: nothing to do
+            clear_trigger(model)
+            return
+    if time.time() - _last_fail.get(model, 0) < FAIL_COOLDOWN:
+        # a recent swap to it failed; back off so a bad entry cannot loop restarts
+        clear_trigger(model)
+        return
+    target = pick_target(st, read_usage())
+    st[target] = entry(target, model, False)
+    write_state(st)
+    log("swap start: %s -> %s (the other instance is untouched)" % (target, model))
+    n = running_requests(INSTANCES[target])
+    if n > 0:
+        log("draining %s: %d in-flight request(s); waiting up to %ss for idle"
+            % (target, int(n), IDLE_WAIT))
+    if wait_until_idle(target):
+        if n > 0:
+            log("drain complete: %s idle" % target)
+    else:
+        log("WARNING: %s still busy after %ss; proceeding (its in-flight "
+            "requests will be dropped)" % (target, IDLE_WAIT))
+    cid = find_container(target)
+    if cid is None:
+        log("ERROR: container for %s not found via docker socket; aborting swap" % target)
+        _last_fail[model] = time.time()
+        clear_trigger(model)
+        return
+    status, _ = sock_request("POST", "/containers/%s/restart" % cid)
+    if status not in (200, 204, 304):
+        log("ERROR: docker restart of %s failed (status %s)" % (target, status))
+        _last_fail[model] = time.time()
+        clear_trigger(model)
+        return
+    deadline = time.time() + SWAP_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(POLL)
+        if health_ok(INSTANCES[target]):
+            st = read_state()
+            st[target] = entry(target, model, True)
+            write_state(st)
+            _last_fail.pop(model, None)
+            log("swap done: %s ready with %s" % (target, model))
+            break
+    else:
+        _last_fail[model] = time.time()
+        log("ERROR: %s still not healthy %ss after restart to %s; "
+            "operator attention needed (fix the registry entry, then docker restart)"
+            % (target, SWAP_TIMEOUT, model))
+    clear_trigger(model)
+
+
+def main():
+    reg = load_registry()
+    default = DEFAULT_MODEL if DEFAULT_MODEL in reg else sorted(reg)[0]
+    st = read_state()
+    if not st:
+        st = {svc: entry(svc, default, False) for svc in INSTANCES}
+        write_state(st)
+        log("state initialised: both instances -> %s" % default)
+    log("model-controller up (registry models: %s)" % ", ".join(sorted(reg)))
+    while True:
+        try:
+            if reconcile(st, reg):
+                write_state(st)
+            if os.path.exists(TRIGGER):
+                handle_trigger(reg)
+                st = read_state()
+        except Exception as e:
+            log("loop error: %r" % (e,))
+        time.sleep(TICK)
+
+
+if __name__ == "__main__":
+    main()

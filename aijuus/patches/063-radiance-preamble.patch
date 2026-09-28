@@ -1,0 +1,28 @@
+diff --git a/radiance_preamble.py b/radiance_preamble.py
+index ba7b93f..09d25f8 100644
+--- a/radiance_preamble.py
++++ b/radiance_preamble.py
+@@ -154,11 +154,19 @@ def section_opts():
+ 
+     print("\n  " + dim("dynamic drafting (RADIANCE_DYNAMIC_DRAFT):"))
+     if _val("RADIANCE_DYNAMIC_DRAFT", "1") == "1":
+-        print("        " + dim("per-slot confidence gate: draft while cum. confidence >= TAU, take a free-win"))
+-        print("        " + dim("n-gram, else verify; batch schedule caps serial MTP forwards at concurrency."))
++        print("        " + dim("per-slot confidence gate: draft while cum. confidence >= TAU, take an n-gram"))
++        print("        " + dim("tail on MTP agreement OR a long match, else verify; batch schedule caps serial"))
++        print("        " + dim("MTP forwards at concurrency. Top-2 match candidates back the tail."))
+         for name, dflt, desc in [
+-            ("RADIANCE_DRAFT_SCHEDULE",   "1:8,2:7,4:6,8:5,16:4", "batch-size MTP-forward ceiling (bs:max_depth, carry-forward)"),
+-            ("RADIANCE_DRAFT_TAU",        "0.35", "confidence-product stop threshold"),
++            ("RADIANCE_DRAFT_SCHEDULE",      "1:8,2:7,4:6,8:5,16:4", "batch-size MTP-forward ceiling (bs:max_depth, carry-forward)"),
++            ("RADIANCE_DRAFT_TAU",           "0.20", "confidence-product stop threshold"),
++            ("RADIANCE_DRAFT_NGRAM_STRONG",  "8", "min match length to take a tail without MTP agreement (0=off)"),
++            ("RADIANCE_DRAFT_NGRAM_RECENT",  "0", "take a short match (>=3) that recurred within N tokens (0=off)"),
++            ("RADIANCE_DRAFT_NGRAM_MAXL",    "32", "suffix comparison horizon"),
++            ("RADIANCE_DRAFT_NGRAM_WINDOW",  "auto", "self-match search window: auto | 0 (full) | tokens"),
++            ("RADIANCE_DRAFT_CROSS_REQ",     "auto", "search all active rows: auto (small B + short ctx) | 1 | 0"),
++            ("RADIANCE_DRAFT_STATS",         "1", "periodic controller counters on stderr"),
++            ("RADIANCE_DRAFT_HEAD_TOP1",    "0", "fused int2 draft-head top-1 (B2; removes capture+argmax+Y store)"),
+         ]:
+             print(f"        {dim('·')} {name} = {c(ACCENT, _val(name, dflt))}  " + dim(desc))
+     else:

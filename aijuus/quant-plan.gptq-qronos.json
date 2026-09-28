@@ -1,0 +1,18 @@
+{
+  "global": {
+    "scheme": "mxfp4",
+    "algo": "gptq,qronos",
+    "algo_config_file": {
+      "gptq": "algo-configs/gptq-qwen38.json",
+      "qronos": "algo-configs/qronos-qwen38.json"
+    }
+  },
+  "exclude": {
+    "mode": "append"
+  },
+  "mtp": {
+    "mode": "fp8",
+    "keep_in_exclude": true
+  },
+  "version": "0.13+quark-gptq-qronos"
+}

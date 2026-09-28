@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic reap of the vLLM fs KV secondary tier
+
+[Timer]
+# The tier writes tens of MB/s worst case, so the volume has hours of headroom;
+# a 5-minute cadence keeps each reap small and its I/O idle-class.
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
