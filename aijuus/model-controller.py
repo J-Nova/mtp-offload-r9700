@@ -182,13 +182,16 @@ def _get(url):
     if API_KEY:
         req.add_header("Authorization", "Bearer " + API_KEY)
     with urllib.request.urlopen(req, timeout=5) as r:
-        return r
+        # Read the body INSIDE the context: leaving `with` closes the response,
+        # after which r.read() returns b'' (status stays readable, which is why
+        # health_ok looked fine while instance_model silently saw nothing).
+        return r.status, r.read()
 
 
 def instance_model(base):
     """Model the instance actually serves right now (None if unreachable)."""
     try:
-        data = json.loads(_get(base + "/v1/models").read().decode())
+        data = json.loads(_get(base + "/v1/models")[1].decode())
         models = [m.get("id") for m in data.get("data", []) if m.get("id")]
         return models[0] if models else None
     except Exception:
@@ -208,7 +211,7 @@ def running_requests(base):
     """
     total = 0.0
     try:
-        for line in _get(base + "/metrics").read().decode().splitlines():
+        for line in _get(base + "/metrics")[1].decode().splitlines():
             m = _RUNNING_RE.match(line)
             if m:
                 total += float(m.group(1))
@@ -219,7 +222,7 @@ def running_requests(base):
 
 def health_ok(base):
     try:
-        return _get(base + "/health").status == 200
+        return _get(base + "/health")[0] == 200
     except Exception:
         return False
 
