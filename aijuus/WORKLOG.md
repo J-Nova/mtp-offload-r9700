@@ -6,6 +6,17 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 13) — DRY port fully mapped (ready to execute); not applied
+
+Mapped the entire `patches/dry_sampler` change set from the extracted reference (10 files) and wrote
+it up as an exact port spec in the plan. DRY is **default-off** (`dry_multiplier` 0.0), so landing it
+is behaviour-neutral until enabled. I did **not** apply it in this session: it rewrites the sampler /
+rejection-sampler hot path plus the input-processor / GPU-input-batch plumbing, and an unvalidated
+single pass risks generation correctness. It is the one remaining implementation item and is ready
+to implement as `patch_dry.py` + an entrypoint `dry.py` copy, then validate in-container.
+
+---
+
 ## 2026-09-29 (cont. 12) — SKINNY=all regressed (reverted); both tcclaviger tuning levers were worse
 
 - **`RADIANCE_SKINNY_GEMM=all`**: greedy 92.6 (flat) but sampled **84.5** vs baseline 88.1;
