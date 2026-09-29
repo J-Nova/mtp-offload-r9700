@@ -432,21 +432,26 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   DFlash2 drafter int4 projections under `RADIANCE_FAST_DRAFT`, not the MTP quant we removed.
 - **5.2 ROCm 10**: RESEARCHED — see below; deferred as a major upgrade.
 
-### ROCm 10 research (5.2, 2026-09-29)
-- **ROCm 10.0.0** (Aug 2026) supports gfx1201/RDNA4; validated with **vLLM 0.27.0**, PyTorch
-  2.11-2.13, Python 3.14. AMD's headline "3.3x inference / 2.4x training over ROCm 7" is from
-  **ROCm.AI adaptations on Instinct** (Optimized Kernels / Parallelism / Scheduling, Hyperloom), not
-  a raw SDK gain.
-- Concrete gfx1201 items in 10.0: refreshed gfx1201 SystemDB (tuned hipBLASLt find/perf entries —
-  relevant to our TunableOp), a new **hipBLASLt local optimizer**, restored gfx12 Winograd,
-  `hipMemcpy2D` / `hipEventRecord` improvements.
-- **Caveat for us**: our stack is vLLM **0.29** on ROCm **7.14** with fork-local patches (libr4d,
-  AITER gfx12 enablement, `radiance_*`). ROCm 10 changes packaging (TheRock), math/compiler paths
-  and Wave-Matrix support — every patch would need re-validation, and 10.0's *validated* vLLM
-  (0.27.0) is older than ours. High effort, uncertain net gain.
-- **Bigger near-term lever (upstream, not ROCm 10)**: vLLM PR #34709 enables the `wvSplitK`/`wvSplitKQ`
-  **skinny GEMM on RDNA4/gfx1x** decode with **~15% decode tok/s on the R9700**. Worth backporting
-  into our 0.29 tree independently of any ROCm upgrade.
+### ROCm 10 research (5.2, 2026-09-29) — staying on vLLM 0.29
+- **ROCm 10.0.0** (Aug 2026): HIP **10.0.0**, LLVM **24.0.0**, rocBLAS **5.6.0**, hipBLASLt **1.4.1**,
+  CK **1.2.0**; gfx1201/RDNA4 supported. Validated frameworks: PyTorch 2.11-2.13, **vLLM 0.27.0**
+  (older than our 0.29), Python 3.14. The "3.3x inference / 2.4x training over ROCm 7" headline is
+  from **ROCm.AI / Hyperloom** auto-optimization on **Instinct**, not a raw SDK/gfx1201 gain.
+- **What actually changed for gfx1201**: refreshed gfx1201 SystemDB (tuned hipBLASLt find/perf
+  entries), a hipBLASLt **local optimizer**, CK a8w8 GEMM tuning (MI355X), **HIP graph replay**
+  reduces inter-kernel gaps for graphs interleaving async allocs, gfx12 Winograd, hipMemcpy2D /
+  hipEventRecord wins. AITER PR #3330 added RDNA4 scalar fallbacks + ck-tile targets.
+- **Known gfx1200/1201 caution**: default *batched* GEMM via hipBLASLt can regress vs non-batched
+  (workaround `ROCBLAS_USE_HIPBLASLT=0`); a Tensile `MT64x64x64_ISA1201` OOB kernel bug exists on
+  some ROCm 7.2 builds.
+- **Why we defer (staying on 0.29)**: our radiance stack is hand-written gfx1201 kernels (libr4d,
+  `radiance_mxfp4_fp8.so`) AOT-built with **ROCm 7.14 hipcc**, plus fork-local vLLM/AITER patches.
+  A ROCm 10 move means rebuilding libr4d + the HIP module + vLLM and re-validating every patch;
+  our TunableOp table is version-validated and would need regeneration. Net gfx1201-specific gain
+  is unproven; effort/risk high. Revisit only if a vLLM 0.29-class stack is validated on ROCm 10.
+- **wvSplitK (PR #34709)**: NOT a lever for us — it is **already in vLLM 0.29.0 and active**
+  (`use_skinny` accepts `on_gfx1x()`; `VLLM_ROCM_USE_SKINNY_GEMM` default True; `wvSplitK_hf`
+  wave32 kernels present in `_rocm_C.abi3.so`). Applies only to unquantized bf16 linears.
 
 ### How to run an arm
 One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the

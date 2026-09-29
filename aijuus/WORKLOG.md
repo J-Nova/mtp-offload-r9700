@@ -6,6 +6,28 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 8) — B4 neutral; wvSplitK already upstream; DRY/degen refs complete; ROCm 10 dug in
+
+- **B4 (AITER off)**: greedy 92.1 / sampled 87.4 vs the 3.3 baseline 92.4 / 88.1 → **neutral** (within
+  noise; our config's AITER role is minimal with R4D attention + sub-flags 0). **Reverted to
+  `VLLM_ROCM_USE_AITER=1`.**
+- **wvSplitK PR #34709**: NOT a backport — it is **already in vLLM 0.29.0 and enabled**
+  (`use_skinny` accepts `on_gfx1x()`, `VLLM_ROCM_USE_SKINNY_GEMM` default True; `wvSplitK_hf` wave32
+  kernels present in `_rocm_C.abi3.so`). Applies only to unquantized bf16 linears (our linears use
+  radiance kernels), so no action.
+- **DRY/degen port**: reference set completed (15 files) in
+  `aijuus/refs/tcclaviger-vllm-29.05.12/`. Raw diff vs ours is ~1400 lines and interleaves
+  tcclaviger's *other* fork-local changes (e.g. scheduler.py), so a blind port is unsafe; the
+  DRY/degen hunks are tagged `FORK-LOCAL` and can be isolated. Port staged as the next focused task
+  (runtime `patch_dry.py` / `patch_degen.py`).
+- **ROCm 10 (5.2)**: deeper research in the plan. HIP 10 / LLVM 24 / rocBLAS 5.6 / hipBLASLt 1.4.1;
+  validated vLLM is 0.27.0; "3.3x" is ROCm.AI/Hyperloom on Instinct. gfx1201 items are SystemDB
+  refresh, hipBLASLt optimizer, HIP-graph replay gap reduction. Deferred: our libr4d +
+  `radiance_mxfp4_fp8.so` + vLLM patched stack is AOT-built on ROCm 7.14 and would need a full
+  rebuild/re-validation on 10.
+
+---
+
 ## 2026-09-29 (cont. 7) — 3.3 adopted; B4 armed; DRY/degen refs extracted; ROCm 10 researched
 
 - **3.3 ADOPTED.** Clean re-measure (pull finished): greedy 92.4 (was 88.1), sampled 88.1 (was 80.2)
