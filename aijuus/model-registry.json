@@ -102,7 +102,7 @@
   "Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp": {
     "path": "/models/Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ",
     "spec_method": "mtp",
-    "spec_tokens": 8,
+    "spec_tokens": 4,
     "verify_head": 0,
     "kv_cache_memory": 8761733283,
     "server_env": {
@@ -111,6 +111,6 @@
       "RADIANCE_DRAFT_RERANK": "32",
       "RADIANCE_DRAFT_VOCAB": "/patches/aijuus/draft_keep/keep-union.txt"
     },
-    "note": "Blend, MTP variant: uses the MTP head inside the blend (no drafter). Spec tuning from the MTP sweep: SPEC=8; DYNAMIC_DRAFT=1, FAST_DRAFT=1, TAU=0.20, NGRAM_STRONG=8 (from _defaults + here); RERANK=32 (MTP's argmax needs only 32 -- README.md:561, MTP-DECODE-OPT-PLAN.md:214; _defaults' 80 is the dflash value); VERIFY_HEAD=0 via the field above. kv_cache_memory: INTERIM -- borrowed 8761733283 from the identical-weights -blend-MXFP4-OCP-GPTQ (dflash) entry to unblock the deploy; profiling alone finds only ~4.59 GiB and rejects MAXLEN=160000 (needs >=6.05 GiB). Run ./calibrate-kv.sh SPEC_METHOD=mtp SPEC=8 to measure the exact mtp:8 pin and replace it."
+    "note": "Blend, MTP variant: uses the MTP head inside the blend (no drafter). Spec tuning from the MTP sweep: SPEC=8; DYNAMIC_DRAFT=1, FAST_DRAFT=1, TAU=0.20, NGRAM_STRONG=8 (from _defaults + here); RERANK=32 (MTP's argmax needs only 32 -- README.md:561, MTP-DECODE-OPT-PLAN.md:214; _defaults' 80 is the dflash value); VERIFY_HEAD=0 via the field above. kv_cache_memory: INTERIM -- borrowed 8761733283 from the identical-weights -blend-MXFP4-OCP-GPTQ (dflash) entry to unblock the deploy; profiling alone finds only ~4.59 GiB and rejects MAXLEN=160000 (needs >=6.05 GiB). Run ./calibrate-kv.sh SPEC_METHOD=mtp SPEC=8 to measure the exact mtp:8 pin and replace it. B1 A/B arm ACTIVE 2026-09-29: spec_tokens 8 -> 4 (branch found SPEC 4 best under sampling). Revert to 8 to switch arms; baseline at SPEC 8 recorded in WORKLOG."
   }
 }
