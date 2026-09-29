@@ -6,6 +6,23 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 7) — 3.3 adopted; B4 armed; DRY/degen refs extracted; ROCm 10 researched
+
+- **3.3 ADOPTED.** Clean re-measure (pull finished): greedy 92.4 (was 88.1), sampled 88.1 (was 80.2)
+  → +4.9% / +9.9%. Denser capture ladder kept.
+- **B4 armed**: `VLLM_ROCM_USE_AITER=0` (both services) → next redeploy tests it vs the 3.3 baseline.
+- **4.1 DRY / 4.2 degen**: pulled `tcclaviger/vllm:29.05.12` (vLLM `0.29.0.dev0+g2bdbbc8080`) and
+  extracted the reference into `aijuus/refs/tcclaviger-vllm-29.05.12/` (dry.py 391 lines + sampler/
+  scheduler/params plumbing). Port scoped in the plan; deferred as a multi-file vLLM patch.
+- **3.2 flash_attn**: on gfx1201 the CK backend cannot build (Wave32); only the Triton backend works
+  and it mainly helps ViT. Low value for our R4D text path.
+- **5.2 ROCm 10**: researched (see plan). Validated vLLM is only 0.27.0; gfx1201 gains are a
+  refreshed SystemDB + hipBLASLt optimizer; our 0.29 + libr4d/AITER patches would all need
+  re-validation. Bigger near-term lever: upstream vLLM PR #34709 `wvSplitK` RDNA4 skinny GEMM
+  (~15% decode on R9700) — backport candidate, independent of ROCm.
+
+---
+
 ## 2026-09-29 (cont. 6) — Remaining items: 3.3 armed; 5.1 done; the rest blocked/low-value
 
 - **3.3** cudagraph capture ladder densified in the entrypoint (added 12,20,28,36,44,52,60,68 to

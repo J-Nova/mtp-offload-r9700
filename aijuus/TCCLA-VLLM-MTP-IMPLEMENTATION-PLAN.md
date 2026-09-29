@@ -412,22 +412,41 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
 - B3/B4: pending.
 
 ### Remaining work status (2026-09-29)
-- **3.3 capture ladder**: ARMED (denser small-batch ladder in the entrypoint); measure vs prior.
-- **B4 AITER on/off**: not yet armed (next arm after 3.3).
-- **3.2 flash_attn**: not installed; vLLM's FlashAttention Triton AMD backend is gated by
-  `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`. Our body uses the purpose-built R4D attention, so this
-  is an optional attention-backend A/B (B5), likely slower — low expected value.
-- **B3 MXFP4+GPTQ drafter**: NOT pursued — needs the R9700 branch's paroquant/MXFP4 plugin and a
-  GPTQ calibration `.pt`; overlapping axis with the W4 head we dropped; low expected value.
-- **4.1 DRY**: BLOCKED — not in vLLM 0.29, and tcclaviger's `tcclaviger/vllm` source is private
-  (Codeberg requires auth). Would need extracting the patched vLLM from the Docker Hub image.
-- **4.2 degenerate-loop detection**: vLLM 0.29 ships upstream `SamplingParams.repetition_detection`
-  (scheduler-enforced), but it is per-request, not a server default; a server-wide default needs
-  plumbing like tcclaviger's `--degen-*` (same private-source block).
-- **5.1 tcclaviger repos**: DONE — `codeberg.org/tcclaviger/vllm-radiance` cloned (public). Confirms
-  the current "davetha" path is the **DFlash2 drafter's int4 decoder projections** (`RADIANCE_FAST_DRAFT`,
-  codes derived at load, no calibration), not the MTP `DAVETHA_DRAFTER_QUANT` we removed.
-- **5.2 ROCm 10**: deferred — major upgrade, not attempted here.
+- **3.3 capture ladder**: **ADOPTED.** Clean re-measure: greedy 92.4 (was 88.1), sampled 88.1 (was
+  80.2) → +4.9% / +9.9%.
+- **B4 AITER on/off**: ARMED (`VLLM_ROCM_USE_AITER=0`); measure vs the 3.3 baseline.
+- **3.2 flash_attn**: not installed. On gfx1201 the **CK backend cannot build** (Wave32 vs
+  CK's Wave64); only the **Triton** backend works (`FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`), and in
+  vLLM it mainly accelerates **ViT** attention (1.8-6.5x TTFT for multimodal). Our body uses the
+  purpose-built R4D attention → low expected value; optional attention-backend A/B.
+- **B3 MXFP4+GPTQ drafter**: NOT pursued — needs the R9700 branch's paroquant plugin + a GPTQ
+  calibration `.pt`; overlaps the W4 head we dropped.
+- **4.1 DRY / 4.2 degen**: **reference EXTRACTED** from the now-public `tcclaviger/vllm:29.05.12`
+  image (which is vLLM `0.29.0.dev0+g2bdbbc8080`, ~our 0.29.0). Stored in
+  `aijuus/refs/tcclaviger-vllm-29.05.12/`. Port scope: new `vllm/v1/sample/ops/dry.py` (391 lines) +
+  ~200 changed lines across `sampling_params.py`, `v1/sample/{ops/penalties,sampler,metadata,rejection_sampler}.py`,
+  `v1/core/sched/{utils,scheduler}.py`, `entrypoints/cli/serve.py`, `v1/engine/input_processor.py`,
+  `v1/worker/gpu_input_batch.py`, `v1/request.py`. Deferred to a dedicated port task (multi-file
+  vLLM patch; quality-only, not throughput).
+- **5.1 tcclaviger repos**: DONE — public radiance repo cloned; the current "davetha" path is the
+  DFlash2 drafter int4 projections under `RADIANCE_FAST_DRAFT`, not the MTP quant we removed.
+- **5.2 ROCm 10**: RESEARCHED — see below; deferred as a major upgrade.
+
+### ROCm 10 research (5.2, 2026-09-29)
+- **ROCm 10.0.0** (Aug 2026) supports gfx1201/RDNA4; validated with **vLLM 0.27.0**, PyTorch
+  2.11-2.13, Python 3.14. AMD's headline "3.3x inference / 2.4x training over ROCm 7" is from
+  **ROCm.AI adaptations on Instinct** (Optimized Kernels / Parallelism / Scheduling, Hyperloom), not
+  a raw SDK gain.
+- Concrete gfx1201 items in 10.0: refreshed gfx1201 SystemDB (tuned hipBLASLt find/perf entries —
+  relevant to our TunableOp), a new **hipBLASLt local optimizer**, restored gfx12 Winograd,
+  `hipMemcpy2D` / `hipEventRecord` improvements.
+- **Caveat for us**: our stack is vLLM **0.29** on ROCm **7.14** with fork-local patches (libr4d,
+  AITER gfx12 enablement, `radiance_*`). ROCm 10 changes packaging (TheRock), math/compiler paths
+  and Wave-Matrix support — every patch would need re-validation, and 10.0's *validated* vLLM
+  (0.27.0) is older than ours. High effort, uncertain net gain.
+- **Bigger near-term lever (upstream, not ROCm 10)**: vLLM PR #34709 enables the `wvSplitK`/`wvSplitKQ`
+  **skinny GEMM on RDNA4/gfx1x** decode with **~15% decode tok/s on the R9700**. Worth backporting
+  into our 0.29 tree independently of any ROCm upgrade.
 
 ### How to run an arm
 One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the
