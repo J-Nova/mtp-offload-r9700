@@ -6,6 +6,23 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 6) — Remaining items: 3.3 armed; 5.1 done; the rest blocked/low-value
+
+- **3.3** cudagraph capture ladder densified in the entrypoint (added 12,20,28,36,44,52,60,68 to
+  close the 8->24 gap, mirroring the branch's `[4,8,12,16,20,24,28,32]`). ARMED for the next redeploy.
+- **5.1 DONE**: cloned the public `codeberg.org/tcclaviger/vllm-radiance` (936K, no `patches/`
+  dir; radiance build context like ours). It confirms the current "davetha" path is the **DFlash2
+  drafter's int4 decoder projections** under `RADIANCE_FAST_DRAFT` (codes derived at load, no
+  calibration) — i.e. the DAVETHA axis we removed was MTP-only and deprecated. tcclaviger's *vLLM*
+  source (the `tcclaviger/vllm` image: DRY `--dry-*`, degen `--degen-*`) is **private**
+  (`git ls-remote` needs auth), so 4.1/4.2 are not portable without extracting from that image.
+- **4.1 DRY**: blocked (not in vLLM 0.29; private source). **4.2 degen**: vLLM 0.29 ships upstream
+  per-request `SamplingParams.repetition_detection` (scheduler-enforced), but no server-wide default.
+- **3.2 flash_attn**: not installed; optional attention-backend A/B (R4D likely wins). **B3**: not
+  pursued (needs the branch's paroquant plugin + GPTQ calibration `.pt`; low value). **5.2**: deferred.
+
+---
+
 ## 2026-09-29 (cont. 5) — Removed the DAVETHA / W4 drafter-quant axis (superseded)
 
 tcclaviger removed `DAVETHA_DRAFTER_QUANT` and the reduced-vocab W4 draft head in his current code

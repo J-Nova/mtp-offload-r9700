@@ -411,6 +411,24 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   was then deleted from the tree as superseded (tcclaviger dropped that MTP path). int2 kept.
 - B3/B4: pending.
 
+### Remaining work status (2026-09-29)
+- **3.3 capture ladder**: ARMED (denser small-batch ladder in the entrypoint); measure vs prior.
+- **B4 AITER on/off**: not yet armed (next arm after 3.3).
+- **3.2 flash_attn**: not installed; vLLM's FlashAttention Triton AMD backend is gated by
+  `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`. Our body uses the purpose-built R4D attention, so this
+  is an optional attention-backend A/B (B5), likely slower — low expected value.
+- **B3 MXFP4+GPTQ drafter**: NOT pursued — needs the R9700 branch's paroquant/MXFP4 plugin and a
+  GPTQ calibration `.pt`; overlapping axis with the W4 head we dropped; low expected value.
+- **4.1 DRY**: BLOCKED — not in vLLM 0.29, and tcclaviger's `tcclaviger/vllm` source is private
+  (Codeberg requires auth). Would need extracting the patched vLLM from the Docker Hub image.
+- **4.2 degenerate-loop detection**: vLLM 0.29 ships upstream `SamplingParams.repetition_detection`
+  (scheduler-enforced), but it is per-request, not a server default; a server-wide default needs
+  plumbing like tcclaviger's `--degen-*` (same private-source block).
+- **5.1 tcclaviger repos**: DONE — `codeberg.org/tcclaviger/vllm-radiance` cloned (public). Confirms
+  the current "davetha" path is the **DFlash2 drafter's int4 decoder projections** (`RADIANCE_FAST_DRAFT`,
+  codes derived at load, no calibration), not the MTP `DAVETHA_DRAFTER_QUANT` we removed.
+- **5.2 ROCm 10**: deferred — major upgrade, not attempted here.
+
 ### How to run an arm
 One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the
 Coolify UI env), redeploy, then measure with the same harness:
