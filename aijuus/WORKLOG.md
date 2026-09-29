@@ -6,6 +6,20 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 16) — controller reload endpoint (no redeploy for registry arms)
+
+- Added an HTTP admin endpoint to `model-controller.py`: `POST /reload` restarts matching instance(s)
+  so their entrypoint re-reads `/patches/aijuus/model-registry.json` with fresh settings (drains
+  in-flight, docker-restarts, polls /health); `GET /status`, `GET /health`. Bearer-auth with
+  `VLLM_API_KEY`; port `RELOAD_PORT` (default 8101); a module-level `_op_lock` serializes swaps and
+  reloads (one restart op at a time). Targets: `?instance=` (or "all") > `?model=` > all ready.
+- Verified: py_compile + isolated HTTP smoke test (401 without key, 200 /status, 404 unknown).
+- The controller script is bind-mounted ro → to activate it, **restart just the controller**
+  (`docker restart <model-controller>`), fast, no model reload.
+- This is the fast loop for vocab/knob A/Bs (each was previously a full Coolify redeploy).
+
+---
+
 ## 2026-09-29 (cont. 15) — DRY A/B: marginal quality, sampled t/s regression -> NOT adopted
 
 - Arm `RADIANCE_DRY_MULTIPLIER=0.8` + `RADIANCE_DRY_RANGE=2048` (boot: `[run] DRY enabled:

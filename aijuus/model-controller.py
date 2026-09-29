@@ -34,8 +34,11 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 STATE = "/model-state/state.json"
 TRIGGER = "/model-state/trigger.json"
@@ -55,6 +58,10 @@ FAIL_COOLDOWN = int(os.environ.get("FAIL_COOLDOWN_SECONDS", "120"))
 # work. 0 disables the wait (swap immediately).
 IDLE_WAIT = int(os.environ.get("IDLE_WAIT_SECONDS", "300"))
 IDLE_POLL = int(os.environ.get("IDLE_POLL_SECONDS", "5"))
+# Admin HTTP endpoint (no auth beyond the API key): POST /reload restarts the
+# matching instance(s) so their entrypoint re-reads model-registry.json with FRESH
+# settings (env/args) -- no full redeploy. GET /status / GET /health.
+RELOAD_PORT = int(os.environ.get("RELOAD_PORT", "8101"))
 
 # compose service name -> in-network base URL (+ tensor-parallel rank)
 INSTANCES = {"vllm-0": "http://vllm-0:8000", "vllm-1": "http://vllm-1:8001"}
@@ -62,6 +69,7 @@ RANKS = {"vllm-0": 0, "vllm-1": 1}
 
 _last_fail = {}   # model -> monotonic time of the last failed swap
 _rr = 0           # rotating pick among equally-suitable (idle) instances
+_op_lock = threading.Lock()  # serialize swaps/reloads: one restart op at a time
 
 
 def entry(svc, model, ready):
@@ -388,6 +396,120 @@ def handle_trigger(reg):
     clear_trigger(model)
 
 
+def do_reload(model=None, instance=None):
+    """Restart matching instance(s) so their entrypoint re-reads the registry.
+
+    Keeps the SAME model (state.json model unchanged) but picks up fresh settings
+    (env/args) from model-registry.json -- the fast path for iterating on a model's
+    knobs without a full Coolify redeploy. Drains in-flight work first (bounded by
+    IDLE_WAIT), restarts via the docker socket, then polls /health.
+
+    Targets: `instance` (a service name, or "all"); else `model`; else every
+    currently-ready instance.
+    """
+    reg = load_registry()
+    st = read_state()
+    if instance and instance != "all":
+        targets = [instance] if instance in INSTANCES else []
+    elif model:
+        targets = [s for s in INSTANCES if st.get(s, {}).get("model") == model]
+    else:
+        targets = [s for s in INSTANCES if st.get(s, {}).get("ready")] or list(INSTANCES)
+    if not targets:
+        return {"ok": False, "error": "no matching instance", "targets": []}
+
+    results = []
+    for svc in targets:
+        tgt_model = st.get(svc, {}).get("model") or model or DEFAULT_MODEL
+        if tgt_model not in reg:
+            results.append({"instance": svc, "ok": False,
+                            "error": "model %r not in registry" % tgt_model})
+            continue
+        st = read_state()
+        st[svc] = entry(svc, tgt_model, False)
+        write_state(st)
+        log("reload start: %s (model %s) with fresh registry settings" % (svc, tgt_model))
+        if not wait_until_idle(svc):
+            log("WARNING: %s still busy after %ss; proceeding" % (svc, IDLE_WAIT))
+        cid = find_container(svc)
+        if cid is None:
+            log("ERROR: container for %s not found via docker socket" % svc)
+            results.append({"instance": svc, "ok": False, "error": "container not found"})
+            continue
+        status, _ = sock_request("POST", "/containers/%s/restart" % cid)
+        if status not in (200, 204, 304):
+            log("ERROR: docker restart of %s failed (status %s)" % (svc, status))
+            results.append({"instance": svc, "ok": False, "error": "restart status %s" % status})
+            continue
+        deadline = time.time() + SWAP_TIMEOUT
+        ok = False
+        while time.time() < deadline:
+            time.sleep(POLL)
+            if health_ok(INSTANCES[svc]):
+                st = read_state()
+                st[svc] = entry(svc, tgt_model, True)
+                write_state(st)
+                ok = True
+                break
+        log("reload %s: %s" % (svc, "done" if ok else "TIMEOUT"))
+        results.append({"instance": svc, "ok": ok})
+    return {"ok": all(r.get("ok") for r in results), "targets": results}
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "model-controller"
+
+    def log_message(self, *a):
+        return
+
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth(self):
+        if not API_KEY:
+            return True
+        h = self.headers.get("Authorization", "")
+        return h in ("Bearer " + API_KEY, API_KEY)
+
+    def do_GET(self):
+        if not self._auth():
+            return self._send(401, {"ok": False, "error": "unauthorized"})
+        if self.path.startswith("/health"):
+            return self._send(200, {"ok": True})
+        if self.path.startswith("/status"):
+            return self._send(200, {"ok": True, "state": read_state(),
+                                    "registry": sorted(load_registry())})
+        return self._send(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        if not self._auth():
+            return self._send(401, {"ok": False, "error": "unauthorized"})
+        if not self.path.startswith("/reload"):
+            return self._send(404, {"ok": False, "error": "not found"})
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        params = {}
+        if body:
+            try:
+                params = json.loads(body) or {}
+            except Exception:
+                params = {}
+        if "?" in self.path:
+            q = parse_qs(urlparse(self.path).query)
+            if not params.get("model") and q.get("model"):
+                params["model"] = q["model"][0]
+            if not params.get("instance") and q.get("instance"):
+                params["instance"] = q["instance"][0]
+        with _op_lock:
+            res = do_reload(model=params.get("model"), instance=params.get("instance"))
+        return self._send(200 if res.get("ok") else 500, res)
+
+
 def main():
     reg = load_registry()
     default = DEFAULT_MODEL if DEFAULT_MODEL in reg else sorted(reg)[0]
@@ -397,13 +519,21 @@ def main():
         write_state(st)
         log("state initialised: both instances -> %s" % default)
     log("model-controller up (registry models: %s)" % ", ".join(sorted(reg)))
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", RELOAD_PORT), _Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log("reload endpoint on :%d  (POST /reload [?model=&instance=], GET /status, GET /health)"
+            % RELOAD_PORT)
+    except Exception as e:
+        log("WARNING: reload endpoint failed to start on :%d: %r" % (RELOAD_PORT, e))
     while True:
         try:
-            if reconcile(st, reg):
-                write_state(st)
-            if os.path.exists(TRIGGER):
-                handle_trigger(reg)
-                st = read_state()
+            with _op_lock:
+                if reconcile(st, reg):
+                    write_state(st)
+                if os.path.exists(TRIGGER):
+                    handle_trigger(reg)
+                    st = read_state()
         except Exception as e:
             log("loop error: %r" % (e,))
         time.sleep(TICK)

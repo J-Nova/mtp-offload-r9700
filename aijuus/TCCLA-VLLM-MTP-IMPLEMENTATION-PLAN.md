@@ -520,8 +520,17 @@ One flip = `RADIANCE_DRAFT_VOCAB` in the MTP registry entry (+ redeploy). Arms:
 Run one arm at a time; measure `aijuus/tools/mtp-bench.py` + acceptance.
 
 ### How to run an arm
-One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the
-Coolify UI env), redeploy, then measure with the same harness:
+One variable at a time. For **registry/env knobs** (e.g. `RADIANCE_DRAFT_VOCAB`, `RADIANCE_DRAFT_TAU`)
+you do NOT need a Coolify redeploy: edit the registry, then hit the **controller reload endpoint**,
+which restarts the instance(s) so their entrypoint re-reads `/patches/aijuus/model-registry.json`
+with fresh settings (drains first, polls /health):
+
+    # from the host: the controller is only on the coolify network, so exec into an instance
+    docker exec $(docker ps -qf name=vllm-0) \
+      curl -s -H "Authorization: Bearer $VLLM_API_KEY" -X POST http://model-controller:8101/reload
+    # optional: ?instance=vllm-0  or  ?model=<key>  or  body {"instance":"all"}
+
+Then measure with the same harness:
 
     # inside a vLLM container (or any host with the port reachable)
     python3 /patches/aijuus/tools/mtp-bench.py --url http://localhost:8000 --reps 3 --metrics
