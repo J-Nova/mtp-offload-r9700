@@ -125,7 +125,7 @@ services:
       # aijuus/r4d_lib.py + aijuus/qwen3_5_mtp_w4.py and install_all() remaps the
       # MTP arch to Qwen3_5MTPW4 and points it at RADIANCE_DRAFT_KEEP_FILE, so
       # enabling this needs no image rebuild. Requires a draft_keep_file.
-      - RADIANCE_DRAFT_KEEP_FILE=${RADIANCE_DRAFT_KEEP_FILE:-/patches/aijuus/draft_keep/keep.json}
+      - RADIANCE_DRAFT_KEEP_FILE=${RADIANCE_DRAFT_KEEP_FILE:-/patches/aijuus/draft_keep/keep-union.json}
       # Model to boot when /model-state/state.json has no entry for this instance yet
       # (fresh boot). Hot-swap restarts read state.json instead; see model-registry.json.
       - MODEL_DEFAULT=${MODEL_DEFAULT:-Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp}
@@ -252,12 +252,12 @@ services:
       - TRITON_CACHE_DIR=/cache/triton
       - AITER_ROOT_DIR=/cache/aiter
       - TRITON_CACHE_AUTOTUNING=1
-      - R4D_SO=/home/juup/.cache/radiance-libr4d/b9e42ab-rx9
+      - R4D_SO=/home/juup/.cache/radiance-libr4d/v0.5.0-w4a16
     volumes:
       - /home/juup/models:/models
       - /home/juup/.radiance-cache-w4a8-093-gdnm-nqft-fp8s-gnq-tp1s:/cache
       - /home/juup/radiance-vllm-mxfp4:/patches:z
-      - /home/juup/.cache/radiance-libr4d/b9e42ab-rx9:/r4d:z
+      - /home/juup/.cache/radiance-libr4d/v0.5.0-w4a16:/r4d:z
       # Shared fs KV tier backing store, mounted into BOTH instances. Point the host side at a
       # dedicated SSD/volume (or a loop volume from ops/make-kvcache-volume.sh). Docker creates
       # the default path if absent. The host-side reaper runs against the same directory.
@@ -336,7 +336,7 @@ services:
       # aijuus/r4d_lib.py + aijuus/qwen3_5_mtp_w4.py and install_all() remaps the
       # MTP arch to Qwen3_5MTPW4 and points it at RADIANCE_DRAFT_KEEP_FILE, so
       # enabling this needs no image rebuild. Requires a draft_keep_file.
-      - RADIANCE_DRAFT_KEEP_FILE=${RADIANCE_DRAFT_KEEP_FILE:-/patches/aijuus/draft_keep/keep.json}
+      - RADIANCE_DRAFT_KEEP_FILE=${RADIANCE_DRAFT_KEEP_FILE:-/patches/aijuus/draft_keep/keep-union.json}
       # Model to boot when /model-state/state.json has no entry for this instance yet
       # (fresh boot). Hot-swap restarts read state.json instead; see model-registry.json.
       - MODEL_DEFAULT=${MODEL_DEFAULT:-Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp}
@@ -463,12 +463,12 @@ services:
       - TRITON_CACHE_DIR=/cache/triton
       - AITER_ROOT_DIR=/cache/aiter
       - TRITON_CACHE_AUTOTUNING=1
-      - R4D_SO=/home/juup/.cache/radiance-libr4d/b9e42ab-rx9
+      - R4D_SO=/home/juup/.cache/radiance-libr4d/v0.5.0-w4a16
     volumes:
       - /home/juup/models:/models
       - /home/juup/.radiance-cache-w4a8-093-gdnm-nqft-fp8s-gnq-tp1s-b:/cache
       - /home/juup/radiance-vllm-mxfp4:/patches:z
-      - /home/juup/.cache/radiance-libr4d/b9e42ab-rx9:/r4d:z
+      - /home/juup/.cache/radiance-libr4d/v0.5.0-w4a16:/r4d:z
       # Shared fs KV tier backing store, mounted into BOTH instances. Point the host side at a
       # dedicated SSD/volume (or a loop volume from ops/make-kvcache-volume.sh). Docker creates
       # the default path if absent. The host-side reaper runs against the same directory.

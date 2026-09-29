@@ -12,6 +12,7 @@ Writes one id per line, sorted, unique (atomic replace).
 """
 import argparse
 import glob
+import json
 import os
 
 try:  # run as a script from this dir: sys.path[0] is the script dir
@@ -26,6 +27,9 @@ def main():
     ap.add_argument("--rank-glob", default="aijuus/draft_keep/rank*.json")
     ap.add_argument("--extra", action="append", default=[])
     ap.add_argument("--out", default="aijuus/draft_keep/keep-union.txt")
+    ap.add_argument("--json-out", default="aijuus/draft_keep/keep-union.json",
+                    help="JSON sibling the reduced-vocab W4 head reads (RADIANCE_DRAFT_KEEP_FILE); "
+                         "set to '' to skip")
     a = ap.parse_args()
 
     ids = set()
@@ -52,8 +56,15 @@ def main():
     with open(tmp, "w") as fh:
         fh.write("\n".join(str(i) for i in sorted(ids)) + "\n")
     os.replace(tmp, a.out)
+    if a.json_out:
+        os.makedirs(os.path.dirname(a.json_out) or ".", exist_ok=True)
+        jtmp = a.json_out + ".tmp"
+        with open(jtmp, "w") as fh:
+            json.dump(sorted(ids), fh)
+        os.replace(jtmp, a.json_out)
     print(f"wrote {a.out}: {len(ids)} ids "
-          f"(seed {n_seed}, rank union {n_rank}, extra {n_extra})")
+          f"(seed {n_seed}, rank union {n_rank}, extra {n_extra})"
+          + (f"; {a.json_out}" if a.json_out else ""))
 
 
 if __name__ == "__main__":

@@ -162,11 +162,11 @@ low-risk gain that does not depend on the W4 port.
 
 ### Phase 1.1: Reduced Vocab Draft Head (Option B) — consumes the Phase 1.0 keep list
 
-**Status**: BLOCKED (2026-09-29) — the libr4d builds we ship (`b9e42ab-rx6`/`-rx9`) export only
-`r4d_gemm_bf16_nt_m16`, not `r4d_gemm_w4a16_nt_m64`, and the `.hip` source is not on the host.
-The reduced-vocab W4 class/kernel wiring (`aijuus/qwen3_5_mtp_w4.py` + `draft_w4_lmhead`) is in
-place, but it has no kernel to call. Unblock by obtaining/building libr4d with
-`r4d_gemm_w4a16_nt_m64`. Meanwhile Phase 1.0's int2 vocab prune is live and Phase 3.1 proceeds.
+**Status**: UNBLOCKED (2026-09-29) — the image's baked `r4d.so` (libr4d `v0.5.0`) already exports
+`r4d_gemm_w4a16_nt_m64`; compose was overriding it with the older `b9e42ab-rx9`. Repointed
+`R4D_SO`/`/r4d` at `/home/juup/.cache/radiance-libr4d/v0.5.0-w4a16` (extracted from the image). Stays
+env-gated (`DAVETHA_DRAFTER_QUANT=0`); activation is the B2 A/B. `RADIANCE_DRAFT_KEEP_FILE` now
+defaults to the same union set (`keep-union.json`).
 
 **Priority**: CRITICAL
 **Expected Impact**: +4..+8% tok/s net (similar to old approach, but more efficient)

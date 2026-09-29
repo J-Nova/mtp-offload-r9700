@@ -24,6 +24,18 @@ libr4d, or an r4dhip build). (An earlier note that r4d.so carried the symbol was
 Note: the boot's `[radiance.w4] no w4a16 gemm_nt kernel … disabled` is the *full-head* path
 (`radiance_w4.py`, gated `RADIANCE_DRAFT_W4_FULL`, default off), not this one.
 
+**Resolved (same day):** the blocker was the compose override, not libr4d. The Dockerfile already
+pins `R4D_VERSION=v0.5.0`, and the image's *baked* `r4d.so` **has**
+`r4d_gemm_w4a16_nt_m64` (also `w4a8`/`mxfp4a8`); `b9e42ab` is an ancestor of `v0.5.0`, so our GDN
+guards are included. Compose was overriding it with the older `b9e42ab-rx9` build via
+`R4D_SO` + `/r4d`. Fix: extract the baked `r4d.so` to
+`/home/juup/.cache/radiance-libr4d/v0.5.0-w4a16/r4d.so` and repoint both services' `R4D_SO`/`/r4d`
+at it. No image rebuild needed. Phase 1.1 stays env-gated (`DAVETHA_DRAFTER_QUANT=0`); activation
+is the B2 A/B at the end.
+
+Also aligned the reduced-vocab W4 keep file to the same canonical set: `build_vocab.py` now emits
+`keep-union.json` (the W4 head reads JSON), and `RADIANCE_DRAFT_KEEP_FILE` defaults to it.
+
 ### Phase 3.1 started (unblocked, +5.1% measured on the branch)
 - `aijuus/kv-offload/ops/entrypoint.sh` copies the prebuilt table to
   `/cache/tunableop/skinny0.csv`.
