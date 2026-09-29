@@ -6,6 +6,23 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 4) — A/B B2 result: W4 head NOT adopted
+
+`DAVETHA_DRAFTER_QUANT=1` (reduced-vocab W4 head) redeployed and measured. Boot confirms it armed
+(`[radiance.w4] 4-bit drafter hook installed`, kernel `gemm_w4a16_nt_m64` for M=64 K=5120 N=5120).
+
+| Arm (SPEC 8) | greedy mean | sampled mean | acceptance len |
+|---|---|---|---|
+| int2 + vocab (baseline) | ~88 | ~80 | ~5-6 |
+| W4 reduced head | ~85-87 | ~83-87 | ~3-4 |
+
+Runs are noisy (sampled-json swings ~95-120 t/s). W4 **lowers** acceptance length and is flat-to-
+slightly-worse on greedy, flat-to-slightly-better on sampled — no clear win. The R9700 branch also
+kept int2+vocab for MTP in production. **Reverted `DAVETHA_DRAFTER_QUANT` to 0** (int2). The W4 path
+stays implemented and validated, selectable via the env, for a sampled-heavy workload.
+
+---
+
 ## 2026-09-29 (cont. 3) — A/B battery: B1 result, B2 armed
 
 ### B1 (SPEC depth) — RESULT: SPEC 8 wins
@@ -20,6 +37,7 @@ SPEC-8 int2 baseline (greedy ~88, sampled ~80). Revert to 0 to switch back.
 
 ---
 
+## 2026-09-29 (cont. 2) — Phase 1.0 FUSED ported+validated; Phase 3.1 verified
 
 ### Deploy verification (redeploy)
 - `[radiance] using patched r4d.so from /home/juup/.cache/radiance-libr4d/v0.5.0-w4a16`;

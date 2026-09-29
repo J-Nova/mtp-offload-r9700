@@ -397,7 +397,9 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
 ### Battery results (log)
 - **B1 SPEC depth**: SPEC 4 **worse** than 8 on our workload (greedy 86.5 vs 88.1, sampled 77.6 vs
   80.2 t/s; acceptance length ~3 vs ~5-6). Kept `spec_tokens=8`.
-- **B2 W4 head**: armed (`DAVETHA_DRAFTER_QUANT=1`), pending measurement vs the SPEC-8 int2 baseline.
+- **B2 W4 head**: **NOT adopted.** W4 (~85-87 greedy / ~83-87 sampled, acceptance ~3-4) is noisy and
+  no clear win over int2+vocab (~88 / ~80, acceptance ~5-6); lower acceptance. Reverted
+  `DAVETHA_DRAFTER_QUANT=0` (int2). W4 stays implemented, selectable via the env.
 - B3/B4: pending.
 
 ### How to run an arm
