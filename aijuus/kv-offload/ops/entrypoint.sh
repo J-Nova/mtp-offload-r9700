@@ -315,6 +315,16 @@ TOOL_ARG=""
 if [ -n "$TOOL_CALL_PARSER" ]; then TOOL_ARG="--enable-auto-tool-choice --tool-call-parser $TOOL_CALL_PARSER"; fi
 if [ -n "$REASONING_PARSER" ]; then TOOL_ARG="$TOOL_ARG --reasoning-parser $REASONING_PARSER"; fi
 
+# DRY (patch_dry.py) is opt-in: RADIANCE_DRY_MULTIPLIER unset/0 => off (no behaviour change).
+DRY_ARG=""
+if [ -n "${RADIANCE_DRY_MULTIPLIER:-}" ] && [ "${RADIANCE_DRY_MULTIPLIER}" != "0" ]; then
+  DRY_ARG="--dry-multiplier ${RADIANCE_DRY_MULTIPLIER}"
+  if [ -n "${RADIANCE_DRY_BASE:-}" ]; then DRY_ARG="$DRY_ARG --dry-base ${RADIANCE_DRY_BASE}"; fi
+  if [ -n "${RADIANCE_DRY_ALLOWED_LENGTH:-}" ]; then DRY_ARG="$DRY_ARG --dry-allowed-length ${RADIANCE_DRY_ALLOWED_LENGTH}"; fi
+  if [ -n "${RADIANCE_DRY_RANGE:-}" ]; then DRY_ARG="$DRY_ARG --dry-range ${RADIANCE_DRY_RANGE}"; fi
+  echo "[run] DRY enabled: $DRY_ARG"
+fi
+
 # shellcheck disable=SC2086
 exec /opt/radiance_entrypoint.sh \
   "$VLLM_MODEL_PATH" --served-model-name "$VLLM_SERVED_MODEL_NAME" \
@@ -324,6 +334,7 @@ exec /opt/radiance_entrypoint.sh \
   --max-model-len "$MLEN" --max-num-seqs "$SEQS" --max-num-batched-tokens "$CHUNK" \
   --attention-backend R4D \
   $SPEC_ARG \
+  $DRY_ARG \
   $ASYNC_ARG \
   --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype float16 \
   --compilation-config "{\"cudagraph_capture_sizes\":$CAPLIST,\"pass_config\":{\"fuse_norm_quant\":true,\"fuse_act_quant\":true}}" \

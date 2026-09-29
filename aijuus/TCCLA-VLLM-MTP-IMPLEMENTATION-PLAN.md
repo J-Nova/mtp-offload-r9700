@@ -413,6 +413,10 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   88.1 / 80.2.
 - **Tuning — `RADIANCE_DRAFT_TAU`**: 0.28 worse than 0.20 (86.6 / 83.5 vs 92.4 / 88.1) → kept 0.20.
 - **Tuning — `RADIANCE_SKINNY_GEMM=all`**: armed, pending.
+- **DRY (quality, opt-in)**: `RADIANCE_DRY_MULTIPLIER` (unset/0 = off; e.g. `0.8` enables;
+  optional `RADIANCE_DRY_BASE`/`_ALLOWED_LENGTH`/`_RANGE`). A/B on loop-prone prompts (repetition
+  should drop) **and** normal prose/code (no over-penalization); decode t/s is ~neutral — DRY is a
+  quality guard, not a speedup.
 - B3/B4: pending (B4 AITER neutral → reverted).
 
 ### Remaining work status (2026-09-29)
