@@ -394,6 +394,23 @@ variable at a time.
 (lossless head surface), Phase 2.1 no-calibration, Phase 3.1 TunableOp table — all proven
 lossless/byte-exact and complementary, so gating them behind an A/B only wastes wall-clock.
 
+### How to run an arm
+One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the
+Coolify UI env), redeploy, then measure with the same harness:
+
+    # inside a vLLM container (or any host with the port reachable)
+    python3 /patches/aijuus/tools/mtp-bench.py --url http://localhost:8000 --reps 3 --metrics
+
+- Harness: `aijuus/tools/mtp-bench.py` (greedy + sampled, multi-prompt mean; dependency-free).
+- Arm knobs:
+  - **B1 SPEC depth**: `speculative_config.num_speculative_tokens` (8 -> 4). Also retime
+    `RADIANCE_DRAFT_SCHEDULE` (it is keyed to SPEC=8).
+  - **B2 head**: `DAVETHA_DRAFTER_QUANT=1` (int2+vocab vs W4 reduced head).
+  - **B3 drafter quant**: `RADIANCE_MTP_MXFP4[_FILE]` (if/when ported).
+  - **B4 AITER**: `VLLM_ROCM_USE_AITER=0` (and unified-attn off).
+- Baseline (2026-09-29, int2+vocab, TunableOp, SPEC 8): greedy mean ~88, sampled mean ~80
+  (2 reps x 400 tok; single-prompt numbers are noisy — use the mean).
+
 ## Implementation Order
 
 1. **Phase 0**: Decision point (old vs new approach) — done (Option B)

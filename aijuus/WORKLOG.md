@@ -29,6 +29,14 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 - Table loads. Smoke bench on one prompt: greedy 123.3 t/s (flat), **sampled 64.5 → 72.3 t/s
   (+12%)**, acceptance ~60% unchanged. Dropped the temporary `PYTORCH_TUNABLEOP_VERBOSE=1`.
 
+### A/B harness + baseline
+- Added `aijuus/tools/mtp-bench.py` (dependency-free; greedy + sampled, multi-prompt mean, optional
+  acceptance via `/metrics`). Run inside a container: `python3 /patches/aijuus/tools/mtp-bench.py`.
+- Baseline (int2+vocab, TunableOp, SPEC 8): greedy mean ~88, sampled mean ~80 t/s (2 reps x 400 tok).
+  Single-prompt numbers swing a lot; use the mean.
+- Battery knobs recorded in the plan's "How to run an arm". Phase 1.1 verified ready to arm
+  (`DAVETHA_DRAFTER_QUANT=1`: registry remap + `draft_w4_lmhead.available()=True`).
+
 ---
 
 ## 2026-09-29 (cont.) — Phase 1.1 blocked then unblocked; Phase 3.1 wired
