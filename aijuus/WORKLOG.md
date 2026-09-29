@@ -14,6 +14,13 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
   relative to *their* 0.35 baseline).
 - **Armed `RADIANCE_SKINNY_GEMM=all`** (compose, both services) — next redeploy measures it vs the
   0.20 baseline. Watch acceptance (a bf16-ULP change can move drafting acceptance).
+- **Degen e2e validated**: live scheduler runs `check_stop(request, max_len, self.degen_params)` per
+  appended token, and a spy confirmed `check_degeneration` is invoked. A text-periodic prompt
+  ("x" x360) correctly does **not** fire because its *tokens* are varied (not a token-level loop);
+  the detector is validated directly on synthetic period-1/period-4 token tails. Note for testing:
+  degen keys on TOKEN periodicity, not character repetition.
+- `docker rmi tcclaviger/vllm` was blocked by a pre-existing `tcclaviger_extract` container (left in
+  place); refs are already extracted so the image can be dropped later.
 
 ---
 
