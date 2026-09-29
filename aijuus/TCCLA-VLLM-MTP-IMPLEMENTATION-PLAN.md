@@ -417,6 +417,9 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   optional `RADIANCE_DRY_BASE`/`_ALLOWED_LENGTH`/`_RANGE`). A/B on loop-prone prompts (repetition
   should drop) **and** normal prose/code (no over-penalization); decode t/s is ~neutral — DRY is a
   quality guard, not a speedup.
+  **Baseline (DRY off, 2026-09-29)**: loop-phrase rep 0.523 / 217 tok / stop; loop-sentence rep 0.941
+  / 176 tok (degen); loop-count rep 0.047 / 509 tok; normal-code rep 0.431; normal-prose rep 0.341;
+  t/s greedy 87.6 / sampled 90.3. Probe: repeat inducing prompts + t/s (see WORKLOG).
 - B3/B4: pending (B4 AITER neutral → reverted).
 
 ### Remaining work status (2026-09-29)
