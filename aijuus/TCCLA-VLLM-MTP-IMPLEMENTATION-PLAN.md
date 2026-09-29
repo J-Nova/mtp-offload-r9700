@@ -510,6 +510,15 @@ against our tree:
    but sampled 84.5 vs 88.1, acceptance down to 27-40% (mean accept ~3.2-4.2 vs ~5-6). Reverted to
    `1`.** The ULP-level shapes hurt MTP drafting acceptance here.
 
+### Vocab A/B (draft keep-set)
+One flip = `RADIANCE_DRAFT_VOCAB` in the MTP registry entry (+ redeploy). Arms:
+- **seed-49k** (baseline, `keep-union.txt` 49,159): greedy 90.9 / sampled 85.2, accept 46.7%, mean accept 4.73.
+- **full** (`RADIANCE_DRAFT_VOCAB=""` → 248,320-row int2 head, 0.33 GiB): confirm the prune actually helps here.
+- **freq variants** (ranked on the `betterbench/corpus/v1` workload, 21.8k corpus tokens / 3.2k unique → freq ranking padded by id):
+  `keep-24k-freq.txt` (24,576), `keep-49k-freq.txt` (49,152), `keep-96k-freq.txt` (98,304),
+  `keep-union-freq.txt` (65,327 = seed ∪ freq-49k).
+Run one arm at a time; measure `aijuus/tools/mtp-bench.py` + acceptance.
+
 ### How to run an arm
 One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the
 Coolify UI env), redeploy, then measure with the same harness:
