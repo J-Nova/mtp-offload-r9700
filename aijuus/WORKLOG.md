@@ -6,6 +6,36 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont.) — Phase 1.1 BLOCKED; Phase 3.1 wired
+
+### Verified live (post-redeploy)
+- `[aot-envkey] applied` (env key `1f2e5a7357ca`); new AOT dir seeded from the base inductor cache.
+- `[radiance] DRAFT_VOCAB: 49160 of 248320 rows … 0.07 GiB/rank, EXACTSET=False`.
+- Greedy 123.8 t/s, sampled 64.5 t/s; mean acceptance length 5–6, draft acceptance 49–66% — no
+  regression from the vocab prune.
+
+### Phase 1.1 blocker (important)
+The reduced-vocab W4 draft head (`DAVETHA_DRAFTER_QUANT=1` -> `aijuus/qwen3_5_mtp_w4.py` +
+`draft_w4_lmhead`) needs libr4d's `r4d_gemm_w4a16_nt_m64`. **Our prebuilt libr4d builds
+(`b9e42ab-rx6`, `b9e42ab-rx9`) do NOT export it** — `readelf -sW` shows only
+`r4d_gemm_bf16_nt_m16`; the `.hip` source is not on the host. So the W4 kernel path cannot run
+and Phase 1.1 is blocked until we obtain/build libr4d with that kernel (tcclaviger codeberg
+libr4d, or an r4dhip build). (An earlier note that r4d.so carried the symbol was wrong.)
+Note: the boot's `[radiance.w4] no w4a16 gemm_nt kernel … disabled` is the *full-head* path
+(`radiance_w4.py`, gated `RADIANCE_DRAFT_W4_FULL`, default off), not this one.
+
+### Phase 3.1 started (unblocked, +5.1% measured on the branch)
+- `aijuus/kv-offload/ops/entrypoint.sh` copies the prebuilt table to
+  `/cache/tunableop/skinny0.csv`.
+- `_defaults.server_env` now sets `PYTORCH_TUNABLEOP_ENABLED=1`,
+  `PYTORCH_TUNABLEOP_TUNING=0`, `PYTORCH_TUNABLEOP_FILENAME=/cache/tunableop/skinny%d.csv`,
+  and `PYTORCH_TUNABLEOP_VERBOSE=1` (temporary, for confirming the table loads; remove after).
+- Validators match torch 2.11.0 / HIP 714 / gfx1201; hipBLASLt version could not be read
+  statically — the boot log will say if the table is accepted.
+- NEXT: redeploy -> confirm the table loads (or "ignored") -> benchmark; then remove VERBOSE.
+
+---
+
 ## 2026-09-29 — R9700 branch integration, Phase 0.5/1.0, review fixes
 
 ### Context

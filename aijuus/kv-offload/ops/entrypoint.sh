@@ -191,6 +191,15 @@ cp radiance_preamble.py /opt/radiance_preamble.py
 cp fp8-configs/* "$SP"/vllm/model_executor/layers/quantization/utils/configs/ 2>/dev/null || true
 cp moe-configs/* "$SP"/vllm/model_executor/layers/fused_moe/configs/ 2>/dev/null || true
 cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/ 2>/dev/null || true
+# TunableOp table for the skinny fp8 GEMMs (MTP drafter N=5120 + lm_head), from the R9700
+# branch (same torch 2.11.0 / HIP 714 / gfx1201 validators). Read-only; PYTORCH_TUNABLEOP_*
+# comes from the registry. A validator mismatch makes torch ignore it (fails safe).
+mkdir -p /cache/tunableop 2>/dev/null || true
+if [ -f aijuus/refs/r9700-tp1/tunableop-skinny0.csv ]; then
+  cp -f aijuus/refs/r9700-tp1/tunableop-skinny0.csv /cache/tunableop/skinny0.csv
+else
+  echo "[run] WARN: tunableop table aijuus/refs/r9700-tp1/tunableop-skinny0.csv missing"
+fi
 echo "[run] runtime overlay installed from /patches (radiance_*.py + aijuus/ + configs)"
 
 python3 patch_quark_mxfp4.py

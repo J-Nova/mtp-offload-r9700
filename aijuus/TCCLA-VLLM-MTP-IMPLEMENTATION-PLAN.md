@@ -162,6 +162,12 @@ low-risk gain that does not depend on the W4 port.
 
 ### Phase 1.1: Reduced Vocab Draft Head (Option B) — consumes the Phase 1.0 keep list
 
+**Status**: BLOCKED (2026-09-29) — the libr4d builds we ship (`b9e42ab-rx6`/`-rx9`) export only
+`r4d_gemm_bf16_nt_m16`, not `r4d_gemm_w4a16_nt_m64`, and the `.hip` source is not on the host.
+The reduced-vocab W4 class/kernel wiring (`aijuus/qwen3_5_mtp_w4.py` + `draft_w4_lmhead`) is in
+place, but it has no kernel to call. Unblock by obtaining/building libr4d with
+`r4d_gemm_w4a16_nt_m64`. Meanwhile Phase 1.0's int2 vocab prune is live and Phase 3.1 proceeds.
+
 **Priority**: CRITICAL
 **Expected Impact**: +4..+8% tok/s net (similar to old approach, but more efficient)
 **Status**: IN PROGRESS
@@ -246,7 +252,7 @@ low-risk gain that does not depend on the W4 port.
 #### 3.1 Adopt the R9700 prebuilt TunableOp table for the skinny fp8 GEMMs
 **Priority**: HIGH (replaces the earlier sweep-from-scratch plan)
 **Expected Impact**: +5.1% sampled (measured on the branch); MTP GEMMs 1.30 → 0.85 ms, lm_head 2.47 → 2.32 ms, step 41.8 → 39.9 ms, acceptance identical
-**Status**: MOVED UP — the branch already did this work and the versions match
+**Status**: IN PROGRESS (2026-09-29) — entrypoint copies the table to `/cache/tunableop/skinny0.csv`; `PYTORCH_TUNABLEOP_*` wired in `_defaults.server_env` (VERBOSE=1 temporary). Awaiting redeploy to confirm the table loads, then benchmark and drop VERBOSE.
 
 **Details:**
 - The branch's `fp8_tune.py` sweeps the six skinny fp8 shapes at every M the V2 runner uses (1..12) → a 78-entry per-shape table; hipBLASLt's heuristic gives the MTP drafter's N=5120 GEMMs a 16x128 tile (40 workgroups on 64 CUs, no split) and the lm_head 64x64; tuned solutions are 16x16.
