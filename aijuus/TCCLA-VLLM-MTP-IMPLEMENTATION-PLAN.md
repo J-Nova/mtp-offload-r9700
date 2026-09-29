@@ -453,6 +453,28 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   (`use_skinny` accepts `on_gfx1x()`; `VLLM_ROCM_USE_SKINNY_GEMM` default True; `wvSplitK_hf`
   wave32 kernels present in `_rocm_C.abi3.so`). Applies only to unquantized bf16 linears.
 
+### Deep dive: tcclaviger MTP/kernel comparison (2026-09-29)
+Compared the public `tcclaviger/vllm-radiance` repo and the `tcclaviger/vllm:29.05.12` image
+against our tree:
+- **Radiance repo**: ours is a **strict superset** — no `def`/`class` present in theirs that is
+  missing from ours (`radiance_draft*.py`, `radiance_gdn/gemm/attn/kernels`).
+- **vLLM spec_decode** (`eagle.py`, `medusa.py`, `ngram_proposer.py`): effectively identical
+  (docstring/whitespace only).
+- **MTP patches**: `patch_mtp_loopbreak.py`, `patch_mtp_mm_mask.py`, `patch_skinny_gemm.py`
+  identical; `patch_radiance_fusion.py` (13) and `patch_gdn_metadata.py` (23) differ (our fork
+  edits, not missing features).
+- **wvSplitK**: already upstream/enabled (see above). **R4D attention**: already in use.
+- **Shard-local draft confidence** (42% less per-step all-reduce): TP>1 only → N/A (we serve TP=1
+  x2 instances).
+
+**Two concrete missed tunings** (from their documented sweeps):
+1. **`RADIANCE_DRAFT_TAU`**: tcclaviger bakes **0.35** for the bf16 head and **0.28 with
+   `RADIANCE_FAST_DRAFT=1`** (+5.3% over 0.35). Ours was **0.20** (deeper = more drafting).
+   **ARMED 0.20 → 0.28**; measure vs the 3.3 baseline (greedy 92.4 / sampled 88.1).
+2. **`RADIANCE_SKINNY_GEMM=all`**: adds the ULP-level shapes (notably GDN `in_proj_ba`, 48x/step,
+   28.5→3.6us) — **+3.5% tokens/s** in their DFlash2 case, no acceptance cost, but a bf16-ULP
+   change can move acceptance under spec decode. Next arm after TAU.
+
 ### How to run an arm
 One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the
 Coolify UI env), redeploy, then measure with the same harness:

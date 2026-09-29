@@ -6,6 +6,20 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 10) — Deep dive vs tcclaviger: no missing MTP/kernel features; two tuning levers
+
+- Radiance repo: **ours is a strict superset** (no `def`/`class` in theirs missing from ours).
+  vLLM `spec_decode` (eagle/medusa/ngram) effectively identical. MTP patches `loopbreak`/`mm_mask`/
+  `skinny_gemm` identical; `radiance_fusion`/`gdn_metadata` differ by our fork edits only.
+  wvSplitK already upstream; R4D attention already used; shard-local draft confidence is TP>1 only (N/A).
+- **Missed tuning 1 — `RADIANCE_DRAFT_TAU`**: tcclaviger bakes 0.35 (bf16 head) / **0.28 with
+  `RADIANCE_FAST_DRAFT=1`** (+5.3% over 0.35); ours was 0.20. **Armed 0.20 → 0.28** (measure vs 3.3).
+- **Missed tuning 2 — `RADIANCE_SKINNY_GEMM=all`**: ULP-level shapes incl. GDN `in_proj_ba`
+  (48x/step, 28.5→3.6us) → **+3.5% tokens/s** in their case, no acceptance cost, but bf16-ULP can
+  move acceptance. Next arm.
+
+---
+
 ## 2026-09-29 (cont. 9) — Degen (4.2) ported, tested, wired
 
 - Added `patch_degen.py` (repo root): runtime overlay porting tcclaviger's `patches/degen_detect`
