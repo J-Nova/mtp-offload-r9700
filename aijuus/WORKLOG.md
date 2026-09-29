@@ -6,6 +6,17 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 11) — Degen live; TAU 0.28 worse (kept 0.20); SKINNY=all armed
+
+- Redeploy confirmed `[patch_degen] applied` and the banner shows `RADIANCE_DRAFT_TAU = 0.28`.
+- **TAU arm result: 0.28 is WORSE** — greedy 86.6 / sampled 83.5 vs 0.20's 92.4 / 88.1 (−6.3% /
+  −5.2%). **Reverted to 0.20** (our deep-dive value was already optimal; tcclaviger's 0.28 advice is
+  relative to *their* 0.35 baseline).
+- **Armed `RADIANCE_SKINNY_GEMM=all`** (compose, both services) — next redeploy measures it vs the
+  0.20 baseline. Watch acceptance (a bf16-ULP change can move drafting acceptance).
+
+---
+
 ## 2026-09-29 (cont. 10) — Deep dive vs tcclaviger: no missing MTP/kernel features; two tuning levers
 
 - Radiance repo: **ours is a strict superset** (no `def`/`class` in theirs missing from ours).

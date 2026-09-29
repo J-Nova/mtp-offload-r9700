@@ -409,7 +409,11 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
 - **B2 W4 head**: **NOT adopted → REMOVED.** W4 (~85-87 greedy / ~83-87 sampled, acceptance ~3-4)
   showed no clear win over int2+vocab (~88 / ~80, acceptance ~5-6); lower acceptance. The W4 path
   was then deleted from the tree as superseded (tcclaviger dropped that MTP path). int2 kept.
-- B3/B4: pending.
+- **Tuning — SPEC/captures**: denser capture ladder (3.3) adopted: greedy 92.4 / sampled 88.1 vs
+  88.1 / 80.2.
+- **Tuning — `RADIANCE_DRAFT_TAU`**: 0.28 worse than 0.20 (86.6 / 83.5 vs 92.4 / 88.1) → kept 0.20.
+- **Tuning — `RADIANCE_SKINNY_GEMM=all`**: armed, pending.
+- B3/B4: pending (B4 AITER neutral → reverted).
 
 ### Remaining work status (2026-09-29)
 - **3.3 capture ladder**: **ADOPTED.** Clean re-measure: greedy 92.4 (was 88.1), sampled 88.1 (was
@@ -469,11 +473,12 @@ against our tree:
 
 **Two concrete missed tunings** (from their documented sweeps):
 1. **`RADIANCE_DRAFT_TAU`**: tcclaviger bakes **0.35** for the bf16 head and **0.28 with
-   `RADIANCE_FAST_DRAFT=1`** (+5.3% over 0.35). Ours was **0.20** (deeper = more drafting).
-   **ARMED 0.20 → 0.28**; measure vs the 3.3 baseline (greedy 92.4 / sampled 88.1).
+   `RADIANCE_FAST_DRAFT=1`** (+5.3% over 0.35). Ours was **0.20**. **RESULT: 0.28 is WORSE on our
+   workload — greedy 86.6 / sampled 83.5 vs 0.20's 92.4 / 88.1 (−6.3% / −5.2%). Kept 0.20.** Our
+   deeper 0.20 is the right value here (tcclaviger's +5.3% was vs *their* 0.35 baseline, not ours).
 2. **`RADIANCE_SKINNY_GEMM=all`**: adds the ULP-level shapes (notably GDN `in_proj_ba`, 48x/step,
    28.5→3.6us) — **+3.5% tokens/s** in their DFlash2 case, no acceptance cost, but a bf16-ULP
-   change can move acceptance under spec decode. Next arm after TAU.
+   change can move acceptance under spec decode. **ARMED** (next redeploy) vs the 0.20 baseline.
 
 ### How to run an arm
 One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the
