@@ -4,6 +4,165 @@ A running, dated log of what was changed, why, and how it was verified. Newest e
 Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 `TCCLA-VLLM-MTP-IMPLEMENTATION-PLAN.md`, which hold the analysis and the plan.
 
+## 2026-09-29 (cont. 29) — TOP1 draft-head arm is BROKEN on vLLM 0.29 (MTP boot-fail); swap trigger traced; MTP re-homed to vllm-0
+
+### `RADIANCE_DRAFT_HEAD_TOP1=1` crash-loops MTP at engine init
+- With the arm staged (`RADIANCE_DRAFT_HEAD_TOP1=1`, `RADIANCE_DRAFT_VOCAB` removed) MTP fails **during
+  `profile_run`** -> `speculator.propose` -> `_prefill` -> `_greedy_sample_draft` -> `compute_logits`:
+  `vllm/model_executor/layers/logits_processor.py:198  logits = logits[..., : self.org_vocab_size]`
+  raises `TypeError: tuple indices must be integers or slices, not tuple`.
+- The fused top-1 path makes the head return a tuple, but vLLM's `LogitsProcessor` still expects a tensor
+  from `lm_head`. Boot log confirms the **full** head is used (`draft head (248320, 5120)`), because the
+  fused top-1 path declines the vocab prune (`radiance_drafthead.py:672-674`).
+- Consequence: container crash-loops; MTP cannot boot until `HEAD_TOP1` is back to `0`.
+- **Action taken:** MTP registry entry reverted to the validated arm — `RADIANCE_DRAFT_HEAD_TOP1=0`,
+  `RADIANCE_DRAFT_VOCAB=/patches/aijuus/draft_keep/keep-union-freq.txt`, `RADIANCE_DRAFT_NGRAM=0`.
+  vllm-0 then booted clean and benched on baseline (88.4/155.8/253.2/427.0). See backlog item for the
+  proper fix.
+
+### Swap-trigger traced: who moved vllm-0 to ThinkingCap (21:07:54Z)
+- An **authenticated** `POST /v1/chat/completions` (Bearer key) with `model=ThinkingCap-…` reached
+  model-router :8100 via the public host **`ai.ragfodder.com`** (Coolify Traefik 172.18.0.8, fronted by the
+  `*.ragfodder.com` cloudflared tunnel). Router (by design) wrote `/model-state/trigger.json`, served that
+  request with the loaded MTP model (fallback), and model-controller swapped **vllm-0 -> ThinkingCap**
+  (`swap start` 21:07:54, `done` 21:17:11). `usage.json` records ThinkingCap at 1790716074.39.
+- **Caller identity is not recoverable from logs**: Traefik access logs are disabled and the router logs
+  only its direct peer (the proxy), discarding `X-Forwarded-For`/`CF-Connecting-IP`. Not open-webui
+  (its `webui.db` has no users/chats); not the manual reloads (those came from 172.18.0.1).
+
+### MTP re-homed to vllm-0
+- vllm-0 stopped; state cleared; controller re-seeded; vllm-0 booted MTP. vllm-1 also still serves MTP.
+- `model-controller.reconcile()` reverts a manual `state.json` edit within one TICK (5 s) while the
+  instance is up, so a direct state edit + reload races; deleting state (root-owned, `sudo`) and letting
+  the controller re-seed is the reliable path.
+
+---
+
+## 2026-09-29 (cont. 28) — MTP validation: n-gram tail HSA fault at bs>=2 (2 fixes failed), schedule re-confirmed, vocab A/B a wash
+
+Ran on vllm-0 (MTP blend), clean caches, `RADIANCE_COLLECT_TOKENS=0`.
+
+### Baseline (NGRAM=0, keep-union-freq, schedule [[1,2,5],[3,8,4]])
+conc 1/2/4/8 tok/s **88.3 / 155.8 / 264.4 / 421.9** (accept 56.4/55.4/58.0/55.3).
+Matches/beats cont.26 (88.3/155.7/252.6/423.8) -> **dynamic depth intact**.
+
+### N-gram tail = deterministic bs>=2 crash (blocker)
+- `RADIANCE_DRAFT_NGRAM=1` faults at the **bs=1->bs=2 transition** with
+  `HSA_STATUS_ERROR_EXCEPTION` (GPU hardware exception; `Queue error` + coredump attempt), right after
+  `[sd-trace] bs=2 nspec_sched=5`. Reproduced on **both cards**, with a **fully cleared cache** and the
+  collector off, and ThinkingCap uninvolved. bs=1 is fine (~23 proposals). The engine wedges
+  (`num_requests_running=2`, 0 tok/s, `/health` still 200) -> a restart is required after each attempt.
+- The tail (`_radiance_ngram_extend`) is **not in HEAD** — it is part of the uncommitted 154-line
+  `patch_dynamic_depth.py` diff — and was absent from the cont.26 dynamic-depth validation.
+- **Fix attempt 1 — fixed width**: take the n-gram only when `clen >= K` and REPLACE the K MTP drafts,
+  never append past K (the old `di += c[kk:cl]`, up to `num_speculative_steps`). **FAILED** — still HSA
+  at bs=2 with the row width already == K.
+- **Fix attempt 2 — per-row matcher**: run `match_gpu` once per row at **B=1** (the proven-safe path)
+  instead of one B=R launch. **FAILED** — still HSA at bs=2.
+- **Conclusion**: the fault is neither the draft-row width nor the matcher launch shape — merely
+  *executing the matcher during a bs>=2 draft step* faults, independent of B. Needs a dedicated
+  **standalone `match_gpu` repro** (B=1/B=2 off-server, serving stopped) before it can be re-enabled.
+  `NGRAM` kept **0**. Both safety changes (fixed-width + per-row) are left in the overlay (inert while off).
+
+### Schedule refinement: boundary stays at 3
+- bs=3 at **k=4** (current [[1,2,5],[3,8,4]]): **198.2 / 55.3%**.
+- bs=3 at **k=5** ([[1,3,5],[4,8,4]]): 193.0 / 50.1%.
+- k=4 wins -> keep `[[1,2,5],[3,8,4]]` (reconfirms cont.26).
+
+### Vocab A/B (head-only, one reload per arm)
+keep-union-freq (65327 rows) vs keep-union-v2 (65133 rows), conc 1/2/4/8 tok/s (accept):
+- **freq**: 88.3 / 155.8 / 264.4 / 421.9 (56.4 / 55.4 / 58.0 / 55.3)
+- **v2**:   87.9 / 152.7 / 264.6 / 430.3 (56.4 / 55.0 / 57.9 / 55.4)
+- **No clear winner**: freq wins bs1-2 (latency-critical), tie at bs4, v2 +~2% at bs8 (within noise —
+  freq measured 421.9/423.8 across runs). **Kept `keep-union-freq.txt`**.
+
+### Other
+- `RADIANCE_COLLECT_TOKENS=0` forced on the MTP entry: the B2 token-collector wraps the MTP draft
+  head `compute_logits` and does `argmax` + a host sync **every eager draft step**, and was rewriting
+  `/patches/aijuus/draft_keep/rank1.json` during serving. Off for all measurements.
+- Cleared all stale host state before this run: `/var/lib/radiance-model-state/*` (state/usage/trigger),
+  the 60 GiB fs-KV tier, the 20 GiB compile cache, and the collector artifacts.
+
+### Residuals / remaining backlog (do not forget)
+1. **N-gram tail offline repro** — run `match_gpu` standalone at B=1/B=2 with a serving instance stopped,
+   compare against the in-engine bs=2 context, find the faulty kernel, then re-enable `NGRAM=1` + validate.
+2. **End A/B battery** on the frozen union-freq build (one reload per arm): `EXACTSET+FUSED` on/off;
+   AITER on/off (`VLLM_ROCM_USE_AITER` 1 vs 0); SPEC 4 vs 8 re-run.
+3. **Untested MTP perf levers** (one reload per arm): `RADIANCE_DRAFT_TAU` 0.15/0.25;
+   `RADIANCE_DRAFT_RERANK` (32 vs other); capture-ladder trim (dense 26 sizes vs `[4,8,12,16,20,24,28,32]`).
+   (`RADIANCE_DRAFT_HEAD_TOP1` is **BROKEN** — see item 3b.)
+3b. **FIX `RADIANCE_DRAFT_HEAD_TOP1`** (cont.29): the fused int2 top-1 draft head returns a **tuple** from
+   `compute_logits`, but vLLM 0.29 `LogitsProcessor._get_logits` (`logits_processor.py:198`) still slices
+   the head output as a tensor -> `TypeError: tuple indices must be integers or slices, not tuple` at
+   engine init. Either return a tensor / adjust the gadget to vLLM's LogitsProcessor contract, or drop the
+   arm. NOTE it is mutually exclusive with the vocab prune (fused top-1 declines `RADIANCE_DRAFT_VOCAB`,
+   keeps the full 248320-row head, `radiance_drafthead.py:672-674`). It must NOT be left enabled in the
+   registry (a plain reload of MTP would crash-loop).
+4. **KV calibration** — `./calibrate-kv.sh SPEC_METHOD=mtp SPEC=8` to replace the MTP entry's interim
+   borrowed pin `8761733283` (needs a GPU run / serving stopped).
+5. **Dflash pilot pins** — `Qwen3.8-27B-MXFP4-mtpfp8` and both blend-dflash entries still carry the
+   8.16 GiB pin; port 6.0 GiB or recalibrate, else they OOM if served.
+6. **flash_attn 2.8.3** install + A/B against R4D/AITER attention (image-level, plan §3.2).
+7. **Housekeeping** — commit/track the uncommitted work (`patch_dynamic_depth.py`, `radiance_w4.py`,
+   `model-registry.json`, `WORKLOG.md`); decide the n-gram code (keep inert vs revert).
+Out of scope: DRY (adapted, not adopted), degen (live), ROCm 10 (deferred), KV prefix-cache inert under
+spec-decode (upstream #54360).
+
+---
+
+
+
+## 2026-09-29 (cont. 27) — DFlash boot incident (W4 over-band crash, AOT envkey, KV pin, expandable_segments); MTP impact nil
+
+The controller moved **both** vllm-0/vllm-1 to `ThinkingCap-Qwen3.8-27B-MXFP4-OCP-GPTQ` (dflash/16),
+which then crash-looped through four distinct failures. All fixed; it boots. (dflash path only.)
+
+### Failures and fixes
+1. **W4 over-band compile crash.** `ConstraintViolationError` at `radiance_w4.py:362`, the
+   `torch.cat([... for i in range(0, m, _MAX_M)])` chunk loop: `range()` over a SymInt specialized
+   the token dim. `kernel_projection` (1280x5120) and `candidate_selector.hidden_projection`
+   (256x5120) — the drafter's unquantised bf16 linears, listed in `_CFG_UNQUANT`/`_CFG_UNQUANT_A8`
+   — see the **whole draft block** `num_reqs*(1+nspec) = 8*17 = 136` rows, past `_MAX_M=64`.
+   Two W4-preserving fixes were **rejected**: a `radiance::w4_linear_chunked` custom op and a static
+   `torch.tensor_split(x2, 8)` both hit `AssertionError: Expected tensors only, but got: <class
+   'int'>` in inductor `copy_misaligned_inputs` (`torch/_inductor/utils.py:3442`) — any W4 chunking
+   of an over-band drafter linear corrupts the piecewise graph input list in 0.29. **Fix:** emptied
+   `_CFG_UNQUANT`/`_CFG_UNQUANT_A8` (comment in-file); those layers stay bf16. Boot then logs
+   `[radiance.w4] declined N=… (no measured config)` and the drafter AOT compiles. Re-enabling needs
+   an r4d kernel band above the draft block (`GEMM_W4_MAX_M >= ~136`), not an overlay change.
+2. **Stale AOT artifact.** `patch_aot_envkey.py` keys the AOT dir on
+   `sha256(sorted RADIANCE_* env)[:12]`; it excludes overlay source, so the old broken artifact
+   was reused. **Fix:** `RADIANCE_LOCAL_AOT_EPOCH=1` in `_defaults.server_env` →
+   env key `2184c1ceca86` → `640b6393d1be`, fresh compile (one-time recompile for every model).
+3. **KV alloc OOM** at the shipped 8.16 GiB pin (model ~20.1 GiB + drafter + ~2.5 GiB reserved).
+   Lowered to 7.5 GiB → KV allocated but then the **FULL cudagraph capture OOM'd** (20 MiB
+   `mxfp4_linear_pq` alloc, 2.58 GiB reserved-but-unallocated).
+4. **`expandable_segments` is structurally banned here.** `PYTORCH_CUDA_ALLOC_CONF=
+   expandable_segments:True` → vLLM 0.29 `VllmConfig` value_error: incompatible with the
+   **OffloadingConnector** unless `enable_cumem_allocator` is also on (the VMM allocator remaps the
+   registered/pinned KV). Removed; the real fix is headroom, not a different allocator.
+5. **KV sizing.** Lowered `max_model_len` 160000 → 120000 and set the pin from a naive ~44.2k
+   B/tok estimate to 5308440000 (~4.94 GiB) — **too small**: vLLM refused at
+   `_check_enough_kv_cache_memory` (`120000 needs 5.36 GiB, available 4.93 GiB; estimated max
+   length 105600`). Real cost is ~48–50k B/tok (radiance KV-group pick size 8 → 366 blocks/request,
+   + 3 padding layers "may waste up to 60%"). **Final pin 6442450944 (6.0 GiB).**
+
+### MTP impact: none functional
+- The emptied `_CFG_UNQUANT` shapes belong to the **DFlash drafter** (`DFlashGroupedConv.
+  kernel_projection` + `candidate_selector.hidden_projection`). The MTP blend uses the MTP head and
+  loads **no drafter**, so it never instantiates them → the MTP W4 path is unchanged.
+- The only change reaching MTP is `RADIANCE_LOCAL_AOT_EPOCH` (a pure hash-salt): it forces one fresh
+  AOT recompile on the next MTP boot (slower startup), with **no behaviour or throughput change**.
+  The env key is stable once set, so it is a one-time invalidation.
+- `max_model_len`/`kv_cache_memory` edits are per-entry (`ThinkingCap…` only); the MTP entry is untouched.
+
+### Residuals
+- Other dflash entries (`Qwen3.8-27B-MXFP4-mtpfp8`, both blend-dflash) still carry the 8.16 GiB pin
+  and will OOM if served; port the 6.0 GiB pin or recalibrate.
+- MTP combined **depth + `[ngram]` tail validation still pending** (was interrupted); see cont. 28.
+
+---
+
 ## 2026-09-29 (cont. 26) — Dynamic SD made real on V2: headroom measured, depth overlay implemented
 
 - **Headroom (static depth sweep, `RADIANCE_DYNAMIC_WIDTH=1` active throughout)**, conc 1/2/4/8 tok/s:

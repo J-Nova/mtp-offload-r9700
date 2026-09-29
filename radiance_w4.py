@@ -112,18 +112,17 @@ _A8_M = 16
 # these layers actually run -- they run bf16 rocBLAS, ~33.7 us (kernel_projection) and ~89.5 us
 # (hidden_projection) in the serve, or ~23.3 / ~6.9 through gemm_bf16_nt_m64 under
 # RADIANCE_SKINNY_GEMM=all. Against the skinny path, 4 bits is another ~3x.
-_CFG_UNQUANT: dict = {
-    (1280, 5120): [(16, (1, 4, 1, 1, 1)), (32, (1, 4, 1, 1, 1)),
-                   (48, (1, 4, 1, 1, 1)), (64, (1, 4, 1, 1, 0))],   # 8.19 .. 14.56 us
-    (256, 5120):  [(16, (1, 8, 1, 1, 0)), (32, (1, 8, 1, 1, 0)),
-                   (48, (2, 4, 1, 1, 0)), (64, (2, 4, 1, 1, 0))],   # 3.61 .. 5.09 us
-}
-_CFG_UNQUANT_A8: dict = {
-    (1280, 5120): [(16, (1, 8, 1, 1, 1)), (32, (1, 4, 1, 1, 1)),
-                   (48, (1, 4, 1, 1, 1)), (64, (1, 4, 1, 2, 1))],   # 7.88 .. 9.42 us
-    (256, 5120):  [(16, (1, 10, 1, 1, 0)), (32, (1, 10, 1, 1, 0)),
-                   (48, (2, 8, 1, 1, 1)), (64, (2, 8, 1, 1, 1))],   # 3.36 .. 4.29 us
-}
+# EMPTIED 2026-09-29: these two shapes (kernel_projection 1280x5120, candidate-selector 256x5120)
+# are the drafter's unquantised bf16 linears, and kernel_projection sees the WHOLE draft block --
+# num_reqs * (1 + num_spec_tokens), i.e. 136 rows at 8 seqs / dflash:16, past _MAX_M = 64. Chunking
+# an over-band input through the W4 kernel inserts torch nodes into the drafter's compiled graph and
+# vLLM 0.29's AOT/piecewise/inductor path then hands a non-tensor input to the inductor alignment
+# check (AssertionError: Expected tensors only, but got: <class 'int'> in copy_misaligned_inputs).
+# Neither a `range` chunk loop (dynamic-shape ConstraintViolationError) nor an opaque custom op (same
+# int assertion) survives, so these layers stay on their original bf16 path. Re-enabling needs a
+# kernel band above the draft block (r4d GEMM_W4_MAX_M >= ~136), not an overlay change.
+_CFG_UNQUANT: dict = {}
+_CFG_UNQUANT_A8: dict = {}
 
 # The same table for the int8 kernel, measured the same way. Only bands above _A8_M are consulted,
 # so the 16-row entries exist to make the band structure identical and are never reached at the
