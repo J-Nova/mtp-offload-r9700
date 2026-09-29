@@ -263,7 +263,7 @@ if triton is not None:
     # instead of a separate fp32 cast + reduce, and the coarse scores are not written (the exact set
     # discards them). Ported from the R9700 branch (radiance_drafthead.fused.diff, REVIEW-LOG §2).
     @triton.jit
-    def _draft_head_int2_cand(X, Wq, S, ZS, BM, BI, m_rows, K: tl.constexpr, N, stride_wq, stride_s, NBLK,
+    def _draft_head_int2_cand(X, Wq, S, ZS, BM, BI, SM, m_rows, K: tl.constexpr, N, stride_wq, stride_s, NBLK,
                               KC: tl.constexpr, G: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         pid = tl.program_id(0)
         offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -291,6 +291,17 @@ if triton is not None:
                 acc -= sv[:, None] * tl.load(ZS + offs_n * stride_s + gi,
                                              mask=mask_n, other=0.0).to(tl.float32)[None, :]
         _emit(acc, mask_n, BM, BI, offs_m, pid, NBLK, KC, BLOCK_N)
+        # Emit per-block sum-exp over the COARSE kept-vocab row (same partial as _draft_head_int2_top1).
+        # This decouples the tau-gate confidence from the EXACTSET -inf mask: the returned row keeps
+        # only the reranked candidates, so a capture over it would be a softmax over RERANK entries.
+        # The conf stashed here is instead a COARSE softmax over the whole kept sub-vocabulary, with
+        # an exact-reranked numerator (see _apply_vocab_fused). NOTE: that is NOT the same contract as
+        # the unfused-EXACTSET path, whose returned row is -inf outside the RERANK candidates and
+        # whose capture is therefore a RERANK-only softmax -- tune RADIANCE_DRAFT_TAU per arm.
+        masked = tl.where(mask_n[None, :], acc, float("-inf"))
+        blockmax = tl.max(masked, axis=1)
+        sm = tl.sum(tl.exp(masked - blockmax[:, None]), axis=1)
+        tl.store(SM + offs_m * NBLK + pid, sm)
 
     @triton.jit
     def _rerank_scatter(X, W, S, IDX, IDS, OUT, K: tl.constexpr, stride_w, NFULL, R: tl.constexpr,
@@ -565,9 +576,19 @@ def _apply_head_vocab(self, lm_head, hidden_states, embedding_bias):
         sys.stderr.write(f"[radiance] DRAFT_VOCAB: {ids.numel()} of {rows.shape[0]} rows -> {status}\n")
         sys.stderr.flush()
     if FUSED and getattr(self, "_radiance_topk_only", False) and embedding_bias is None:
+        if not getattr(self, "_radiance_path_logged", False):
+            self._radiance_path_logged = True
+            sys.stderr.write("[radiance] draft head path: FUSED (EXACTSET)\n")
+            sys.stderr.flush()
         # Exact-set path only: the fused kernels write just the reranked candidates, so the coarse
         # scores (which the unfused path keeps for argmax recall) are discarded. Guarded above.
         return _apply_vocab_fused(self, sub, hidden_states)
+    if not getattr(self, "_radiance_path_logged", False):
+        self._radiance_path_logged = True
+        _p = "unfused-EXACTSET" if getattr(self, "_radiance_topk_only", False) else "unfused"
+        sys.stderr.write(f"[radiance] draft head path: {_p} "
+                         f"(preconf={getattr(self, '_radiance_conf_precomputed', False)})\n")
+        sys.stderr.flush()
     eb = embedding_bias.index_select(0, self._dv_ids_dev) if embedding_bias is not None else None
     y_sub = _apply_head_int2(self, sub, hidden_states, eb)
     y = torch.full((*y_sub.shape[:-1], self._dv_nfull), float("-inf"),
@@ -590,8 +611,9 @@ def _apply_vocab_fused(self, sub, hidden_states):
     n, nblk = self._radiance_n, self._radiance_nblk
     bm = torch.empty(M, nblk * KCAND, dtype=torch.float32, device=x.device)
     bi = torch.empty(M, nblk * KCAND, dtype=torch.int32, device=x.device)
+    sm = torch.empty(M, nblk, dtype=torch.float32, device=x.device)
     _draft_head_int2_cand[(nblk,)](
-        x, self._radiance_wq, self._radiance_scale, self._radiance_zs, bm, bi, m,
+        x, self._radiance_wq, self._radiance_scale, self._radiance_zs, bm, bi, sm, m,
         k, n, self._radiance_wq.stride(0), self._radiance_scale.stride(0), nblk, KCAND,
         G=GROUP, BLOCK_M=M, BLOCK_N=BLOCK_N, **_cfg_for(M))
     idx = bi.gather(1, bm.topk(RERANK, dim=1).indices).contiguous()
@@ -606,6 +628,23 @@ def _apply_vocab_fused(self, sub, hidden_states):
                                      R=RERANK, BLOCK_K=512, FP8=False, num_warps=4)
     if self.head_dtype is not None and self.head_dtype != out.dtype:
         out = out.to(self.head_dtype)
+    # Tau-gate confidence decoupled from the EXACTSET mask (see the kernel comment): recover the
+    # top-1 softmax prob from the COARSE per-block partials, as _apply_head_int2_top1 does, and stash
+    # it for _local_draft. The returned row is unchanged (-inf outside the reranked set). Contract
+    # note: this is a COARSE kept-vocab softmax with an exact-reranked numerator, so it is NOT the
+    # same as capturing the returned row (that would be a RERANK-only softmax, and unfused-EXACTSET
+    # does exactly that); RADIANCE_DRAFT_TAU must be tuned per arm.
+    blockmax = bm.view(M, nblk, KCAND)[:, :, 0]
+    brow = blockmax.max(dim=1).values
+    S = (sm * torch.exp(blockmax - brow.unsqueeze(1))).sum(dim=1)
+    max_ex = out.max(dim=1).values.float()          # max over the R reranked (finite) candidates
+    conf = torch.exp(max_ex - brow[:m]) / S[:m]
+    self._radiance_last_conf = torch.nan_to_num(conf, nan=0.0, posinf=0.0).clamp_(0.0, 1.0)
+    if not getattr(self, "_radiance_fused_logged", False):
+        self._radiance_fused_logged = True
+        sys.stderr.write(f"[radiance] fused conf stashed: min={float(self._radiance_last_conf.min()):.4g} "
+                         f"max={float(self._radiance_last_conf.max()):.4g} n={int(self._radiance_last_conf.numel())}\n")
+        sys.stderr.flush()
     return out.reshape(*hidden_states.shape[:-1], -1)
 
 
@@ -649,6 +688,10 @@ def _quantize_draft_head(mtp, lp_attr="logits_processor"):
         lp._dv_ids = torch.tensor(ids, dtype=torch.long)
         lp._dv_sub = None
         lp._apply_head = types.MethodType(_apply_head_vocab, lp)
+        # FUSED+EXACTSET returns a -inf-masked row; the conf it stashes is computed from the coarse
+        # kept-vocab partials so the tau gate keeps working. Tell _local_draft to use it.
+        lp._radiance_conf_precomputed = bool(FUSED and EXACT_SET)
+        lp._radiance_last_conf = None
         return (f"DRAFT_VOCAB: {len(ids)} of {rows.shape[0]} rows (EXACTSET={EXACT_SET}); "
                 f"quantised on first call")
     # A drafter whose checkpoint carries no lm_head (DFlash2) gets the target's tensor shared in

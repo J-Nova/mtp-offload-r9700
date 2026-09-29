@@ -41,6 +41,10 @@ print("VLLM_SERVED_MODEL_NAME=" + q(e.get("served_name", name)))
 print("SPEC_DRAFTER=" + q(e.get("drafter", "")))
 print("SPEC_METHOD=" + q(e.get("spec_method", "none")))
 print("SPEC_TOKENS=" + q(e.get("spec_tokens", "")))
+# Native dynamic speculative decoding: JSON list of [start,end,nspec] inclusive batch ranges
+# (vLLM 0.29 num_speculative_tokens_per_batch_size). Empty disables it. Consumed by the scheduler;
+# RADIANCE_DYNAMIC_DEPTH additionally makes the V2 runner/speculator honour the per-batch K.
+print("SPEC_SCHEDULE=" + q(pick("spec_schedule", "")))
 print("KV_CACHE_MEMORY=" + q(e.get("kv_cache_memory", "")))
 print("VERIFY_HEAD=" + q(e.get("verify_head", "")))
 print("MAX_MODEL_LEN=" + q(pick("max_model_len", "")))
@@ -166,7 +170,11 @@ CAPLIST="[$SIZES]"
 if [ "$SMETHOD" = none ]; then
   SPEC_CFG=""
 elif [ "$SMETHOD" = mtp ]; then
-  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"R4D\",\"disable_padded_drafter_batch\":$UNPAD}"
+  SPEC_SCHED_ARG=""
+  if [ -n "$SPEC_SCHEDULE" ]; then
+    SPEC_SCHED_ARG=",\"num_speculative_tokens_per_batch_size\":$SPEC_SCHEDULE"
+  fi
+  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"R4D\",\"disable_padded_drafter_batch\":$UNPAD$SPEC_SCHED_ARG}"
 else
   SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$SPEC_DRAFTER\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":$UNPAD,\"draft_sample_method\":\"greedy\"}"
 fi
@@ -240,6 +248,16 @@ python3 patch_gdn_merge_inproj.py
 python3 patch_dynwidth.py
 python3 patch_async_dynwidth.py
 python3 patch_step_trace.py
+# Dynamic SD (cont.26): the scheduler computes a per-batch K from SPEC_SCHEDULE; the cudagraph overlay
+# stops the speculator decode-manager ZeroDivisionError when a schedule is configured, and
+# patch_dynamic_depth makes the V2 runner/speculator actually honour that K (proposer depth).
+if [ -n "$SPEC_SCHEDULE" ]; then
+  python3 patch_dynamic_sd_cudagraph.py || { echo "[run] FATAL: patch_dynamic_sd_cudagraph failed"; exit 1; }
+  python3 patch_sd_sched_trace.py || echo "[run] WARN: patch_sd_sched_trace failed"
+fi
+if [ "${RADIANCE_DYNAMIC_DEPTH:-0}" = "1" ]; then
+  python3 patch_dynamic_depth.py || { echo "[run] FATAL: patch_dynamic_depth failed"; exit 1; }
+fi
 python3 patch_ar_geometry.py
 python3 patch_ar_qbits.py
 python3 patch_ar_3rank.py

@@ -116,7 +116,14 @@ Based on the research findings from tcclaviger's vLLM Docker image (versions 29.
 ### Phase 0.5: vLLM 0.29 correctness gates (from the R9700 branch)
 
 **Priority**: HIGH — do BEFORE any RADIANCE_* A/B
-**Status**: PENDING
+**Status**: ITEM 2 DONE — `patch_aot_envkey.py` wired into the entrypoint and reports
+`[aot-envkey] applied: …` with a per-env AOT key at boot (validated: same env reuses the AOT dir,
+changed env changes the 12-hex key). ITEM 1 — runtime audit done 2026-09-29 and it caught a real
+hit: `use_v2_model_runner` defaults True on ROCm for our arch, so the deployment runs the NEW
+`vllm/v1/worker/gpu/model_runner.py` runner, and `radiance_draft.py`'s controller hooks (legacy
+`v1/worker/gpu_model_runner.GPUModelRunner` + `SpecDecodeBaseProposer`) are **INERT** — the tau gate,
+n-gram gating, schedule and batch cap are no-ops. Only the draft-head path is live. See WORKLOG
+cont. 21. Boot-log prover: `aijuus/tools/v2_hook_audit.sh`.
 **Source**: `aijuus/refs/r9700-tp1/REVIEW-LOG.md` (mtstanfield/vllm-mxfp4@r9700-tp1)
 
 Two 0.29 findings that make our own measurements untrustworthy until fixed. Neither changes
@@ -132,15 +139,38 @@ behaviour on its own; both are integrations, not A/Bs:
    sorted RADIANCE_* env to the piecewise hash factors. Our deployment flips many RADIANCE_*
    toggles, so this is required before trusting any of them.
 
+**How to do the V2-hook audit (item 1):**
+1. Enumerate every runtime hook. Sources: `radiance_kernels.install_all()` (mxfp4/gdn/attn/r4d/
+   preshuffle/fuse-rms-quant, draft-head, token collector) and the entrypoint overlays
+   (`radiance_attn/gdn/gemm/draft*.py`) plus the kv-offload connector patches.
+2. For each, identify the symbol it replaces (`grep` the patch/wrapper for the assigned attribute,
+   e.g. `SomeClass.forward = …`, `module.fn = …`) and locate that symbol in the INSTALLED vLLM:
+   `python -c "import vllm.<mod> as m; import inspect; print(inspect.getsourcefile(m.Symbol))"`.
+3. Classify: a hook is live only if its patched attribute is reached by the **V2** runner
+   (`vllm/v1/worker/gpu_model_runner.py`, the default in 0.29) rather than the V1 runner
+   (`vllm/worker/model_runner.py`). If the symbol only appears in the V1 path, the hook is inert.
+4. Runtime proof (install ≠ invocation): drive ONE real generation and check a per-hook side effect.
+   Prefer existing traces — `RADIANCE_R4D_REPORT`, `RADIANCE_OFFLOAD_TRACE`/`_DEBUG_INSTRUMENT`,
+   the MXFP4 kernel-selection lines, the `[radiance] … draft head` line. Where none exists, add a
+   one-shot stderr/counter at the patched function (temporary overlay), regenerate, and assert it
+   fires exactly once per step.
+5. Negative control: same request with the hook's env toggle OFF must NOT emit the marker.
+6. Record per hook: `symbol → V1/V2 → fires (yes/no) → evidence line`. Any V1-only hook is a
+   silent no-op on 0.29 and must be re-pointed at the V2 path (or its acceptance/timing numbers
+   re-interpreted).
+
 ### Phase 1.0: Draft-head surface port (R9700 branch, lossless)
 
 **Priority**: HIGH — cheapest gain, feeds and de-risks Phase 1.1
 **Status**: COMPLETE — `RADIANCE_DRAFT_VOCAB` + `RADIANCE_DRAFT_EXACTSET` + `RADIANCE_DRAFT_FUSED`
-implemented in `radiance_drafthead.py` and GPU-validated. FUSED is byte-identical to the unfused
-exact-set path and inert without the exact set; since the MTP entry keeps EXACTSET off (tau-gate,
-finding #3), FUSED is inert here until the tau-gate confidence is decoupled. Wired into the MTP
-registry entry (`RADIANCE_DRAFT_VOCAB=…/keep-union.txt`). Keep file built by
-`aijuus/draft_keep/build_vocab.py` (union of the branch seed and our collector output).
+implemented in `radiance_drafthead.py`. FUSED was inert here because EXACTSET was off (the tau gate
+read `1/Σexp` over the EXACTSET-masked row ≈ 1). **Decoupled 2026-09-29 (B1)**: the fused kernel now
+emits per-block sum-exp `SM` and the head recovers confidence from the COARSE kept-vocab partials,
+so the mask no longer touches the gate. Validated: fused row == unfused masked row, and on the real
+lm_head the fused conf matches the capture-path reference to 5e-7 with identical argmax. A/B pending
+(set `RADIANCE_DRAFT_EXACTSET=1` + `RADIANCE_DRAFT_FUSED=1` in the MTP registry); expect a launch-count
+win (15→6). Note: for the MTP argmax caller EXACTSET caps drafting to the top-RERANK blocks, so
+acceptance must be measured, not assumed. Registry: `RADIANCE_DRAFT_VOCAB=…/keep-union-freq.txt`.
 **Source**: `aijuus/refs/r9700-tp1/REVIEW-LOG.md` §2 + `aijuus/draft_keep/qwen38-draft-vocab-49152.txt`
 
 Ports onto OUR existing `radiance_drafthead.py` (the int2 head we already run). Its hooks —
@@ -462,6 +492,26 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   Optionally A/B later (e.g. `--dry-multiplier 0.8`).
 - **5.1 tcclaviger repos**: DONE — public radiance repo cloned; the current "davetha" path is the
   DFlash2 drafter int4 projections under `RADIANCE_FAST_DRAFT`, not the MTP quant we removed.
+- **Dynamic-draft controller port to V2 (NEW, HIGH)**: `radiance_draft.py` hooks the legacy
+  `SpecDecodeBaseProposer` / `v1/worker/gpu_model_runner.GPUModelRunner`, but 0.29 runs the new
+  `v1/worker/gpu/model_runner.py` + `MTPSpeculator`. Re-point the controller (tau gate, n-gram
+  gating, batch cap) at the speculator path (`BaseSpeculator.propose` /
+  `AutoRegressiveSpeculator`/`MTPSpeculator` greedy sampling), or explicitly force the legacy runner.
+  Until then every `RADIANCE_DRAFT_TAU/STRONG/RECENT/SCHEDULE` knob is inert.
+  - **Status (2026-09-29, cont. 21–26)**: stage-1 V2 hooks are installed and *live* only for liveness;
+    the per-step confidence capture is opt-in (`RADIANCE_DRAFT_V2_CONF`, default off) because the
+    served decode loop is a replayed FULL CUDA graph, so the Python sampling body runs only on eager
+    PIECEWISE draft steps (no per-step conf). Native `num_speculative_tokens_per_batch_size` is read
+    only by the V1 runner/async scheduler (the V2 runner ignores `num_spec_tokens_to_schedule`), so we
+    implemented **dynamic draft depth ourselves** via `patch_dynamic_depth.py` (gated
+    `RADIANCE_DYNAMIC_DEPTH=1`): the V2 speculator builds the batch→K lookup from its own
+    `vllm_config.speculative_config`, forces the non-fused per-step loop, and bounds the draft loop to
+    K; the runner slices the returned drafts to K. Validated: dynamic **88.3 / 155.7 / 252.6 / 423.8
+    tok/s** at conc 1/2/4/8 vs static k=8 **80.1 / 140.4 / 227.4 / 361.0** (+10–17%). Schedule
+    `[[1,2,5],[3,8,4]]`; k<=3 is a cliff and is avoided. The tau gate / n-gram tail remain unported.
+- **Battery re-run (DEFERRED)**: every SPEC/AITER/capture-ladder result above was measured with the
+  49k head. Re-run the End A/B Battery (B1 SPEC depth, B4 AITER, B5) on the frozen **union-freq**
+  build — and with/without `EXACTSET+FUSED` — before freezing the config. Interactions may differ.
 - **5.2 ROCm 10**: RESEARCHED — see below; deferred as a major upgrade.
 
 ### ROCm 10 research (5.2, 2026-09-29) — staying on vLLM 0.29
@@ -559,13 +609,24 @@ against our tree:
    `1`.** The ULP-level shapes hurt MTP drafting acceptance here.
 
 ### Vocab A/B (draft keep-set)
-One flip = `RADIANCE_DRAFT_VOCAB` in the MTP registry entry (+ redeploy). Arms:
-- **seed-49k** (baseline, `keep-union.txt` 49,159): greedy 90.9 / sampled 85.2, accept 46.7%, mean accept 4.73.
-- **full** (`RADIANCE_DRAFT_VOCAB=""` → 248,320-row int2 head, 0.33 GiB): **RESULT greedy 85.6 / sampled 85.0, accept 53.8%, mean accept 5.30.** The prune is confirmed worthwhile — full raises acceptance but the 8x coarse pass costs greedy t/s; sampled is a wash. Keep a pruned head.
-- **freq variants** (ranked on the `betterbench/corpus/v1` workload, 21.8k corpus tokens / 3.2k unique → freq ranking padded by id):
-  `keep-24k-freq.txt` (24,576), `keep-49k-freq.txt` (49,152), `keep-96k-freq.txt` (98,304),
-  `keep-union-freq.txt` (65,327 = seed ∪ freq-49k).
-Run one arm at a time; measure `aijuus/tools/mtp-bench.py` + acceptance.
+One flip = `RADIANCE_DRAFT_VOCAB` in the MTP registry entry (+ restart via controller `/reload`).
+Method: after each boot discard a warmup bench, then record two `mtp-bench.py --reps 4` runs — the
+first bench after a boot is unreliable (lazy int2 quant + kernel JIT overlap it; a post-boot 24k run
+read 69.6 greedy vs 80.9 warm). Arms (rows) and warm results (greedy / sampled t-s, spec-decode accept):
+- **seed-49k** (`keep-union.txt`, 49,159): baseline 90.9 / 85.2, accept 46.7% (earlier run).
+- **24k-freq** (`keep-24k-freq.txt`, 24,576): greedy 80.9 / sampled 81.8, accept 45.2%.
+- **union-freq** (`keep-union-freq.txt`, 65,327 = seed ∪ freq-49k): **greedy 93.4 / 93.3, sampled 91.3 / 86.4, accept 45.5 / 48.4%**.
+- **96k-freq** (`keep-96k-freq.txt`, 98,304): greedy 87.5 / 87.4, sampled 89.7 / 83.4, accept 53.6 / 51.7%.
+- **full** (`RADIANCE_DRAFT_VOCAB=""` → 248,320-row int2 head, 0.33 GiB): greedy 85.6 / sampled 85.0, accept 53.8%.
+- **49k-freq** (`keep-49k-freq.txt`, 49,152): untested.
+
+**DECISION (2026-09-29): union-freq 65,327** (`keep-union-freq.txt`) is the chosen keep-set — best and
+highly reproducible greedy t/s (93.4/93.3) at a smaller head than 96k. Acceptance is lower than
+96k/full, but the cheaper coarse pass nets out faster. Registry:
+`RADIANCE_DRAFT_VOCAB=/patches/aijuus/draft_keep/keep-union-freq.txt`.
+
+Note: the `/reload` fast path was unusable during this sweep because a `patch_degen.py` idempotency
+bug crash-looped any restarted instance (duplicate `--degen-max-period`); see WORKLOG.
 
 ### How to run an arm
 One variable at a time. For **registry/env knobs** (e.g. `RADIANCE_DRAFT_VOCAB`, `RADIANCE_DRAFT_TAU`)

@@ -4,6 +4,315 @@ A running, dated log of what was changed, why, and how it was verified. Newest e
 Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 `TCCLA-VLLM-MTP-IMPLEMENTATION-PLAN.md`, which hold the analysis and the plan.
 
+## 2026-09-29 (cont. 26) — Dynamic SD made real on V2: headroom measured, depth overlay implemented
+
+- **Headroom (static depth sweep, `RADIANCE_DYNAMIC_WIDTH=1` active throughout)**, conc 1/2/4/8 tok/s:
+  k=8 80.1/140.4/227.4/361.0 · k=6 85.9/150.3/236.7/383.9 · **k=5 88.2/155.5/251.9/406.8** ·
+  **k=4 86.2/153.1/266.7/418.8** · k=3 24.0/47.5/85.9/157.1 (a reproducible ~3.5x cliff, avoid).
+  Optimum is concurrency-dependent: **bs 1-2 → k=5, bs 3-8 → k=4**. Acceptance rises as depth drops
+  (36.9%→56.4% at conc1), i.e. the deep positions were mostly wasted. These numbers were *with*
+  `RADIANCE_DYNAMIC_WIDTH=1` already on, so the dominant lever is proposer depth (MTP forward steps),
+  not verify width.
+- **Why the vLLM feature can't do it**: `num_spec_tokens_to_schedule` is read only by the V1 runner
+  (`gpu_model_runner.py`) and async scheduler; the live V2 runner ignores it (cont.25). The scheduler
+  computes it correctly regardless.
+- **Enabler**: probe shows MTP runs the V2 runner on the NON-FUSED speculator path
+  (`V2 propose ENTERED … fused=False steps=8 adv=True`), so draft depth is a plain Python
+  `for step in range(1, num_speculative_steps)` over per-step FULL-graph replays. `DraftTokensHandler`
+  already sizes on `draft_tokens.shape[1]` and the scheduler schedules `request.spec_token_ids` as
+  returned, so a K-wide draft list is a supported shape (this is how `patch_dynwidth.py` already
+  varies verify width).
+- **New overlay `patch_dynamic_depth.py`** (gated `RADIANCE_DYNAMIC_DEPTH=1`, idempotent, `ast.parse`
+  guarded): (1) V2 runner remembers `SchedulerOutput.num_spec_tokens_to_schedule`, hands it to the
+  speculator before `propose`, and passes only the first K draft columns to `DraftTokensHandler`;
+  (2) speculator bounds `_multi_step_decode` (and the fused loop) to K via `_radiance_eff_k`, with a
+  `[dyn-depth] propose eff_k=…` once-per-distinct-value diagnostic. Fused graphs bake depth, so when
+  `use_fused_multi_step_decode` is True the overlay is a no-op at full depth (never a graph mismatch).
+- **Wiring**: entrypoint re-adds `SPEC_SCHEDULE`/`SPEC_SCHED_ARG` and applies
+  `patch_dynamic_sd_cudagraph.py` + `patch_sd_sched_trace.py` when a schedule is set, and
+  `patch_dynamic_depth.py` when `RADIANCE_DYNAMIC_DEPTH=1`. Registry (MTP): `spec_tokens=8` (ceiling),
+  `spec_schedule=[[1,2,5],[3,8,4]]`, `RADIANCE_DYNAMIC_DEPTH=1`, FUSED/EXACTSET=1.
+- **VALIDATED (cont.26, live)**: dynamic depth works end to end. `[dyn-depth] propose# … k=5 num_reqs=1
+  / k=4 num_reqs=8 fused=False sched=True`. Sweep (conc 1/2/3/4/8, reps 2–3, mt=400):
+  **dynamic 88.3 / 155.7 / 184.7 / 252.6 / 423.8 tok/s** vs static k=8 **80.1 / 140.4 / — / 227.4 /
+  361.0** → **+10.2% / +10.9% / — / +11.1% / +17.4%**, and it matches the per-conc static optima at
+  bs1-2 (k=5) and bs8 (k=4). Acceptance steady ~55-56%. Measured draft width at bs8 = 3.88 tokens/draft
+  (K=4 applied). Correctness sanity: greedy `17*23` → `391` (correct), coherent reasoning. Stable across
+  re-runs (conc4 252.3-253.0, conc8 423.3-424.3).
+- **Implementation note (v1 → v2)**: v1 forwarded `SchedulerOutput.num_spec_tokens_to_schedule` from
+  the runner into `speculator._radiance_dyn_k`; probes showed the runner received K=4/5 but `propose`
+  still saw 0/8 on the same object id, so the hand-off was dropped (cause not fully isolated; the two
+  speculator instances, one `fused=True` one `fused=False`, made it fragile). v2 is **self-contained**:
+  the speculator builds the batch→K lookup from its own `vllm_config.speculative_config` and derives K
+  from `input_batch.num_reqs`; the runner only slices the returned drafts to K. v2 also **forces
+  `use_fused_multi_step_decode=False`** whenever a schedule is set, so capture uses per-step graphs and
+  depth is Python-controlled on every instance (fused graphs bake depth). Debug probe files removed.
+- **Rollback**: set `RADIANCE_DYNAMIC_DEPTH=0` and `spec_schedule=""`. Note: the overlays edit the
+  container filesystem; a Coolify redeploy re-applies from the image cleanly (during dev we reset the
+  two files to pristine from the image before re-applying).
+
+---
+
+## 2026-09-29 (cont. 25) — Deep review of dynamic SD: it is inert by construction on the V2 runner
+
+Root cause established by code trace (not just measurement). The plumbing is not miswired — vLLM 0.29
+implements dynamic SD for the *V1* GPU runner and async scheduler only; the live V2 runner drops it.
+
+- **Path**: registry `spec_schedule` → entrypoint `SPEC_SCHEDULE`/`SPEC_CFG`
+  (`num_speculative_tokens_per_batch_size`) → `SpeculativeConfig` (field only; `_verify_args` does NOT
+  validate it) → `Scheduler.__init__` builds `self.dynamic_sd_lookup =
+  build_dynamic_sd_schedule_lookup(sched, max_num_seqs, num_spec_tokens)` → per step,
+  `num_spec_tokens_to_schedule = dynamic_sd_lookup[len(num_scheduled_tokens)]` → placed in
+  `SchedulerOutput`.
+- **Dead end**: `SchedulerOutput.num_spec_tokens_to_schedule` is consumed ONLY by
+  `v1/core/sched/async_scheduler.py:25` and `v1/worker/gpu_model_runner.py` (the **V1** runner:
+  lines 5096/5105/5139/5161/5188/5206/5354, which pass it as `num_speculative_tokens=`).
+  `v1/worker/gpu_worker.py:457-476` picks `vllm.v1.worker.gpu.model_runner.GPUModelRunner` when
+  `use_v2_model_runner` (our case, log "Using V2 Model Runner"), and **that file has ZERO references to
+  `num_spec_tokens_to_schedule`**. `async_scheduling=False` here, so the async consumer is off too.
+- **Draft depth** is fixed at `self.num_speculative_steps = vllm_config.num_speculative_tokens` (=8) in
+  the V2 speculator; the draft count fed to the target comes from `scheduled_spec_decode_tokens`
+  (previous step's actual drafts), never from the schedule. So neither draft depth nor verification
+  width changes on the live path.
+- **Only real effects of arming it**: (a) `scheduler.py:1103` disables decode-request padding
+  (`pad_spec_decode`) whenever `dynamic_sd_lookup is not None` — a *negative* for full-cudagraph
+  uniformity; (b) `cudagraph_utils._init_candidates` takes the dynamic branch and expands candidate
+  query lengths, which is what crashed the speculator decode manager (our overlay patch makes it not
+  crash, but the expanded values are unused on V2).
+- **Unit tests** (`aijuus/tools/test_dynamic_sd.py`, run in a throwaway container): all pass —
+  schedule validation (accepts ours; rejects None/empty/short/start-0/overlap/starts-at-2/negative-K),
+  lookup `[0,8,7,7,6,6,6,6,5]` for max_num_seqs=8 (+ gap carry-forward, K clamp), the cudagraph
+  formula (unpatched speculator manager `{-2,-1,0,1}` → `round_up(...,0)` raises; patched `{1}`; main
+  runner unchanged `{6,7,8,9}`), and the installed-guard presence checks.
+- **Conclusion**: keep `spec_schedule` off; the re-test's remaining value is only the integration
+  confirmation that the schedule reaches the scheduler (`[sd-trace]`) while throughput stays unchanged.
+  A working dynamic depth would require the V2 runner/speculator to consume `num_spec_tokens_to_schedule`
+  (a vLLM-side change), not a config/plumbing change on our side.
+- **Integration evidence (rigorous re-test, cont.25)**: Arm A boot (schedule armed, FUSED/EXACTSET=1) →
+  `[sd-trace]` logs `bs=1 nspec_sched=8`, `bs=2→7`, `bs=3→7`, `bs=4..7→6`, `bs=8→5` (schedule IS
+  applied), no `ZeroDivisionError`, healthy. Sweep (conc 1/2/4/8, reps 2, mt=400):
+  **Arm A 80.1 / 140.4 / 227.4 / 361.0 tok/s, accept 36.9 / 35.6 / 49.2 / 47.5 %**;
+  **Arm B (schedule off) 79.9 / 140.1 / 227.2 / 358.5, accept 36.9 / 35.6 / 49.2 / 47.4 %** —
+  within noise. So the schedule is genuinely consulted by the scheduler but has no effect on the live
+  V2 path, confirming the code trace above. Verdict: the plumbing is a dud; drop it (keep
+  `patch_dynamic_sd_cudagraph.py` + `patch_sd_sched_trace.py` + `aijuus/tools/test_dynamic_sd.py` as
+  reference/regression only).
+
+---
+
+## 2026-09-29 (cont. 24) — Review fixes: dynamic-SD plumbing dropped; V2 conf capture gated; registry restored
+
+Code review of the uncommitted set flagged four issues; all addressed:
+
+- **Registry restored to the decided config** (`aijuus/model-registry.json`): MTP `server_env` back to
+  `RADIANCE_DRAFT_EXACTSET=1` + `RADIANCE_DRAFT_FUSED=1` (arm-C's `0`/`0` was a transient A/B setting
+  and contradicted cont.22); `RADIANCE_DRAFT_VOCAB=keep-union-freq.txt` unchanged.
+- **Dynamic-SD plumbing dropped** (`aijuus/kv-offload/ops/entrypoint.sh`): removed the `SPEC_SCHEDULE`
+  print and the `SPEC_SCHED_ARG` / `num_speculative_tokens_per_batch_size` block (mtp `SPEC_CFG` is
+  back to the static form), and removed the unconditional `patch_dynamic_sd_cudagraph.py` invocation.
+  Also removed the `spec_schedule` key from the MTP registry entry. Rationale: inert on this stack
+  (cont.23) and a maintenance/crash surface for no gain. `patch_dynamic_sd_cudagraph.py` is kept
+  untracked as the reference fix, with a STATUS header saying it is NOT applied and MUST be applied if
+  the schedule is ever re-armed.
+- **V2 confidence capture gated** (`radiance_draft.py`): new opt-in `RADIANCE_DRAFT_V2_CONF` (default
+  0). `_install_v2_hooks` now only wraps `_greedy_sample_draft` (and resets `_radiance_conf_hist`) when
+  the knob is on; `propose_v2` keeps the liveness log. Documented that the served decode loop is a
+  replayed FULL CUDA graph (`Capturing decode CUDA graphs (FULL)`), so the Python sampling body only
+  runs on eager PIECEWISE draft steps and cannot yield a per-step confidence — the old "stage-1
+  capture" was a silent no-op on the served path.
+- **Fused confidence contract documented** (`radiance_drafthead.py`): corrected the comment that
+  claimed the fused conf equals the unfused-EXACTSET capture. The fused conf is a COARSE kept-vocab
+  softmax with an exact-reranked numerator; unfused-EXACTSET (`_apply_head_int2` `y.fill_(-inf)` +
+  32-candidate scatter) is a RERANK-only softmax. `RADIANCE_DRAFT_TAU` must be tuned per arm.
+- Verified: `py_compile` clean on both edited modules; entrypoint `bash -n` clean; no
+  `spec_schedule`/`SPEC_SCHEDULE`/`patch_dynamic_sd_cudagraph` references remain in the entrypoint or
+  registry. Live vllm-0 still runs the previous boot's config until its next restart.
+
+---
+
+## 2026-09-29 (cont. 23) — Dynamic-SD A/B: no measurable gain on the MTP path
+
+- New harness `aijuus/tools/mtp-conc-bench.py`: concurrency sweep (C in 1/2/4/8) with aggregate decode
+  tok/s + acceptance from `/metrics` deltas. (`mtp-bench.py` is single-stream and at bs=1 the schedule
+  resolves to the static depth, so it can't see a dynamic-SD effect.) Metric names on this build are
+  `vllm:spec_decode_num_draft_tokens_total` / `_accepted_tokens_total` (not `num_drafted_tokens`).
+- Method: same boot, warm, `--conc 1,2,4,8 --reps 2 --max-tokens 400` (greedy) per arm.
+- **Arm A** (dynSD=ON, FUSED/EXACTSET=ON): 80.0 / 140.2 / 227.4 / 359.8 tok/s, accept 36.9 / 35.6 / 49.2 / 47.6 %.
+- **Arm B** (dynSD=OFF/static nspec=8, FUSED/EXACTSET=ON): 75.0 / 140.0 / 225.0 / 358.6 tok/s, accept 36.9 / 35.6 / 48.9 / 47.6 %.
+- **Result: within noise (~1–6% at conc1, <1% above; acceptance identical to 0.1%)** — native dynamic SD
+  gives no measurable benefit here. Mechanism: `num_speculative_tokens_per_batch_size` is consumed only
+  by `v1/core/sched/scheduler.py` (→ `num_spec_tokens_to_schedule`, i.e. how many drafted tokens are
+  *scheduled/verified*) and by `cudagraph_utils.py` (query lengths). The V2 speculator's draft loop is
+  fixed at `self.num_speculative_steps` (= config nspec), so it still runs 8 draft forwards regardless;
+  trimming verification width saves little vs the draft-forward cost. At conc8 the per-step draft count
+  is ~5 but the speculator loop is unchanged.
+- Consequence: the `patch_dynamic_sd_cudagraph.py` overlay is now **dormant** (only hit when a schedule
+  is set). Keeping the registry `spec_schedule=""` (static nspec=8) is the simpler, equal-performing
+  config. The overlay stays in the entrypoint as a correctness fix in case the schedule is re-armed.
+
+---
+
+## 2026-09-29 (cont. 22) — V2 controller hooks LIVE; native dynamic-SD fixed via overlay; schedule ARMED
+
+- **V2 port stage 1 works**: boot log shows `[radiance.draft] V2 speculator hooks installed` and, on
+  the warmup, `V2 greedy_sample_draft ENTERED ids=(8,) conf min=0.0844 max=0.0844 preconf=True` +
+  `V2 propose ENTERED cls=MTPSpeculator conf_hist=set`. So the controller is finally on the executed
+  path (the draft head's FUSED+EXACTSET `preconf` is being consumed). Note conf is constant across the
+  batch here (min==max) — all rows share the same prompt; fine.
+- **Native dynamic SD was broken in this build** (now FIXED — see below): adding
+  `num_speculative_tokens_per_batch_size=[[1,1,8],[2,3,7],[4,7,6],[8,8,5],[9,64,4]]` to
+  `--speculative-config` crash-looped the EngineCore at startup:
+  `v1/worker/gpu/spec_decode/autoregressive/speculator.py:143 init_cudagraph_manager` →
+  `cudagraph_utils.py:254 _init_candidates` → `round_up(num_tokens, decode_query_len)` →
+  `ZeroDivisionError`. The schedule itself parsed correctly
+  (`build_dynamic_sd_schedule_lookup(...)= [0,8,7,7,6,6,6,6,5]`), so this was a 0.29 bug in the
+  dynamic-SD × V2-speculator-cudagraph path, not our format.
+- **Fix — new overlay `patch_dynamic_sd_cudagraph.py`**: `_init_candidates` expands candidate decode
+  query lengths as `{num_spec + (decode_query_len - num_speculative_tokens) for num_spec in
+  dense_schedule[1:]}`. That assumes the MAIN runner (`decode_query_len = num_spec+1`, offset +1).
+  `AutoRegressiveSpeculator.init_cudagraph_manager` builds its per-step DECODE manager with
+  `decode_query_len=1`, so the offset is `1 - num_spec` (e.g. -7 at SPEC=8) and the set becomes
+  `{-2,-1,0,1}` → `round_up(...,0)`. The patch filters `_q >= 1` and falls back to
+  `[self.decode_query_len]` when empty. Main runner unchanged (`{9,8,7,6}`); speculator decode manager
+  collapses to `{1}` (i.e. the correct non-dynamic behaviour). Wired into `entrypoint.sh` right after
+  `patch_step_trace.py` (unconditional, idempotent; marker `patch_dynamic_sd_cudagraph`). Verified in a
+  throwaway container: applies once, `py_compile` OK, second run prints "already applied".
+- **Re-armed `spec_schedule`** to `[[1,1,8],[2,3,7],[4,7,6],[8,8,5],[9,64,4]]` in
+  `model-registry.json` (MTP entry) after the user restarted vllm-0.
+- **Verified on vllm-0 boot (13:49) + smoke request**: `[dynamic-sd-cg] applied`, serve args carry
+  `num_speculative_tokens_per_batch_size`, `Using V2 Model Runner`, no `ZeroDivisionError`, service
+  healthy. Smoke (batch=1) shows the whole stack executing: `V2 greedy_sample_draft ENTERED … preconf=True`
+  and `V2 propose ENTERED cls=MTPSpeculator`, draft head `FUSED (EXACTSET)`; `spec_decode_num_draft_tokens`
+  = 64 (8 drafts × 8), accepted 33 at batch=1 — and the schedule selected `num_spec=8`, matching
+  `[1,1,8]`, confirming the native schedule drives draft depth.
+- Registry state: `spec_schedule=[[1,1,8],[2,3,7],[4,7,6],[8,8,5],[9,64,4]]`, MTP keeps
+  `RADIANCE_DRAFT_VOCAB=keep-union-freq.txt` + `RADIANCE_DRAFT_EXACTSET=1` + `RADIANCE_DRAFT_FUSED=1`.
+- **Next**: V2 port stage 2 (per-request confidence gate + n-gram tail assembly in
+  `MTPSpeculator`/`AutoRegressiveSpeculator`), then A/B (FUSED/EXACTSET on/off; union-freq vs union-v2
+  corpus). Custom `RADIANCE_DRAFT_SCHEDULE` is now redundant with native `spec_schedule` — keep as
+  fallback only.
+- **Stage-2 reconnaissance (feasibility)**: the V2 multi-step draft loop
+  (`autoregressive/speculator.py::_multi_step_decode` / `_generate_fused_drafts`) is captured into the
+  decode CUDA graph, so a per-request *Python* early-stop (the legacy gate's compute saving) is not
+  graph-safe. What IS feasible graph-safely: post-process the returned `draft_tokens[:num_reqs]` (a GPU
+  tensor) after `propose`. The legacy matcher's context source (`input_batch.token_ids_cpu_tensor` /
+  `num_tokens_no_spec`) does NOT exist on V2 `InputBatch` (it only carries the scheduled `input_ids`),
+  but the full history is on GPU at `model_runner.req_states.all_token_ids.gpu` (+ `num_computed_tokens`,
+  `input_batch.idx_mapping` maps req→state index), so a V2 n-gram matcher is possible without host
+  copies. Net: batch-size schedule is already covered by native `spec_schedule`; the remaining stage-2
+  value is (a) n-gram "free win" tail extension and (b) a tau gate that decides where the tail is
+  allowed — both as post-propose tensor ops. This is a sizeable port; measurement-first is an option.
+
+---
+
+## 2026-09-29 (cont. 21) — FINDING: the dynamic-draft controller is INERT on the V2 model runner
+
+- **Symptom**: enabling `RADIANCE_DRAFT_EXACTSET=1 + RADIANCE_DRAFT_FUSED=1` (union-freq) gave a
+  ~3x-slow first boot (transient) then ~neutral numbers (greedy 90.0 / sampled 92.7 / accept 53.2%
+  vs baseline 94.0/89.5/57.8). A one-time `_local_draft` log was added and never fired.
+- **Diagnosis** (one-time entry logs on `SpecDecodeBaseProposer.propose/_greedy_sample` and
+  `GPUModelRunner.propose_draft_token_ids`): none ever fire, though `install()` reports
+  `RADIANCE_DYNAMIC_DRAFT=ON` and the draft head's FUSED path DOES run. So the controller hooks are
+  applied to classes that are never called.
+- **Root cause**: `vllm_config.use_v2_model_runner` defaults **True** on ROCm except for
+  `{DeepseekV32ForCausalLM, DeepseekV4ForCausalLM}` (`ROCM_DEFAULT_MRV1_ARCHITECTURES`); our
+  `Qwen3_5ForConditionalGeneration` is not in it and no unsupported features apply, so 0.29 runs the
+  **new** `vllm/v1/worker/gpu/model_runner.py` runner. Its drafter for `method="mtp"` is
+  `MTPSpeculator` (`vllm/v1/worker/gpu/spec_decode/mtp/speculator.py`), not
+  `vllm.v1.spec_decode.llm_base_proposer.SpecDecodeBaseProposer`.
+- **Impact**: `radiance_draft.py`'s whole controller — the tau confidence gate, the n-gram/suffix
+  gating, the per-slot schedule, the batch cap — is a **no-op** in this deployment. Only the *draft
+  head* path is live (it runs via the speculator's `compute_logits`), so int2/vocab-prune/FUSED still
+  apply; the decoupling in cont.19 currently has no consumer.
+- **Consequence for B1**: FUSED's launch saving still applies to the head, but EXACTSET's mask no
+  longer affects the gate (there is no gate), so the arm is ≈neutral; the decoupling must be
+  re-validated once the controller is live.
+- **Fix options**: (a) port the controller hooks to the V2 speculator (`BaseSpeculator.propose` /
+  `AutoRegressiveSpeculator`/`MTPSpeculator` greedy path) — the correct fix; (b) force
+  `VLLM_USE_V2_MODEL_RUNNER=0` to run the legacy runner our hooks target (big config change; other
+  v2-oriented patches may break); or (c) accept the controller is off and drop its knobs. Recommend
+  (a). The plan's Phase 0.5 "V1 hooks inert on V2" concern is confirmed — and it hits our own
+  controller, not just the generic audit.
+
+---
+
+## 2026-09-29 (cont. 20) — Phase 0.5 V2-hook audit: STATIC PASS (runtime check armed)
+
+- **Static finding: there is no V1 runner in the 0.29 image.** `vllm/worker/model_runner.py` is
+  absent; the runner is `vllm/v1/worker/gpu_model_runner.py` (`GPUModelRunner`) + `vllm/v1/worker/
+  gpu_worker.py` (`Worker`). So the review's "V1 hooks are inert" class cannot apply to a hook that
+  targets these, and a V1-targeting hook would fail to import (visible) rather than silently no-op.
+- **Every hook/patched path targets V2** (verified by reading each install and the patch scripts):
+  - `radiance_draft.py` → `vllm.v1.worker.gpu_model_runner.GPUModelRunner.propose_draft_token_ids`
+    (and `_sample`/bookkeeping) — the V2 runner itself.
+  - `radiance_drafthead.py` → `load_weights` on `Qwen3_5MTP`/`Qwen3NextMTP`/`DFlash2Qwen3ForCausalLM`
+    (arch classes) + `LogitsProcessor._apply_head`.
+  - `radiance_kernels.install_load_hook` → `Fp8LinearMethod.process_weights_after_loading` (quant layer).
+  - `radiance_kernels.install_attn_config_hook` → AITER `unified_attention` `select_3d/2d_config`
+    (the ROCm unified-attention backend V2 uses).
+  - `radiance_kernels.install_r4d_report` → `vllm.v1.worker.gpu_worker.Worker.compile_or_warm_up_model`.
+  - `radiance_allreduce.install_custom_ar` → `CudaCommunicator.{__init__,all_reduce}`.
+  - `radiance_vit_attn.install` → `vllm.v1.attention.ops.vit_attn_wrappers.apply_sdpa`.
+  - patch scripts: targets are `vllm/v1/...` throughout (scheduler, input_processor, rejection_sampler,
+    gpu_input_batch, kv_cache_utils, attention backends, gpu_worker). `patch_step_trace.py` targets
+    `vllm/v1/worker/gpu_worker.py` + `vllm/v1/worker/gpu/async_utils.py` (V2).
+- **Runtime proof** (install ≠ invocation) is a boot-log check per hook; script:
+  `aijuus/tools/v2_hook_audit.sh [container]`. Markers: preshuffle line, attn-override line,
+  `int2 draft head armed` + `INT2_DRAFT_HEAD (lazy)`, `DRAFT_VOCAB: N of M rows`,
+  `RADIANCE_DYNAMIC_DRAFT=ON`, `fast-reduce hook armed`/`custom all-reduce INSTALLED`,
+  `R4D kernel selection: libr4d` (fires from the V2 Worker after warmup), and item-2 `[aot-envkey]`
+  + env-key hash + `new AOT dir` count. Negative control: with a hook's env toggle off its marker
+  must be absent.
+
+---
+
+## 2026-09-29 (cont. 19) — FUSED/EXACTSET tau-gate decoupling (B1), validated
+
+- **Problem**: `RADIANCE_DRAFT_EXACTSET=1` was unusable on MTP because it sets `_radiance_topk_only`
+  and makes the returned row `-inf` outside the RERANK candidates; `_local_draft` derived the
+  tau-gate confidence as `1/Σexp` over that masked row, so confidence read ≈1 and the gate never
+  fired. `RADIANCE_DRAFT_FUSED=1` needs `_radiance_topk_only` (it discards the coarse row), so it was
+  inert too.
+- **Fix (decoupling)**: `_draft_head_int2_cand` now also emits the per-block sum-exp `SM` (verbatim
+  from the already-validated `_draft_head_int2_top1`), and `_apply_vocab_fused` recovers the top-1
+  softmax from the COARSE kept-vocab partials (`brow`/`S`/`max_ex`, same as the TOP1 path), stashing
+  it as `lp._radiance_last_conf`. `_local_draft` consumes it and skips `capture_local` when
+  `lp._radiance_conf_precomputed` (set only when `FUSED and EXACTSET`). The returned row is unchanged;
+  no caller signature changed. Default-off (needs both envs).
+- **Validation** (`stilldeadcode`/`juupp` `vllm-radiance:0.9.3-collect-tokens`, throwaway GPU run):
+  - row equality: fused masked row == unfused masked row (mask + values) — `fused_test.py`.
+  - **real lm_head** (`lm_head.weight` bf16 [248320,5120], 32768-id subset, m=8): fused conf vs the
+    capture-path reference `1/Σexp` → **mean |Δ| 5.0e-7, max 6.0e-7**; finite/row 32 (=RERANK);
+    argmax identical. So the confidence the tau gate sees is unchanged while the head runs in 6
+    launches instead of 15.
+  - block-partial reconstruction checked on CPU (S == full logsumexp to 5e-7).
+- **To A/B**: set `RADIANCE_DRAFT_EXACTSET=1` + `RADIANCE_DRAFT_FUSED=1` in the MTP registry entry
+  (`server_env`), restart vllm-0, compare greedy/sampled t-s + acceptance against union-freq without
+  them. Recall note: for the MTP ARGMAX caller, EXACTSET caps the draft to the top-RERANK (32)
+  coarse blocks, so drafted ids are not guaranteed identical to the coarse-row argmax — acceptance
+  must be checked, not assumed.
+
+---
+
+## 2026-09-29 (cont. 18) — patch_degen idempotency fix (crash loop) + vocab keep-set decided: union-freq
+
+- **Bug**: `patch_degen.py` step 7 (CLI options) used marker `'"degen-max-period"'`, but the inserted
+  text is `"--degen-max-period"` (leading `--`). The marker never matched, so the block was re-inserted
+  on **every container boot**. vllm-1 (restarting repeatedly while chasing a ThinkingCap swap) reached
+  ~20 duplicate `--degen-max-period` registrations → `argparse.ArgumentError: conflicting option
+  string` → crash loop. It also hung `/reload`: the controller's swap loop holds `_op_lock` until
+  `SWAP_TIMEOUT` (3600s), so the reload request blocked.
+- **Fix**: marker → `'"--degen-max-period"'`. Verified idempotent — applying 3× leaves the file hash
+  unchanged with the count at 1; real restarts of vllm-0 (via `/reload`) and vllm-1 both boot healthy
+  with the count still 1.
+- **Recovery**: copied vllm-0's good `arg_utils.py` into vllm-1 (it was the only diverged file of
+  2382), cleared the stuck `trigger.json`, reset state to the default blend-MTP key, restarted the
+  controller then vllm-1. Both instances healthy; ThinkingCap can be retried later.
+- **Vocab A/B result / decision**: warm sweep (discard the first post-boot bench, record 2× reps-4) →
+  **union-freq 65,327 is the fastest greedy arm** (93.4/93.3), ahead of 96k (87.4), full 248k (85.6),
+  49k seed (85.4), 24k (80.9). Chosen keep-set: `keep-union-freq.txt`. Detail in the plan's Vocab A/B
+  section.
+
 ---
 
 ## 2026-09-29 (cont. 16) — controller reload endpoint (no redeploy for registry arms)

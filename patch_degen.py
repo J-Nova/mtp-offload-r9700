@@ -209,7 +209,7 @@ def apply():
         "        scheduler_group.add_argument(\n"
         '            "--degen-min-span", **scheduler_kwargs["degen_min_span"]\n'
         "        )\n",
-        marker='"degen-max-period"',
+        marker='"--degen-max-period"',
     )
     # 8) SchedulerConfig construction
     _edit(

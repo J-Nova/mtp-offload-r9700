@@ -39,6 +39,7 @@ Env (the knobs):
   RADIANCE_DRAFT_CROSS_MAX / _CROSS_CTX_MAX  auto cross-request bounds (default 8 / 16384)
   RADIANCE_DRAFT_STATS      periodic controller counters on stderr (default 1)
   RADIANCE_DRAFT_STATS_EVERY  steps between stats lines (default 200)
+  RADIANCE_DRAFT_V2_CONF    V2 speculator confidence capture (default 0=off; see _install_v2_hooks)
 """
 import os
 import sys
@@ -82,6 +83,13 @@ CROSS_CTX_MAX = int(os.environ.get("RADIANCE_DRAFT_CROSS_CTX_MAX") or "16384")
 # Controller counters (opt-out). Cheap: a few ints per step.
 STATS = os.environ.get("RADIANCE_DRAFT_STATS", "1") == "1"
 STATS_EVERY = int(os.environ.get("RADIANCE_DRAFT_STATS_EVERY") or "200")
+# V2 speculator confidence capture (opt-in, default OFF). The served draft decode loop is recorded
+# into FULL CUDA graphs (cudagraph_utils / autoregressive.speculator), so the Python
+# `_greedy_sample_draft`/`_apply_head` bodies do NOT run per served decode step -- only eager
+# (PIECEWISE) draft-prefill steps reach them. Turning this on therefore captures at most the
+# position-0 confidence, not a per-step one, and nothing consumes it yet (stage 2). Keep it off on
+# the served path to avoid a misleading signal and per-eager-step softmax work.
+V2_CONF = os.environ.get("RADIANCE_DRAFT_V2_CONF", "0") == "1"
 # batch-size MTP-forward ceiling "bs:max_depth,..." (carry-forward). Caps how deep the drafter forwards
 # by running batch size, so deep serial drafts do not run at concurrency. The per-slot rule still stops
 # earlier within it, and the free n-gram tail is unaffected. Empty string disables the cap.
@@ -271,6 +279,27 @@ def _local_draft(proposer, hidden_states):
         _t = _time.perf_counter()
 
     B = local.shape[0]
+    start = getattr(getattr(lm_head, "shard_indices", None), "org_vocab_start_index", 0) or 0
+    # FUSED+EXACTSET: the head stashed a confidence from the COARSE kept-vocab partials. The
+    # returned row is -inf outside the reranked set, so capture_local would read ~1.0 always and
+    # defeat the tau gate. Consume the stashed value and skip capture (see radiance_drafthead).
+    preconf = None
+    if getattr(lp, "_radiance_conf_precomputed", False):
+        preconf = getattr(lp, "_radiance_last_conf", None)
+        lp._radiance_last_conf = None
+    if not getattr(lp, "_radiance_ld_logged", False):
+        lp._radiance_ld_logged = True
+        _log(f"_local_draft: preconf_flag={getattr(lp, '_radiance_conf_precomputed', False)} "
+             f"last_conf={'set' if preconf is not None else 'none'} tp={tp}")
+    lidx = local.argmax(dim=-1)
+    if PHASE_TIMERS:
+        _phase("argmax", _t)
+        _t = _time.perf_counter()
+    if preconf is not None and tp == 1:
+        if not getattr(lp, "_radiance_preconf_logged", False):
+            lp._radiance_preconf_logged = True
+            _log("precomputed tau confidence active (FUSED+EXACTSET)")
+        return (lidx + start).to(torch.int64), preconf[:B].to(torch.float32)
     sc = getattr(proposer, "_radiance_lscratch", None)
     if sc is None or sc[0].shape[0] != B * gpu._NSPLIT:
         sc = proposer._radiance_lscratch = gpu.make_scratch(B, local.device)
@@ -280,12 +309,6 @@ def _local_draft(proposer, hidden_states):
     if PHASE_TIMERS:
         _phase("capture", _t)
         _t = _time.perf_counter()
-    lidx = local.argmax(dim=-1)
-    if PHASE_TIMERS:
-        _phase("argmax", _t)
-        _t = _time.perf_counter()
-
-    start = getattr(getattr(lm_head, "shard_indices", None), "org_vocab_start_index", 0) or 0
     tp = get_tensor_model_parallel_world_size()
     if tp == 1:
         return (lidx + start).to(torch.int64), 1.0 / lsum
@@ -356,6 +379,10 @@ def _install_drafter_hooks():
     orig_propose = SpecDecodeBaseProposer.propose
 
     def greedy_sample(self, hidden_states):
+        if not getattr(self, "_radiance_gs_logged", False):
+            self._radiance_gs_logged = True
+            _log(f"greedy_sample ENTERED active={getattr(self, '_radiance_active', False)} "
+                 f"cls={type(self).__name__}")
         if not getattr(self, "_radiance_active", False):
             return orig_greedy(self, hidden_states)
         _t0 = _time.perf_counter() if PHASE_TIMERS else 0.0
@@ -453,6 +480,11 @@ def _install_drafter_hooks():
         bc = getattr(self, "_radiance_batch_ceil", 0)
         # gate only on the standard full-vocab argmax path the capture kernel assumes
         skip = self.use_local_argmax_reduction or self.use_heterogeneous_vocab
+        if not getattr(self, "_radiance_prop_logged", False):
+            self._radiance_prop_logged = True
+            _log(f"propose ENTERED cls={type(self).__name__} skip={skip} "
+                 f"local_argmax={self.use_local_argmax_reduction} "
+                 f"hetero={self.use_heterogeneous_vocab} nspec={num_speculative_tokens}")
         if skip:
             self._radiance_active = False
             if 0 < bc < num_speculative_tokens:          # still honor the concurrency cap by clamping
@@ -484,6 +516,79 @@ def _install_drafter_hooks():
     SpecDecodeBaseProposer._radiance_wrapped = True
 
 
+# ----- V2 speculator hooks (vLLM 0.29 default runner) ------------------------
+# 0.29 runs the NEW model runner (vllm/v1/worker/gpu/model_runner.py) whose MTP drafter is
+# MTPSpeculator -> AutoRegressiveSpeculator -> DraftModelSpeculator, NOT the legacy
+# SpecDecodeBaseProposer the hooks above target. These hook the V2 speculator for liveness; the
+# per-step confidence capture is opt-in (RADIANCE_DRAFT_V2_CONF=1) because the served decode loop is
+# a replayed FULL CUDA graph, so the Python sampling body only runs on eager (PIECEWISE) draft steps
+# (see the V2_CONF comment). Gate/tail assembly lands next.
+def _install_v2_hooks():
+    try:
+        from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+        from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+            AutoRegressiveSpeculator,
+        )
+    except Exception as e:
+        _log(f"V2 speculator hooks unavailable ({e!r}); legacy hooks only")
+        return
+    if getattr(DraftModelSpeculator, "_radiance_v2_wrapped", False):
+        return
+
+    orig_greedy = DraftModelSpeculator._greedy_sample_draft
+
+    def greedy_draft(self, hidden_states):
+        if not getattr(self, "_radiance_active", False):
+            return orig_greedy(self, hidden_states)
+        logits = self.model.compute_logits(hidden_states)
+        ids = logits.argmax(dim=-1)
+        lp = getattr(self.model, "logits_processor", None)
+        conf = None
+        if lp is not None and getattr(lp, "_radiance_conf_precomputed", False):
+            conf = getattr(lp, "_radiance_last_conf", None)
+            lp._radiance_last_conf = None
+        if conf is None:
+            f = logits.float()
+            mx = f.max(dim=-1).values
+            conf = 1.0 / (f - mx[..., None]).exp().sum(dim=-1)
+        if conf.dim() > 1:
+            conf = conf.reshape(-1)
+        self._radiance_conf_hist = conf
+        if not getattr(self, "_radiance_v2_logged", False):
+            self._radiance_v2_logged = True
+            _log(f"V2 greedy_sample_draft ENTERED ids={tuple(ids.shape)} "
+                 f"conf min={float(conf.min()):.3g} max={float(conf.max()):.3g} "
+                 f"preconf={getattr(lp, '_radiance_conf_precomputed', False)}")
+        return ids
+
+    # Capture is opt-in: off by default it is pure overhead with no consumer, and on the served
+    # path it cannot see the replayed decode steps anyway.
+    if V2_CONF:
+        DraftModelSpeculator._greedy_sample_draft = greedy_draft
+
+    orig_propose = AutoRegressiveSpeculator.propose
+
+    def propose_v2(self, *a, **k):
+        self._radiance_active = True
+        if V2_CONF:
+            self._radiance_conf_hist = None
+        r = orig_propose(self, *a, **k)
+        if not getattr(self, "_radiance_v2_prop_logged", False):
+            self._radiance_v2_prop_logged = True
+            h = getattr(self, "_radiance_conf_hist", None)
+            _log(f"V2 propose ENTERED cls={type(self).__name__} "
+                 f"conf_hist={'set' if h is not None else 'none'} v2_conf={int(V2_CONF)} "
+                 f"fused={getattr(self, 'use_fused_multi_step_decode', None)} "
+                 f"steps={getattr(self, 'num_speculative_steps', None)} "
+                 f"adv={getattr(self, 'advance_draft_positions', None)}")
+        return r
+
+    AutoRegressiveSpeculator.propose = propose_v2
+    DraftModelSpeculator._radiance_v2_wrapped = True
+    _log(f"V2 speculator hooks installed (liveness; confidence capture {'ON' if V2_CONF else 'off'})")
+    sys.stderr.flush()
+
+
 # ----- runner wrap: run the matcher, then assemble the gated draft ------------
 def _install_runner_wrap():
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -493,6 +598,14 @@ def _install_runner_wrap():
 
     def wrapped(self, *args, **kwargs):
         _tw = _time.perf_counter() if PHASE_TIMERS else 0.0
+        if not getattr(self, "_radiance_wrap_logged", False):
+            self._radiance_wrap_logged = True
+            try:
+                _dn = type(self.drafter).__name__
+            except Exception:
+                _dn = "?"
+            _log(f"runner wrap ENTERED drafter={_dn} "
+                 f"method={getattr(getattr(self, 'speculative_config', None), 'method', None)}")
         try:
             self.drafter._radiance_batch_ceil = _batch_ceil(len(self.input_batch.req_ids))
         except Exception:
@@ -741,6 +854,7 @@ def install():
         return
     try:
         _install_drafter_hooks()
+        _install_v2_hooks()
         _install_runner_wrap()
         _log(f"RADIANCE_DYNAMIC_DRAFT=ON  controller=policy  tau={TAU}  schedule={SCHEDULE or 'off'}  "
              f"ngram_strong={STRONG} recent={RECENT} maxl={MAXL} "
