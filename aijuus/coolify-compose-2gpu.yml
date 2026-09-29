@@ -120,12 +120,6 @@ services:
       - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-1}
       - RADIANCE_COLLECT_TOKENS_FILE=/patches/aijuus/draft_keep/rank0.json
       - RADIANCE_COLLECT_TOKENS_INTERVAL=20
-      # --- reduced-vocab W4 MTP draft head (off by default) ---
-      # Runtime-patched: the entrypoint overlays aijuus/draft_w4_lmhead.py +
-      # aijuus/r4d_lib.py + aijuus/qwen3_5_mtp_w4.py and install_all() remaps the
-      # MTP arch to Qwen3_5MTPW4 and points it at RADIANCE_DRAFT_KEEP_FILE, so
-      # enabling this needs no image rebuild. Requires a draft_keep_file.
-      - RADIANCE_DRAFT_KEEP_FILE=${RADIANCE_DRAFT_KEEP_FILE:-/patches/aijuus/draft_keep/keep-union.json}
       # Model to boot when /model-state/state.json has no entry for this instance yet
       # (fresh boot). Hot-swap restarts read state.json instead; see model-registry.json.
       - MODEL_DEFAULT=${MODEL_DEFAULT:-Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp}
@@ -139,9 +133,6 @@ services:
       # concurrent request) so an over-subscribed cycle restores a partial prefix instead of
       # nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV offload".
       - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-12}
-      # DAVETHA_DRAFTER_QUANT: int4 group-128 draft lm_head via libr4d r4d_gemm_w4a16_nt_m64.
-      # 0 = disabled (uses radiance_drafthead 2-bit), 1 = enabled. Measured +4..+8% tok/s net.
-      - DAVETHA_DRAFTER_QUANT=${DAVETHA_DRAFTER_QUANT:-0}
       # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
       # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
       # (Adaptive Replacement Cache) balances recency + frequency, which can lift the
@@ -331,12 +322,6 @@ services:
       - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-1}
       - RADIANCE_COLLECT_TOKENS_FILE=/patches/aijuus/draft_keep/rank1.json
       - RADIANCE_COLLECT_TOKENS_INTERVAL=20
-      # --- reduced-vocab W4 MTP draft head (off by default) ---
-      # Runtime-patched: the entrypoint overlays aijuus/draft_w4_lmhead.py +
-      # aijuus/r4d_lib.py + aijuus/qwen3_5_mtp_w4.py and install_all() remaps the
-      # MTP arch to Qwen3_5MTPW4 and points it at RADIANCE_DRAFT_KEEP_FILE, so
-      # enabling this needs no image rebuild. Requires a draft_keep_file.
-      - RADIANCE_DRAFT_KEEP_FILE=${RADIANCE_DRAFT_KEEP_FILE:-/patches/aijuus/draft_keep/keep-union.json}
       # Model to boot when /model-state/state.json has no entry for this instance yet
       # (fresh boot). Hot-swap restarts read state.json instead; see model-registry.json.
       - MODEL_DEFAULT=${MODEL_DEFAULT:-Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp}
@@ -350,9 +335,6 @@ services:
       # concurrent request) so an over-subscribed cycle restores a partial prefix instead of
       # nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV offload".
       - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-12}
-      # DAVETHA_DRAFTER_QUANT: int4 group-128 draft lm_head via libr4d r4d_gemm_w4a16_nt_m64.
-      # 0 = disabled (uses radiance_drafthead 2-bit), 1 = enabled. Measured +4..+8% tok/s net.
-      - DAVETHA_DRAFTER_QUANT=${DAVETHA_DRAFTER_QUANT:-0}
       # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
       # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
       # (Adaptive Replacement Cache) balances recency + frequency, which can lift the

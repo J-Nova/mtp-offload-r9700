@@ -1,5 +1,14 @@
 # tcclaviger/vllm MTP Optimization Implementation Plan
 
+> **SUPERSEDED (2026-09-29):** the drafter-quant axis in this document — Option A
+> `DAVETHA_DRAFTER_QUANT` and Option B "reduced-vocab W4 draft head" (`draft_keep_file` +
+> `Qwen3_5MTPW4`) — is **DROPPED**. tcclaviger removed that MTP path; our B2 A/B showed no clear
+> win (see WORKLOG). What we actually ADOPTED from the R9700 branch is the **torch-level
+> `RADIANCE_DRAFT_VOCAB` prune on our existing int2 head** (Phase 1.0, +5-6% greedy/sampled,
+> lossless), plus the prebuilt TunableOp table (3.1) and the 0.29 correctness gates (0.5).
+> Phase 1.1 and the B2 arm are removed; the W4 modules, `merge.py`, `keep-union.json` and
+> `PLAN-A-FALLBACK.md` were deleted from the tree.
+
 ## Executive Summary
 
 Based on the research findings from tcclaviger's vLLM Docker image (versions 29.05.2 and 29.05.12) and blog posts, this plan outlines all beneficial optimizations to implement into our Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp setup.
@@ -71,7 +80,7 @@ Based on the research findings from tcclaviger's vLLM Docker image (versions 29.
 - Decision made: proceed with Option B (reduced vocab approach)
 
 **Option A: Old DAVETHA_DRAFTER_QUANT approach (patches 090/091)**
-- **STATUS: FALLBACK PLAN** — documented in `TCCLA-VLLM-MTP-PLAN-A-FALLBACK.md`
+- **STATUS: FALLBACK PLAN — REMOVED 2026-09-29** (doc deleted; drafter-quant axis dropped)
 - Only use if Option B fails
 - int4 group-128 quantization of full vocab lm_head
 - Online quantization at warmup (DAVETHA_DRAFTER_QUANT=1)
@@ -160,13 +169,13 @@ Ports onto OUR existing `radiance_drafthead.py` (the int2 head we already run). 
 **Output**: a validated keep list (the Phase 1.1 `draft_keep_file` input) plus a measured,
 low-risk gain that does not depend on the W4 port.
 
-### Phase 1.1: Reduced Vocab Draft Head (Option B) — consumes the Phase 1.0 keep list
+### Phase 1.1: Reduced Vocab Draft Head (Option B) — REMOVED (superseded)
 
-**Status**: UNBLOCKED (2026-09-29) — the image's baked `r4d.so` (libr4d `v0.5.0`) already exports
-`r4d_gemm_w4a16_nt_m64`; compose was overriding it with the older `b9e42ab-rx9`. Repointed
-`R4D_SO`/`/r4d` at `/home/juup/.cache/radiance-libr4d/v0.5.0-w4a16` (extracted from the image). Stays
-env-gated (`DAVETHA_DRAFTER_QUANT=0`); activation is the B2 A/B. `RADIANCE_DRAFT_KEEP_FILE` now
-defaults to the same union set (`keep-union.json`).
+**Status**: REMOVED 2026-09-29. The W4 reduced head is dropped (tcclaviger removed that MTP path;
+our B2 A/B showed no clear win — W4 ~86/~85 with acceptance ~3-4 vs int2 ~88/~80 with acceptance
+~5-6). Deleted: `aijuus/qwen3_5_mtp_w4.py`, `aijuus/draft_w4_lmhead.py`, `aijuus/r4d_lib.py`,
+`aijuus/draft_keep/merge.py`, `aijuus/draft_keep/keep-union.json`, `aijuus/TCCLA-VLLM-MTP-PLAN-A-FALLBACK.md`
+and the `_install_draft_w4` wiring. `RADIANCE_DRAFT_VOCAB` on the int2 head (Phase 1.0) is kept.
 
 **Priority**: CRITICAL
 **Expected Impact**: +4..+8% tok/s net (similar to old approach, but more efficient)
@@ -384,7 +393,7 @@ variable at a time.
 | # | A/B | Arms | Why deferred |
 |---|-----|------|--------------|
 | B1 | **SPEC depth** | SPEC 4 vs 8 (vs 5) | We run 8; the branch found SPEC 4 best under sampling (3: 80.8, 4: 84.5, 5: 83.7) but 8 best greedy. Workload-dependent. |
-| B2 | **Head implementation** | Phase 1.0 pruned-int2 vs Phase 1.1 pruned-W4 | Same axis (vocab prune); decide which is faster/better once both exist. |
+| B2 | ~~Head implementation~~ **REMOVED** | int2-vs-W4 dropped 2026-09-29 (superseded; int2 kept) | W4 path deleted from the tree |
 | B3 | **MXFP4 + GPTQ drafter** | fp8 drafter vs MXFP4-RTN vs MXFP4-GPTQ (branch `RADIANCE_MTP_MXFP4[_FILE]`, `mtp_refit.py`/`mtp_gptq.py`) | Heavier; needs the branch's paro quant tooling and a calibration pass. |
 | B4 | **AITER settings** | `VLLM_ROCM_USE_AITER=1` vs `0`, unified-attn on/off | Env either/or (Phase 2.2). |
 | B5 | **flash_attn / capture sizes / DRY / degen** | as in Phases 3.2/3.3/4.x | Independent optional features. |
@@ -397,9 +406,9 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
 ### Battery results (log)
 - **B1 SPEC depth**: SPEC 4 **worse** than 8 on our workload (greedy 86.5 vs 88.1, sampled 77.6 vs
   80.2 t/s; acceptance length ~3 vs ~5-6). Kept `spec_tokens=8`.
-- **B2 W4 head**: **NOT adopted.** W4 (~85-87 greedy / ~83-87 sampled, acceptance ~3-4) is noisy and
-  no clear win over int2+vocab (~88 / ~80, acceptance ~5-6); lower acceptance. Reverted
-  `DAVETHA_DRAFTER_QUANT=0` (int2). W4 stays implemented, selectable via the env.
+- **B2 W4 head**: **NOT adopted → REMOVED.** W4 (~85-87 greedy / ~83-87 sampled, acceptance ~3-4)
+  showed no clear win over int2+vocab (~88 / ~80, acceptance ~5-6); lower acceptance. The W4 path
+  was then deleted from the tree as superseded (tcclaviger dropped that MTP path). int2 kept.
 - B3/B4: pending.
 
 ### How to run an arm
@@ -421,19 +430,18 @@ Coolify UI env), redeploy, then measure with the same harness:
 
 ## Implementation Order
 
-1. **Phase 0**: Decision point (old vs new approach) — done (Option B)
+1. **Phase 0**: Decision point — SUPERSEDED 2026-09-29 (drafter-quant axis dropped)
 2. **Phase 0.5**: vLLM 0.29 correctness gates (V2-hook audit + `patch_aot_envkey`) — before any RADIANCE_* A/B
-3. **Phase 5.1**: Fetch tcclaviger's vLLM fork (prerequisite for Phase 1.1)
+3. **Phase 5.1**: Fetch tcclaviger's vLLM fork (prerequisite for Phases 4.1/4.2)
 4. **Phase 1.0**: Draft-head surface port (vocab prune + exactset + fused head) — cheapest gain, produces the keep list
-5. **Phase 1.1**: Reduced vocab draft head (consumes the Phase 1.0 keep list)
-6. **Phase 2.1**: Enable fp8 KV cache (no calibration)
-7. **Phase 3.1**: Adopt the R9700 prebuilt TunableOp table
-8. **Phase 3.2**: Evaluate flash_attn integration
-9. **Phase 3.3**: Optimize CUDA graph capture sizes
-10. **Phase 4.1**: Implement DRY repetition penalty
-11. **Phase 4.2**: Implement degenerate-loop detection
-12. **Phase 5.2**: Evaluate ROCm version upgrade (long-term)
-13. **End A/B Battery** (B1-B6) on the frozen integrated build
+5. **Phase 2.1**: Enable fp8 KV cache (no calibration)
+6. **Phase 3.1**: Adopt the R9700 prebuilt TunableOp table
+7. **Phase 3.2**: Evaluate flash_attn integration
+8. **Phase 3.3**: Optimize CUDA graph capture sizes
+9. **Phase 4.1**: Implement DRY repetition penalty
+10. **Phase 4.2**: Implement degenerate-loop detection
+11. **Phase 5.2**: Evaluate ROCm version upgrade (long-term)
+12. **End A/B Battery** (B1, B3-B6) on the frozen integrated build
 
 ## Success Metrics
 
@@ -478,12 +486,9 @@ Coolify UI env), redeploy, then measure with the same harness:
 - `/home/juup/radiance-vllm-mxfp4/aijuus/refs/r9700-tp1/patch_aot_envkey.py` — 0.29 second-compile-cache env-key fix (Phase 0.5)
 - `/home/juup/radiance-vllm-mxfp4/aijuus/model-registry.json` — per-model serving knobs; MTP entry now carries the interim `kv_cache_memory` pin
 - `/home/juup/radiance-vllm-mxfp4/aijuus/TCCLA-VLLM-MTP-RESEARCH.md` — Research findings
-- `/home/juup/radiance-vllm-mxfp4/aijuus/TCCLA-VLLM-MTP-PLAN-A-FALLBACK.md` — Plan A fallback documentation (old DAVETHA_DRAFTER_QUANT approach)
 - `/home/juup/radiance-vllm-mxfp4/aijuus/coolify-compose-2gpu.yml` — Current deployment config
 - `/home/juup/radiance-vllm-mxfp4/aijuus/patches/050-fp8-mtp.patch` — MXFP4 body + FP8 drafter checkpoint conversion
-- `/home/juup/radiance-vllm-mxfp4/aijuus/r4d_lib.py` — ctypes loader for r4d.so exposing W4A16 GEMM functions
-- `/home/juup/radiance-vllm-mxfp4/aijuus/draft_w4_lmhead.py` — int4 group-128 draft lm_head implementation (old 29.05.2 approach)
-- `/home/juup/radiance-vllm-mxfp4/aijuus/collect_tokens.py` — Token ID collector for generating draft_keep_file (Plan B)
+- `/home/juup/radiance-vllm-mxfp4/aijuus/collect_tokens.py` — token-id collector feeding the `RADIANCE_DRAFT_VOCAB` keep set
 - `/home/juup/radiance-vllm-mxfp4/aijuus/patches/092-radiance-kernels.patch` — radiance_kernels.py runtime hooks (`_install_token_collector`, `_install_draft_w4`); replaces 090/091/old-092/094
 - `/home/juup/radiance-vllm-mxfp4/aijuus/patches/072-kv-cache-029.patch` — kv-cache/*.py 0.29 port (previously uncovered)
 - `/home/juup/radiance-vllm-mxfp4/aijuus/draft_keep/merge.py` — merges `rank*.json` collector output into `keep.json`

@@ -2,5 +2,4 @@
 # keep-union.txt IS tracked: the registry points RADIANCE_DRAFT_VOCAB at it, so a clean
 # checkout needs it (regenerate with build_vocab.py).
 rank*.json
-keep.json
 *.tmp

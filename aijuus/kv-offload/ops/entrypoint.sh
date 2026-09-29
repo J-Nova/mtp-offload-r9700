@@ -173,7 +173,7 @@ cd /patches
 # This MUST run before any python below: radiance_amdsmi.pth has to initialise amdsmi ahead of HIP
 # at interpreter startup, and radiance_kernels is imported by vLLM's plugin loader
 # (vllm/plugins/__init__.py -> radiance_kernels.install_all()). The fork-local hooks there
-# (_install_token_collector, _install_draft_w4) are env-gated, so a plain run is unchanged.
+# (_install_token_collector) is env-gated, so a plain run is unchanged.
 mkdir -p "$SP"/aijuus "$SP"/vllm/model_executor/kernels \
          "$SP"/vllm/model_executor/layers/quantization/utils/configs \
          "$SP"/vllm/model_executor/layers/fused_moe/configs \
@@ -182,11 +182,9 @@ cp radiance_*.py "$SP"/
 cp radiance_amdsmi.pth "$SP"/
 # Optional AIJUUS overlay modules: warn (do not abort the boot under `set -e`) when a file is
 # absent, so a deploy from a tree that lacks an optional module still starts.
-for f in aijuus/__init__.py aijuus/collect_tokens.py aijuus/qwen3_5_mtp_w4.py; do
+for f in aijuus/__init__.py aijuus/collect_tokens.py; do
   if [ -f "$f" ]; then cp "$f" "$SP"/aijuus/; else echo "[run] WARN: overlay file missing: $f"; fi
 done
-if [ -f aijuus/draft_w4_lmhead.py ]; then cp aijuus/draft_w4_lmhead.py "$SP"/vllm/model_executor/kernels/draft_w4_lmhead.py; else echo "[run] WARN: overlay file missing: aijuus/draft_w4_lmhead.py"; fi
-if [ -f aijuus/r4d_lib.py ]; then cp aijuus/r4d_lib.py "$SP"/r4d_lib.py; else echo "[run] WARN: overlay file missing: aijuus/r4d_lib.py"; fi
 cp radiance_preamble.py /opt/radiance_preamble.py
 cp fp8-configs/* "$SP"/vllm/model_executor/layers/quantization/utils/configs/ 2>/dev/null || true
 cp moe-configs/* "$SP"/vllm/model_executor/layers/fused_moe/configs/ 2>/dev/null || true

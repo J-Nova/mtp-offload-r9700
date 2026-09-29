@@ -1,5 +1,11 @@
 # tcclaviger/vllm MTP Optimization Research
 
+> **SUPERSEDED (2026-09-29):** the `DAVETHA_DRAFTER_QUANT` / reduced-vocab W4 draft-head axis
+> described in the early sections is DROPPED — tcclaviger removed that MTP path and our B2 A/B
+> showed no clear win. What we adopted is the **torch-level `RADIANCE_DRAFT_VOCAB` prune on our
+> int2 head** (see the "mtstanfield r9700-tp1" section) plus TunableOp and the 0.29 gates. Keep
+> the tcclaviger sections as history.
+
 ## Executive Summary
 - **We're ~2× better per GPU** than tcclaviger (79.9 t/s vs 40.8 t/s per GPU)
 - **tcclaviger scales better with concurrency** (643.7 t/s @ 16 vs our 313.9 t/s @ 8)

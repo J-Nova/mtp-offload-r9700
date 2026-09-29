@@ -6,6 +6,25 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 5) — Removed the DAVETHA / W4 drafter-quant axis (superseded)
+
+tcclaviger removed `DAVETHA_DRAFTER_QUANT` and the reduced-vocab W4 draft head in his current code
+(its MTP path is different). Since we are not using it, removed it from the plan and codebase:
+- deleted `aijuus/qwen3_5_mtp_w4.py`, `aijuus/draft_w4_lmhead.py`, `aijuus/r4d_lib.py`,
+  `aijuus/draft_keep/merge.py`, `aijuus/draft_keep/keep-union.json`,
+  `aijuus/TCCLA-VLLM-MTP-PLAN-A-FALLBACK.md`.
+- removed `_install_draft_w4` + its call from `radiance_kernels.py` (patch 092 regenerated).
+- removed `DAVETHA_DRAFTER_QUANT` and `RADIANCE_DRAFT_KEEP_FILE` from compose; dropped their overlay
+  copies from the entrypoint.
+- `build_vocab.py`: dropped the W4 `--json-out`.
+- plan/research marked the Option A/B axis superseded; battery B2 removed; `draft_keep/.gitignore`
+  no longer mentions keep.json.
+Kept: the torch-level `RADIANCE_DRAFT_VOCAB` prune on the int2 head (Phase 1.0) — the adopted win.
+`R4D_SO` still points at `.../v0.5.0-w4a16`, a valid libr4d with all serve kernels (name is now
+just historical).
+
+---
+
 ## 2026-09-29 (cont. 4) — A/B B2 result: W4 head NOT adopted
 
 `DAVETHA_DRAFTER_QUANT=1` (reduced-vocab W4 head) redeployed and measured. Boot confirms it armed
