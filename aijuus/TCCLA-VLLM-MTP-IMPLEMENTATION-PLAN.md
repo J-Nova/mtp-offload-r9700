@@ -429,10 +429,14 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   entrypoint; defaults `max_period 100 / min_repeats 6 / min_span 128`, `--degen-max-period 0`
   disables). Validated: fires on a period-1 run at ~129 tokens, period-4 at ~132, never on a
   non-periodic sequence; finishes with `finish_reason "repetition"`.
-- **4.1 DRY**: reference complete in `aijuus/refs/tcclaviger-vllm-29.05.12/`; port fully mapped, not
-  yet applied. It is **default-off** (`dry_multiplier` 0.0 → no behaviour change unless a request or
-  `--dry-*` enables it), so it is safe to land. Exact edits (all `FORK-LOCAL (patches/dry_sampler)`
-  in the refs):
+- **4.1 DRY**: **DONE (2026-09-29)** — `patch_dry.py` (runtime overlay, wired into the entrypoint
+  after `patch_degen.py`) + the `dry.py` module copied by the entrypoint from
+  `aijuus/refs/tcclaviger-vllm-29.05.12/vllm/v1/sample/ops/dry.py`. Tested in-container: all touched
+  modules import, `SamplingMetadata.dry_params` field present, `SchedulerConfig`/`EngineArgs` dry
+  fields (0.0/0.75/2/-1/None), `apply_dry` runs, `DryParams.from_any(None) is None`, `--dry-*` flags
+  registered. **Default-off** (`dry_multiplier` 0.0 → no behaviour change until enabled). The port
+  touches the sampler / rejection-sampler hot path plus input-processor / GPU-input-batch plumbing —
+  refer to the change set below if a future vLLM bump needs it re-applied:
   1. **new** `vllm/v1/sample/ops/dry.py` (391 lines) — `DryParams` (with `from_any`/`enabled`),
      `apply_dry`, `build_breaker_seqs`, `ramp_to_base`, `DRY_DEFAULT_BREAKERS`.
   2. `vllm/v1/sample/penalties.py` — import `DryParams, apply_dry`; `apply_all_penalties(..., dry_params=None, apply_classic=True)`.
@@ -444,8 +448,7 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   8. `vllm/v1/worker/gpu_input_batch.py` — import `DryParams`; `self.dry_params` dict init/add/remove/swap/move; two `or bool(self.dry_params)` needs-token-ids gates; pass `dry_params=` in metadata.
   9. `vllm/config/scheduler.py` — `dry_multiplier` (0.0), `dry_penalty_ramp` (0.75), `dry_allowed_length` (2), `dry_range` (-1), `dry_sequence_breakers` (None).
   10. `vllm/engine/arg_utils.py` — `EngineArgs` dry fields, `--dry-*` CLI options, and the `SchedulerConfig(...)` kwargs.
-  Implement as `patch_dry.py` (same all-or-nothing/idempotent pattern as `patch_degen.py`) plus an
-  entrypoint copy of `dry.py`; validate in-container, then optionally A/B (e.g. `--dry-multiplier 0.8`).
+  Optionally A/B later (e.g. `--dry-multiplier 0.8`).
 - **5.1 tcclaviger repos**: DONE — public radiance repo cloned; the current "davetha" path is the
   DFlash2 drafter int4 projections under `RADIANCE_FAST_DRAFT`, not the MTP quant we removed.
 - **5.2 ROCm 10**: RESEARCHED — see below; deferred as a major upgrade.

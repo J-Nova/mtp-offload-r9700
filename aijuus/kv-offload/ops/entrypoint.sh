@@ -185,6 +185,12 @@ cp radiance_amdsmi.pth "$SP"/
 for f in aijuus/__init__.py aijuus/collect_tokens.py; do
   if [ -f "$f" ]; then cp "$f" "$SP"/aijuus/; else echo "[run] WARN: overlay file missing: $f"; fi
 done
+# DRY module (patch_dry.py needs it): new file, not present in the baked vLLM.
+if [ -f aijuus/refs/tcclaviger-vllm-29.05.12/vllm/v1/sample/ops/dry.py ]; then
+  cp aijuus/refs/tcclaviger-vllm-29.05.12/vllm/v1/sample/ops/dry.py "$SP"/vllm/v1/sample/ops/dry.py
+else
+  echo "[run] WARN: dry.py overlay missing; DRY unavailable"
+fi
 cp radiance_preamble.py /opt/radiance_preamble.py
 cp fp8-configs/* "$SP"/vllm/model_executor/layers/quantization/utils/configs/ 2>/dev/null || true
 cp moe-configs/* "$SP"/vllm/model_executor/layers/fused_moe/configs/ 2>/dev/null || true
@@ -206,6 +212,7 @@ python3 patch_tp3_pad.py
 python3 patch_ar_maxbytes.py
 python3 patch_aot_envkey.py || echo "[run] WARN: patch_aot_envkey.py missing/failed; AOT env-key gate not applied"
 python3 patch_degen.py || echo "[run] WARN: patch_degen failed; server-wide degen detection not applied"
+python3 patch_dry.py || echo "[run] WARN: patch_dry failed; DRY not applied"
 python3 patch_topk_triton_rows.py
 python3 patch_dflash_calib.py
 python3 patch_dflash_mxfp4_kv.py

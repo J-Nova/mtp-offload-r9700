@@ -6,6 +6,21 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 14) — DRY (4.1) ported and validated
+
+- Added `patch_dry.py` (repo root): runtime overlay porting tcclaviger's `patches/dry_sampler` onto
+  vLLM 0.29.0 across 10 files (new `dry.py` + penalties/metadata/sampler/rejection_sampler/
+  sampling_params/input_processor/gpu_input_batch/config/arg_utils). All-or-nothing, idempotent,
+  `RADIANCE_LOCAL_DRY=0` gate; anchors on the degen-inserted lines so it runs AFTER `patch_degen.py`.
+- Entrypoint: copies `dry.py` from the refs, then runs `python3 patch_dry.py` (warn-and-continue).
+- **Validated in-container**: patch applies; all touched modules import; `SamplingMetadata.dry_params`
+  present; `SchedulerConfig`/`EngineArgs` dry defaults 0.0/0.75/2/-1/None; `apply_dry` runs;
+  `DryParams.from_any(None) is None`; `--dry-*` flags registered.
+- **Default-off** (`dry_multiplier` 0.0) → no behaviour change until a request or `--dry-multiplier`
+  enables it. Optional later A/B.
+
+---
+
 ## 2026-09-29 (cont. 13) — DRY port fully mapped (ready to execute); not applied
 
 Mapped the entire `patches/dry_sampler` change set from the extracted reference (10 files) and wrote
