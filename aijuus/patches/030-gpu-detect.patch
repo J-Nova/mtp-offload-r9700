@@ -1,5 +1,5 @@
 diff --git a/gpu-detect.sh b/gpu-detect.sh
-index 0f87891..8db6295 100755
+index 0f87891..cd189c4 100755
 --- a/gpu-detect.sh
 +++ b/gpu-detect.sh
 @@ -134,16 +134,22 @@ rad_detect_gpus() {
@@ -29,3 +29,12 @@ index 0f87891..8db6295 100755
      if [ -n "$row" ]; then hit=$row; fi
    done
    echo "$hit"
+@@ -166,7 +172,7 @@ if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+   [ -n "$RAD_GPU_SKIPPED" ] && echo "skipped (<${RAD_MIN_GPU_MIB} MiB):$RAD_GPU_SKIPPED"
+   echo "tensor parallel:  $RAD_TP   (supported: $RAD_TP_ALLOWED)"
+   echo "hardware sig:     $RAD_GPU_SIG"
+-  kv=$(rad_kv_lookup "$RAD_GPU_SIG" "${MAXSEQS:-8}" "${CHUNK:-8192}" "${MAXLEN:-262144}" "${SPEC_METHOD:-dflash}")
++  kv=$(rad_kv_lookup "$RAD_GPU_SIG" "${MAXSEQS:-8}" "${CHUNK:-8192}" "${MAXLEN:-262144}" "${SPEC_METHOD:-dflash}" "${SPEC:-}")
+   if [ -n "$kv" ]; then
+     echo "KV cache pin:     $kv bytes ($(awk -v b="$kv" 'BEGIN{printf "%.2f", b/1073741824}') GiB/GPU, measured)"
+   else

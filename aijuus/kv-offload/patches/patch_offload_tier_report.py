@@ -164,6 +164,19 @@ CONN_METRICS = CONN / "metrics.py"
 CONN_COMMON = CONN / "common.py"
 CONN_SCHEDULER = CONN / "scheduler.py"
 
+# 0.29.0 replaced this manager with one that carries TieringMetricsTracker
+# (vllm/v1/kv_offload/tiering/metrics.py), which already emits per-tier
+# BLOCK_QUERIES/BLOCK_HITS, LOOKUP_SYNC/ASYNC_DELAY histograms, READ/WRITE
+# bytes+time per job, and active-job/usage gauges. Those supersede the
+# tier-report set this patch adds, so on such a tree there is nothing to do
+# (applying it would duplicate names and re-anchor against internals that moved).
+if TIERING_MANAGER.exists() and "TieringMetricsTracker" in TIERING_MANAGER.read_text():
+    print(
+        "[radiance] tier-report skipped: this vLLM's TieringMetricsTracker already "
+        "emits per-tier hit/lookup/transfer metrics (upstream supersedes this patch)"
+    )
+    sys.exit(0)
+
 print("radiance: KV offload tier-report instrumentation")
 
 # --- prerequisite -----------------------------------------------------------

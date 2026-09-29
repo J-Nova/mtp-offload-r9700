@@ -16,7 +16,10 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Canonical cap lives in the repo .env (shared with compose + the exporter); an explicit
 # env var still wins. This keeps one number from drifting between the reaper and compose.
-ENV_FILE="$HERE/../.env"
+# Repo root .env is three levels up from aijuus/kv-offload/ops (the pre-restructure
+# kv-cache/ops copy had it one level up); prefer whichever exists.
+ENV_FILE="$HERE/../../../.env"
+[ -f "$ENV_FILE" ] || ENV_FILE="$HERE/../.env"
 env_get() { { [ -f "$ENV_FILE" ] && sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; } || true; }
 ROOT=${KVCACHE_ROOT:-}
 if [ -z "$ROOT" ]; then

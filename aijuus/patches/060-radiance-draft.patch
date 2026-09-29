@@ -1,5 +1,5 @@
 diff --git a/radiance_draft.py b/radiance_draft.py
-index f2aeb81..741768c 100644
+index f2aeb81..5ec6f6b 100644
 --- a/radiance_draft.py
 +++ b/radiance_draft.py
 @@ -10,42 +10,108 @@ Lossless: it only changes how many tokens are drafted (and MTP vs a verbatim cop
@@ -579,7 +579,7 @@ index f2aeb81..741768c 100644
          # `seen` records (row, tokens_mirrored). The ROW matters: vLLM reuses and reshuffles
          # input-batch slots as requests come and go, so a request can land on a row that still
          # holds the previous occupant's tokens. Keyed by request id alone, the stale tail stayed
-@@ -299,46 +610,116 @@ def _prepare_match_gpu(runner):
+@@ -299,46 +610,120 @@ def _prepare_match_gpu(runner):
      nmax = max(n_list)
      if nmax < 3:
          return
@@ -627,12 +627,16 @@ index f2aeb81..741768c 100644
 +        pack = gpu.match_gpu(ctxg[:B], n_arr, nspec, nmax, base,
 +                             2 * gpu._nblk(nmax, window), False, mb, MAXL)
 +    pk = pack.cpu().numpy()
-+    if not cross and window > 0 and (pk[:, 2 * nspec + 4] != 0).any():
-+        # a windowed row found nothing: fall back to a full scan for this step (the miss flag rode
-+        # back in the single pack copy, so no extra sync is added on the common match/no-window path)
-+        base.zero_()
++    miss = pk[:, 2 * nspec + 4] != 0
++    if not cross and window > 0 and miss.any():
++        # Windowed rows that found nothing are re-scanned with the window removed. Only the miss
++        # rows do work (base = the row's own length makes the window empty for the rest) and only
++        # their rows are copied back -- not a full-batch rescan plus a second whole-pack sync.
++        sel = np.nonzero(miss)[0]
++        base.copy_(torch.from_numpy(np.where(miss, 0, n_np).astype(np.int32)))
 +        pack = gpu.match_gpu(ctxg[:B], n_arr, nspec, nmax, base, nc_full, False, mb, MAXL)
-+        pk = pack.cpu().numpy()
++        pk[sel] = pack.index_select(0, torch.from_numpy(sel).to(pack.device)).cpu().numpy()
++        base.zero_()
 +    d._radiance_pack_cpu = pk
 +    # P8 counters: rows, rows with any match, rows with a strong match.
 +    meta = pk[:, 2 * nspec:]
@@ -712,7 +716,7 @@ index f2aeb81..741768c 100644
      return out
  
  
-@@ -358,6 +739,10 @@ def install():
+@@ -358,6 +743,10 @@ def install():
          _install_drafter_hooks()
          _install_runner_wrap()
          _log(f"RADIANCE_DYNAMIC_DRAFT=ON  controller=policy  tau={TAU}  schedule={SCHEDULE or 'off'}  "

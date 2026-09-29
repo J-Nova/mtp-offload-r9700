@@ -1,0 +1,13 @@
+diff --git a/serve-mxfp4.sh b/serve-mxfp4.sh
+index d787440..8ba00e7 100755
+--- a/serve-mxfp4.sh
++++ b/serve-mxfp4.sh
+@@ -863,7 +863,7 @@ KV_SRC=explicit
+ if [ "$KV_MEM" = auto ]; then
+   KV_MEM=""; KV_SRC=profiled
+   if [ "$GPU_UTIL" = "0.98" ]; then
+-    KV_MEM=$(rad_kv_lookup "$RAD_GPU_SIG" "${MAXSEQS:-8}" "$CHUNK" "$MAXLEN" "$SPEC_METHOD")
++    KV_MEM=$(rad_kv_lookup "$RAD_GPU_SIG" "${MAXSEQS:-8}" "$CHUNK" "$MAXLEN" "$SPEC_METHOD" "$SPEC")
+     if [ -n "$KV_MEM" ]; then KV_SRC=measured; fi
+   fi
+ fi

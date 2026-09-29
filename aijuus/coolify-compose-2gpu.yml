@@ -66,8 +66,11 @@
 
 services:
   vllm-0:
-    image: stilldeadcode/vllm-radiance:0.9.3
+    image: juupp/vllm-radiance:0.9.3-collect-tokens
     restart: unless-stopped
+    # Give vLLM time to exit cleanly so the token collector's atexit/signal save
+    # runs before the container is SIGKILLed. 10s (docker default) is not enough.
+    stop_grace_period: 120s
     privileged: true
     ipc: host
     devices:
@@ -109,6 +112,20 @@ services:
       # Instance index for the shape-label metric (radiance_serve_info{instance=...}) and
       # for the per-instance serve_shape_<rank>.prom file. Keep 0 here, 1 on vllm-1.
       - SERVE_RANK=0
+      # --- one-off draft-vocab collection run (2026-09-28) ---
+      # Records every draft token id the MTP head proposes (compute_logits argmax)
+      # so a reduced-vocab draft_keep_file can be built for this model. Writes to a
+      # per-instance file under the repo bind (/patches == repo root on the host),
+      # flushed periodically + on shutdown. Set RADIANCE_COLLECT_TOKENS=0 to disable.
+      - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-1}
+      - RADIANCE_COLLECT_TOKENS_FILE=/patches/aijuus/draft_keep/rank0.json
+      - RADIANCE_COLLECT_TOKENS_INTERVAL=20
+      # --- reduced-vocab W4 MTP draft head (off by default) ---
+      # Runtime-patched: the entrypoint overlays aijuus/draft_w4_lmhead.py +
+      # aijuus/r4d_lib.py + aijuus/qwen3_5_mtp_w4.py and install_all() remaps the
+      # MTP arch to Qwen3_5MTPW4 and points it at RADIANCE_DRAFT_KEEP_FILE, so
+      # enabling this needs no image rebuild. Requires a draft_keep_file.
+      - RADIANCE_DRAFT_KEEP_FILE=${RADIANCE_DRAFT_KEEP_FILE:-/patches/aijuus/draft_keep/keep.json}
       # Model to boot when /model-state/state.json has no entry for this instance yet
       # (fresh boot). Hot-swap restarts read state.json instead; see model-registry.json.
       - MODEL_DEFAULT=${MODEL_DEFAULT:-Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp}
@@ -122,6 +139,9 @@ services:
       # concurrent request) so an over-subscribed cycle restores a partial prefix instead of
       # nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV offload".
       - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-12}
+      # DAVETHA_DRAFTER_QUANT: int4 group-128 draft lm_head via libr4d r4d_gemm_w4a16_nt_m64.
+      # 0 = disabled (uses radiance_drafthead 2-bit), 1 = enabled. Measured +4..+8% tok/s net.
+      - DAVETHA_DRAFTER_QUANT=${DAVETHA_DRAFTER_QUANT:-0}
       # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
       # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
       # (Adaptive Replacement Cache) balances recency + frequency, which can lift the
@@ -166,13 +186,16 @@ services:
       - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-1}
       - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-1}
       # Optional fs-tier host bind; set KV_OFFLOAD_DISK_HOST_DIR to put the shared disk store elsewhere.
-      # Optional SHARED fs secondary tier: both instances point at the same directory, so a
-      # prefix cached by one is loadable by the other (and it survives restarts). This is a
-      # path INSIDE the container -- mount a host dir (fast SSD/NVMe) there on BOTH services,
-      # and run the reaper (ops/kvcache-reap.sh) against it. Defaults to /kvcache/blocks (the
-      # shared bind above); set it to empty for CPU-only (Mode A).
-      # Enabling it also turns on the failed-load fix, without which a reaped block hangs a
-      # request (patch_offload_fs_tier.py).
+      # SHARED fs secondary tier (Mode B, DEFAULT): both instances point at the same directory,
+      # so a prefix cached by one is loadable by the other (and it survives restarts). This is
+      # a path INSIDE the container; the host dir (KV_OFFLOAD_DISK_HOST_DIR) is mounted at
+      # /kvcache on BOTH services, and the host-side reaper (ops/kvcache-reap.sh) is REQUIRED
+      # against `$KV_OFFLOAD_DISK_HOST_DIR/blocks` -- the tier never deletes on its own.
+      # patch_offload_fs_tier.py (store fan-out + async-lookup invalidation on a store landing;
+      # 0.29.0 already handles a failed load) is ported to this image's vLLM 0.29.0.
+      # Set this to empty for CPU-only (Mode A): that turns on the auto head-cap and needs no
+      # reaper (watch for the boot line
+      #   [radiance] WARNING: fs tier fan-out ... did NOT apply -- do NOT enable the fs disk tier).
       - KV_OFFLOAD_DISK_DIR=${KV_OFFLOAD_DISK_DIR-/kvcache/blocks}
       - HF_HUB_OFFLINE=1
       - VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
@@ -258,8 +281,11 @@ services:
       start_period: 1800s
 
   vllm-1:
-    image: stilldeadcode/vllm-radiance:0.9.3
+    image: juupp/vllm-radiance:0.9.3-collect-tokens
     restart: unless-stopped
+    # Give vLLM time to exit cleanly so the token collector's atexit/signal save
+    # runs before the container is SIGKILLed. 10s (docker default) is not enough.
+    stop_grace_period: 120s
     privileged: true
     ipc: host
     devices:
@@ -297,6 +323,20 @@ services:
       - HIP_VISIBLE_DEVICES=0
       # Instance index for the shape-label metric (radiance_serve_info{instance=...}).
       - SERVE_RANK=1
+      # --- one-off draft-vocab collection run (2026-09-28) ---
+      # Records every draft token id the MTP head proposes (compute_logits argmax)
+      # so a reduced-vocab draft_keep_file can be built for this model. Writes to a
+      # per-instance file under the repo bind (/patches == repo root on the host),
+      # flushed periodically + on shutdown. Set RADIANCE_COLLECT_TOKENS=0 to disable.
+      - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-1}
+      - RADIANCE_COLLECT_TOKENS_FILE=/patches/aijuus/draft_keep/rank1.json
+      - RADIANCE_COLLECT_TOKENS_INTERVAL=20
+      # --- reduced-vocab W4 MTP draft head (off by default) ---
+      # Runtime-patched: the entrypoint overlays aijuus/draft_w4_lmhead.py +
+      # aijuus/r4d_lib.py + aijuus/qwen3_5_mtp_w4.py and install_all() remaps the
+      # MTP arch to Qwen3_5MTPW4 and points it at RADIANCE_DRAFT_KEEP_FILE, so
+      # enabling this needs no image rebuild. Requires a draft_keep_file.
+      - RADIANCE_DRAFT_KEEP_FILE=${RADIANCE_DRAFT_KEEP_FILE:-/patches/aijuus/draft_keep/keep.json}
       # Model to boot when /model-state/state.json has no entry for this instance yet
       # (fresh boot). Hot-swap restarts read state.json instead; see model-registry.json.
       - MODEL_DEFAULT=${MODEL_DEFAULT:-Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp}
@@ -310,6 +350,9 @@ services:
       # concurrent request) so an over-subscribed cycle restores a partial prefix instead of
       # nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV offload".
       - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-12}
+      # DAVETHA_DRAFTER_QUANT: int4 group-128 draft lm_head via libr4d r4d_gemm_w4a16_nt_m64.
+      # 0 = disabled (uses radiance_drafthead 2-bit), 1 = enabled. Measured +4..+8% tok/s net.
+      - DAVETHA_DRAFTER_QUANT=${DAVETHA_DRAFTER_QUANT:-0}
       # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
       # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
       # (Adaptive Replacement Cache) balances recency + frequency, which can lift the
@@ -354,13 +397,16 @@ services:
       - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-1}
       - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-1}
       # Optional fs-tier host bind; set KV_OFFLOAD_DISK_HOST_DIR to put the shared disk store elsewhere.
-      # Optional SHARED fs secondary tier: both instances point at the same directory, so a
-      # prefix cached by one is loadable by the other (and it survives restarts). This is a
-      # path INSIDE the container -- mount a host dir (fast SSD/NVMe) there on BOTH services,
-      # and run the reaper (ops/kvcache-reap.sh) against it. Defaults to /kvcache/blocks (the
-      # shared bind above); set it to empty for CPU-only (Mode A).
-      # Enabling it also turns on the failed-load fix, without which a reaped block hangs a
-      # request (patch_offload_fs_tier.py).
+      # SHARED fs secondary tier (Mode B, DEFAULT): both instances point at the same directory,
+      # so a prefix cached by one is loadable by the other (and it survives restarts). This is
+      # a path INSIDE the container; the host dir (KV_OFFLOAD_DISK_HOST_DIR) is mounted at
+      # /kvcache on BOTH services, and the host-side reaper (ops/kvcache-reap.sh) is REQUIRED
+      # against `$KV_OFFLOAD_DISK_HOST_DIR/blocks` -- the tier never deletes on its own.
+      # patch_offload_fs_tier.py (store fan-out + async-lookup invalidation on a store landing;
+      # 0.29.0 already handles a failed load) is ported to this image's vLLM 0.29.0.
+      # Set this to empty for CPU-only (Mode A): that turns on the auto head-cap and needs no
+      # reaper (watch for the boot line
+      #   [radiance] WARNING: fs tier fan-out ... did NOT apply -- do NOT enable the fs disk tier).
       - KV_OFFLOAD_DISK_DIR=${KV_OFFLOAD_DISK_DIR-/kvcache/blocks}
       - HF_HUB_OFFLINE=1
       - VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
@@ -3794,7 +3840,10 @@ services:
       init-observability:
         condition: service_completed_successfully
     environment:
-      - KVCACHE_MAX_GIB=${KVCACHE_MAX_GIB:-100}
+      # Must match the host reaper's KVCACHE_MAX_GIB (/etc/default/kvcache-reap), which
+      # ops/install-reaper.sh writes from .env. Default 60 = the installed reaper cap;
+      # the >0.90 and >100% alerts divide by this gauge.
+      - KVCACHE_MAX_GIB=${KVCACHE_MAX_GIB:-60}
     volumes:
       - ${KV_OFFLOAD_DISK_HOST_DIR:-/var/lib/radiance-kvcache}:/kvcache:ro
       - /dev/shm:/dev/shm:ro

@@ -58,6 +58,30 @@ REPL_FIELD = """class SchedulerOffloadConfig(NamedTuple):
     default_max_offload_tokens: int | None = None
 """
 
+# 0.29.0 added tokens_per_hash and supports_partial_tail to the NamedTuple.
+ANCHOR_FIELD_NEW = """class SchedulerOffloadConfig(NamedTuple):
+    kv_group_configs: tuple[GroupOffloadConfig, ...]
+    blocks_per_chunk: int
+    tokens_per_hash: int
+    num_workers: int
+    offload_prompt_only: bool
+    supports_partial_tail: bool
+"""
+
+REPL_FIELD_NEW = """class SchedulerOffloadConfig(NamedTuple):
+    kv_group_configs: tuple[GroupOffloadConfig, ...]
+    blocks_per_chunk: int
+    tokens_per_hash: int
+    num_workers: int
+    offload_prompt_only: bool
+    supports_partial_tail: bool
+    # _radiance_offload_head_cap: server-level default for max_offload_tokens.
+    # Caps offloaded tokens from the START of each request so the CPU tier keeps a
+    # contiguous prefix head (see patch_offload_head_cap.py). Per-request
+    # kv_transfer_params still overrides.
+    default_max_offload_tokens: int | None = None
+"""
+
 ANCHOR_RETURN = """            blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
         )
@@ -65,6 +89,24 @@ ANCHOR_RETURN = """            blocks_per_chunk=spec.blocks_per_chunk,
 
 REPL_RETURN = """            blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
+            default_max_offload_tokens=_radiance_head_cap(
+                spec, kv_cache_config, vllm_config
+            ),
+        )
+"""
+
+# 0.29.0's from_spec return also fills tokens_per_hash and supports_partial_tail.
+ANCHOR_RETURN_NEW = """            blocks_per_chunk=spec.blocks_per_chunk,
+            tokens_per_hash=spec.tokens_per_hash,
+            offload_prompt_only=spec.offload_prompt_only,
+            supports_partial_tail=supports_partial_tail,
+        )
+"""
+
+REPL_RETURN_NEW = """            blocks_per_chunk=spec.blocks_per_chunk,
+            tokens_per_hash=spec.tokens_per_hash,
+            offload_prompt_only=spec.offload_prompt_only,
+            supports_partial_tail=supports_partial_tail,
             default_max_offload_tokens=_radiance_head_cap(
                 spec, kv_cache_config, vllm_config
             ),
@@ -178,15 +220,21 @@ def main() -> None:
     if SENTINEL in text:
         print(f"[patch] offload-head-cap: already applied ({TARGET.name})")
         return
-    for anchor, repl, name in (
-        (ANCHOR_FIELD, REPL_FIELD, "NamedTuple field"),
-        (ANCHOR_RETURN, REPL_RETURN, "from_spec return"),
-        (ANCHOR_INIT, REPL_INIT, "__post_init__ fallback"),
+    # Each step carries one or more (anchor, repl) shapes so the patch applies to
+    # both the pre-0.29.0 tree and 0.29.0 (which added tokens_per_hash and
+    # supports_partial_tail to SchedulerOffloadConfig).
+    for shapes, name in (
+        (((ANCHOR_FIELD, REPL_FIELD), (ANCHOR_FIELD_NEW, REPL_FIELD_NEW)), "NamedTuple field"),
+        (((ANCHOR_RETURN, REPL_RETURN), (ANCHOR_RETURN_NEW, REPL_RETURN_NEW)), "from_spec return"),
+        (((ANCHOR_INIT, REPL_INIT),), "__post_init__ fallback"),
     ):
-        if anchor not in text:
+        for anchor, repl in shapes:
+            if anchor in text:
+                text = text.replace(anchor, repl, 1)
+                break
+        else:
             print(f"[patch] offload-head-cap: ANCHOR NOT FOUND ({name}); not applied")
             return
-        text = text.replace(anchor, repl, 1)
     text = text + HELPER
     TARGET.write_text(text)
     print(f"[patch] offload-head-cap: applied to {TARGET}")

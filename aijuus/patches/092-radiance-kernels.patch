@@ -1,0 +1,91 @@
+diff --git a/radiance_kernels.py b/radiance_kernels.py
+index 5929aaa..2214ebf 100644
+--- a/radiance_kernels.py
++++ b/radiance_kernels.py
+@@ -403,6 +403,71 @@ def install_r4d_report():
+     Worker.compile_or_warm_up_model = compile_or_warm_up_model
+ 
+ 
++def _install_token_collector():
++    """Delegate to the single token-collector implementation in aijuus.collect_tokens.
++
++    collect_tokens owns the class list and both hooks (compute_logits + get_top_tokens) with the
++    _capturing() guard and error swallowing. Keeping a second wrapper here diverged from it
++    (Qwen3_5MoeMTP missing, no capture guard). ensure_installed() is idempotent.
++    """
++    import aijuus.collect_tokens as collect_tokens
++    collect_tokens.ensure_installed()
++
++
++def _install_draft_w4():
++    """FORK-LOCAL runtime wiring for the reduced-vocab W4 draft head.
++
++    Done here (not baked) so the image needs no rebuild: when
++    DAVETHA_DRAFTER_QUANT=1, resolve the spec-decode MTP arch to the fork-local
++    reduced-vocab class, import the W4 kernel module so its custom op registers,
++    and point the class at the collected draft_keep_file. Best-effort: on any
++    failure the stock bf16 draft head still runs.
++    """
++    import os
++    if os.environ.get("DAVETHA_DRAFTER_QUANT", "0") != "1":
++        return
++
++    # Bring in the fork-local reduced-vocab class first. If this vLLM build lacks
++    # any symbol it imports, skip the whole thing and keep the stock bf16 head --
++    # remapping the registry to a module that cannot import would break MTP load.
++    try:
++        from aijuus import qwen3_5_mtp_w4 as _mw4
++    except Exception as e:
++        sys.stderr.write(
++            f"[radiance] draft_w4 module unavailable, keeping bf16 head: {e!r}\n"
++        )
++        return
++
++    try:
++        from vllm.model_executor.models import registry as _reg
++        repl = {
++            "Qwen3_5MTP": ("aijuus.qwen3_5_mtp_w4", "Qwen3_5MTPW4"),
++            "Qwen3_5MoeMTP": ("aijuus.qwen3_5_mtp_w4", "Qwen3_5MoeMTPW4"),
++        }
++        for attr in ("_SPECULATIVE_DECODING_MODELS", "_VLLM_MODELS", "_MULTIMODAL_MODELS"):
++            table = getattr(_reg, attr, None)
++            if isinstance(table, dict):
++                for arch, target in repl.items():
++                    if arch in table:
++                        table[arch] = target
++    except Exception as e:
++        sys.stderr.write(f"[radiance] draft_w4 registry remap failed: {e!r}\n")
++
++    try:
++        from vllm.model_executor.kernels import draft_w4_lmhead as _w4  # registers the op
++        keep = os.environ.get("RADIANCE_DRAFT_KEEP_FILE")
++        if keep:
++            for cls_name in ("Qwen3_5MTPW4", "Qwen3_5MoeMTPW4"):
++                cls = getattr(_mw4, cls_name, None)
++                if cls is not None:
++                    cls.draft_keep_file = keep
++        # Full-head W4 (patch 090 path) is opt-in on top of the reduced head.
++        if os.environ.get("RADIANCE_DRAFT_W4_FULL", "0") == "1":
++            _w4.install()
++    except Exception as e:
++        sys.stderr.write(f"[radiance] draft_w4 kernel install failed: {e!r}\n")
++
++
+ def install_all():
+     """Install every gated radiance runtime hook. Called once per process by the vLLM plugin loader,
+     after torch/vllm/aiter are imported but before the model loads. Idempotent; each hook is env-gated."""
+@@ -445,6 +510,14 @@ def install_all():
+         install_r4d_report()
+     except Exception as e:
+         sys.stderr.write(f"[radiance] install_r4d_report failed: {e!r}\n")
++    try:
++        _install_token_collector()
++    except Exception as e:
++        sys.stderr.write(f"[radiance] _install_token_collector failed: {e!r}\n")
++    try:
++        _install_draft_w4()
++    except Exception as e:
++        sys.stderr.write(f"[radiance] _install_draft_w4 failed: {e!r}\n")
+ 
+ 
+ def block_scaled_mm(kernel, A, B, As, Bs):

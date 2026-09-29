@@ -58,7 +58,7 @@ from pathlib import Path
 # _patchlib.py lives at the repo root (four levels up from patches/); insert it
 # explicitly since sys.path[0] is aijuus/ when run as `python3 aijuus/<script>.py`.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from _patchlib import apply  # noqa: E402
+from _patchlib import apply, apply_any  # noqa: E402
 
 SP = Path(os.environ.get("RADIANCE_VLLM_DIR", sysconfig.get_paths()["purelib"]))
 ASYNC_LOOKUP = SP / "vllm" / "v1" / "kv_offload" / "tiering" / "async_lookup.py"
@@ -153,10 +153,7 @@ apply(
     label="1b fs manager: record the pool thread counts",
 )
 
-apply(
-    FS_MANAGER,
-    anchor="    @override\n    def submit_store(self, job_metadata: JobMetadata) -> None:",
-    new='''    def _radiance_split(self, io_fn, paths, offsets, n_threads):
+_RADIANCE_SPLIT_HELPER = '''    def _radiance_split(self, io_fn, paths, offsets, n_threads):
         """radiance R3.14: turn one job into a list of partials, one per batch.
 
         Returns a single full-range partial for jobs of 0 or 1 blocks, which is
@@ -194,15 +191,33 @@ apply(
             for a, b in _radiance_batches(total, n_batches)
         ]
 
-    @override
-    def submit_store(self, job_metadata: JobMetadata) -> None:''',
+'''
+
+# submit_store's parameter type drifted JobMetadata -> TransferJob in 0.29.0; insert
+# the helper before whichever signature is present.
+apply_any(
+    FS_MANAGER,
+    variants=[
+        (
+            "    @override\n    def submit_store(self, job_metadata: JobMetadata) -> None:",
+            _RADIANCE_SPLIT_HELPER
+            + "    @override\n    def submit_store(self, job_metadata: JobMetadata) -> None:",
+        ),
+        (
+            "    @override\n    def submit_store(self, job_metadata: TransferJob) -> None:",
+            _RADIANCE_SPLIT_HELPER
+            + "    @override\n    def submit_store(self, job_metadata: TransferJob) -> None:",
+        ),
+    ],
     sentinel="def _radiance_split",
     label="1c fs manager: _radiance_split helper",
 )
 
-apply(
+apply_any(
     FS_MANAGER,
-    anchor='''        task = functools.partial(
+    variants=[
+        (
+            '''        task = functools.partial(
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             self._primary_kv_view,
@@ -211,20 +226,46 @@ apply(
             self._use_o_direct,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])''',
-    new='''        tasks = self._radiance_split(  # radiance R3.14
+            '''        tasks = self._radiance_split(  # radiance R3.14
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._radiance_n_write_threads,
         )
         self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)''',
+        ),
+        (
+            # 0.29.0 hoists `keys = list(job_metadata.keys)` and uses it in the paths.
+            '''        task = functools.partial(
+            batch_store_block,
+            [self.file_mapper.get_file_name(key) for key in keys],
+            self._primary_kv_view,
+            [int(bid) * self._block_size for bid in job_metadata.block_ids],
+            self._block_size,
+            self._use_o_direct,
+        )
+        self._pool.enqueue_store(job_metadata.job_id, 1, [task])''',
+            '''        tasks = self._radiance_split(  # radiance R3.14
+            batch_store_block,
+            [self.file_mapper.get_file_name(key) for key in keys],
+            [int(bid) * self._block_size for bid in job_metadata.block_ids],
+            self._radiance_n_write_threads,
+        )
+        self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)''',
+        ),
+    ],
     sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_store_block,",
     label="1d fs manager: fan the store path out",
 )
 
-apply(
-    FS_MANAGER,
-    anchor='''        task = functools.partial(
+# 0.29.0 rewrote submit_load around a `load_task()` closure that also records
+# per-task progress for the failed-load fix, so the one-task split no longer maps
+# cleanly. Load fan-out is therefore skipped on that tree; store fan-out (1d) still
+# applies, and 0.29.0's own load path already handles a failed load.
+if "        task = functools.partial(\n            batch_load_block," in FS_MANAGER.read_text():
+    apply(
+        FS_MANAGER,
+        anchor='''        task = functools.partial(
             batch_load_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             self._primary_kv_view,
@@ -234,16 +275,21 @@ apply(
         )
 
         self._pool.enqueue_load(job_metadata.job_id, 1, [task])''',
-    new='''        tasks = self._radiance_split(  # radiance R3.14
+        new='''        tasks = self._radiance_split(  # radiance R3.14
             batch_load_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._radiance_n_read_threads,
         )
         self._pool.enqueue_load(job_metadata.job_id, len(tasks), tasks)''',
-    sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_load_block,",
-    label="1e fs manager: fan the load path out",
-)
+        sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_load_block,",
+        label="1e fs manager: fan the load path out",
+    )
+else:
+    print(
+        "[radiance] fs load fan-out skipped: this vLLM uses a load_task() closure "
+        "(no functools.partial to split); store fan-out still applies"
+    )
 
 
 # =====================================================================================
@@ -345,26 +391,44 @@ apply(
     label="2b fs manager __init__: tracking maps, diagnostic counter, gate warning",
 )
 
-apply(
+apply_any(
     FS_MANAGER,
-    anchor='''        if self.events is not None:
+    variants=[
+        (
+            '''        if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         tasks = self._radiance_split(  # radiance R3.14''',
-    new='''        if self.events is not None:
+            '''        if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         # radiance: always-on (independent of events) so get_finished_jobs() can
         # invalidate the async-lookup cache when this store lands.
         self._store_lookup_keys[job_metadata.job_id] = list(job_metadata.keys)
         tasks = self._radiance_split(  # radiance R3.14''',
-    sentinel="self._store_lookup_keys[job_metadata.job_id] = list(job_metadata.keys)",
+        ),
+        (
+            # 0.29.0 hoists `keys = list(job_metadata.keys)`.
+            '''        if self.events is not None:
+            self._store_job_keys[job_metadata.job_id] = keys
+        tasks = self._radiance_split(  # radiance R3.14''',
+            '''        if self.events is not None:
+            self._store_job_keys[job_metadata.job_id] = keys
+        # radiance: always-on (independent of events) so get_finished_jobs() can
+        # invalidate the async-lookup cache when this store lands.
+        self._store_lookup_keys[job_metadata.job_id] = list(keys)
+        tasks = self._radiance_split(  # radiance R3.14''',
+        ),
+    ],
+    sentinel="self._store_lookup_keys[job_metadata.job_id]",
     label="2c fs manager submit_store: track store keys unconditionally",
 )
 
-apply(
+apply_any(
     FS_MANAGER,
-    anchor='''            results.append(JobResult(job_id=job_id, success=success))
+    variants=[
+        (
+            '''            results.append(JobResult(job_id=job_id, success=success))
         return results''',
-    new='''            # radiance: a successful store put these blocks on disk, so any
+            '''            # radiance: a successful store put these blocks on disk, so any
             # previously-cached `absent` verdict for them is stale. Drop it (the
             # next lookup re-states the file). A FAILED store leaves the verdict
             # untouched. Also forget the verdict of a FAILED load's keys so the
@@ -377,6 +441,36 @@ apply(
                 self._lookup_manager.forget(load_keys)
             results.append(JobResult(job_id=job_id, success=success))
         return results''',
+        ),
+        (
+            # 0.29.0's finishing path carries transfer_time, and its own
+            # mark_miss() already handles a failed load, so only store
+            # invalidation is added here.
+            '''            results.append(
+                JobResult(
+                    job_id=job_id,
+                    success=success,
+                    transfer_time=transfer_time,
+                )
+            )
+        return results''',
+            '''            # radiance R3.15: a successful store put these blocks on disk, so
+            # any previously-cached `absent` verdict for them is stale; drop it
+            # so the next lookup re-states the file. A failed store leaves the
+            # verdict. (A failed load is handled by 0.29.0's own mark_miss().)
+            store_keys = self._store_lookup_keys.pop(job_id, None)
+            if store_keys and success and _RADIANCE_LOOKUP_INVALIDATE:
+                self._lookup_manager.invalidate(store_keys)
+            results.append(
+                JobResult(
+                    job_id=job_id,
+                    success=success,
+                    transfer_time=transfer_time,
+                )
+            )
+        return results''',
+        ),
+    ],
     sentinel="store_keys = self._store_lookup_keys.pop(job_id, None)",
     label="2d fs manager get_finished_jobs: invalidate on store, forget on failed load",
 )
@@ -416,17 +510,25 @@ apply(
     label="2e fs manager lookup: RADIANCE_LOOKUP_STALE_WATCH diagnostic",
 )
 
-# 2f. submit_load must record its keys so a failed load can forget them.
-apply(
-    FS_MANAGER,
-    anchor='''    def submit_load(self, job_metadata: JobMetadata) -> None:
+# 2f. Pre-0.29.0 only: record the load's keys so a failed load can forget them.
+# 0.29.0's submit_load already tracks _load_job_keys and mark_miss()es the failed
+# keys, so this would be a second, conflicting bookkeeping path.
+if "    def submit_load(self, job_metadata: JobMetadata) -> None:" in FS_MANAGER.read_text():
+    apply(
+        FS_MANAGER,
+        anchor='''    def submit_load(self, job_metadata: JobMetadata) -> None:
         tasks = self._radiance_split(  # radiance R3.14''',
-    new='''    def submit_load(self, job_metadata: JobMetadata) -> None:
+        new='''    def submit_load(self, job_metadata: JobMetadata) -> None:
         self._radiance_load_keys[job_metadata.job_id] = list(job_metadata.keys)
         tasks = self._radiance_split(  # radiance R3.14''',
-    sentinel="self._radiance_load_keys[job_metadata.job_id] = list(job_metadata.keys)",
-    label="2f fs manager submit_load: record keys for failed-load forget",
-)
+        sentinel="self._radiance_load_keys[job_metadata.job_id] = list(job_metadata.keys)",
+        label="2f fs manager submit_load: record keys for failed-load forget",
+    )
+else:
+    print(
+        "[radiance] fs failed-load forget not needed: 0.29.0's submit_load already "
+        "tracks load keys and mark_miss()es a failed load"
+    )
 
 print(
     "[radiance] fs tier applied -- fanout target="

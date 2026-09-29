@@ -1,0 +1,688 @@
+diff --git a/kv-cache/patch_eagle_groups.py b/kv-cache/patch_eagle_groups.py
+index 6304a80..b43d416 100644
+--- a/kv-cache/patch_eagle_groups.py
++++ b/kv-cache/patch_eagle_groups.py
+@@ -90,7 +90,7 @@ import sys
+ from pathlib import Path
+ 
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+-from _patchlib import apply  # noqa: E402
++from _patchlib import apply, apply_any  # noqa: E402
+ 
+ VLLM = Path(sys.prefix) / "lib" / f"python3.{sys.version_info.minor}" / "site-packages" / "vllm"
+ if not VLLM.exists():
+@@ -102,15 +102,21 @@ KVU = VLLM / "v1" / "core" / "kv_cache_utils.py"
+ print("[radiance] R3.13a eagle-group annotation")
+ 
+ # --- A. remove the DeepSeek-only gate -------------------------------------------------
+-apply(
++# Two shapes, because 0.29.0 renamed the function and moved the gate to the caller:
++#   pre-0.29.0 -- drop the in-body `model_version == "deepseek_v4"` early return.
++#   0.29.0 -- upstream already calls `_annotate_eagle_groups` on the hybrid
++#     uniform-page-size path; enable its positional `use_deepseek_v4_fallback` there.
++apply_any(
+     KVU,
+-    anchor='''    # Detection uses the merged MLA spec's model_version.
++    variants=[
++        (
++            '''    # Detection uses the merged MLA spec's model_version.
+     if not any(
+         getattr(spec, "model_version", None) == "deepseek_v4"
+         for spec in kv_cache_spec.values()
+     ):
+         return''',
+-    new='''    # Detection uses the merged MLA spec's model_version.
++            '''    # Detection uses the merged MLA spec's model_version.
+     # The rule this function applies -- the draft model's attention layer is
+     # registered last, so flag whichever group holds the last layer -- is a fact
+     # about how vLLM registers a draft model, not anything specific to DeepSeek.
+@@ -122,15 +128,41 @@ apply(
+         for spec in kv_cache_spec.values()
+     ):
+         return''',
++        ),
++        (
++            '''    _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
++    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
++    return groups''',
++            '''    # radiance: enable the positional draft-group annotation on the hybrid
++    # uniform-page-size path (see patch_eagle_groups.py). Upstream gates the
++    # positional rule on the model being DeepSeek-V4; a hybrid Mamba+attention MTP
++    # model lands here with nothing annotated, so the offload scheduler flags every
++    # group as a draft group. filtered_spec excludes hidden-state layers not in
++    # `groups` yet. RADIANCE_OFFLOAD_EAGLE_GROUPS=0 restores the upstream behaviour.
++    _annotate_eagle_groups(
++        vllm_config,
++        filtered_spec,
++        groups,
++        use_deepseek_v4_fallback=(
++            os.environ.get("RADIANCE_OFFLOAD_EAGLE_GROUPS", "0") == "1"
++        ),
++    )
++    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
++    return groups''',
++        ),
++    ],
+     sentinel="RADIANCE_OFFLOAD_EAGLE_GROUPS",
+-    label="A kv_cache_utils: generalize eagle annotation past the deepseek_v4 gate",
++    label="A kv_cache_utils: enable draft-group annotation past the deepseek_v4 gate",
+ )
+ 
+-# --- B. call it on the general hybrid grouping path ------------------------------------
+-apply(
+-    KVU,
+-    anchor="    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)",
+-    new='''    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)
++# --- B. call it on the general hybrid grouping path (pre-0.29.0 only) -------------------
++# 0.29.0 already calls the annotator on this path, so inserting the old symbol would only
++# add a NameError. Gate on the old function existing.
++if "def _annotate_eagle_groups_deepseek_v4" in KVU.read_text():
++    apply(
++        KVU,
++        anchor="    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)",
++        new='''    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)
+ 
+     # Annotate the EAGLE/MTP draft group on the uniform-page-size path too. Upstream
+     # annotates only on the DeepSeek-V4 branch above, so a hybrid Mamba+attention model
+@@ -138,8 +170,13 @@ apply(
+     # as draft groups. filtered_spec (not kv_cache_spec) keeps registration order while
+     # excluding the hidden-state layers that are not in `groups` yet.
+     _annotate_eagle_groups_deepseek_v4(vllm_config, filtered_spec, groups)''',
+-    sentinel="_annotate_eagle_groups_deepseek_v4(vllm_config, filtered_spec, groups)",
+-    label="B kv_cache_utils: annotate eagle groups on the hybrid page-size path",
+-)
++        sentinel="_annotate_eagle_groups_deepseek_v4(vllm_config, filtered_spec, groups)",
++        label="B kv_cache_utils: annotate eagle groups on the hybrid page-size path",
++    )
++else:
++    print(
++        "[radiance] hunk B not needed: this vLLM already calls _annotate_eagle_groups "
++        "on the uniform-page-size path"
++    )
+ 
+ print("[radiance] R3.13a applied -- expect 'draft attention groups [8] detected' at boot")
+diff --git a/kv-cache/patch_fs_failed_load.py b/kv-cache/patch_fs_failed_load.py
+index 18b1c5c..6b9056d 100755
+--- a/kv-cache/patch_fs_failed_load.py
++++ b/kv-cache/patch_fs_failed_load.py
+@@ -65,6 +65,15 @@ if "_RADIANCE_FANOUT_MAX = int(" not in s:
+ if "def invalidate(self, keys" not in (ASYNC_LOOKUP.read_text() if ASYNC_LOOKUP.exists() else ""):
+     raise SystemExit("[radiance] needs patch_kv_offload_lookup_cache_invalidate.py applied first")
+ 
++# 0.29.0's submit_load already tracks _load_job_keys and mark_miss()es the failed
++# keys, so the radiance forget() would be a second, conflicting bookkeeping path.
++if "def submit_load(self, job_metadata: TransferJob) -> None:" in s:
++    print(
++        "[radiance] fs failed-load forget skipped: 0.29.0's submit_load already "
++        "tracks load keys and mark_miss()es a failed load (upstream supersedes)"
++    )
++    raise SystemExit(0)
++
+ # 1. async_lookup.py: forget() right before cleanup().
+ apply(
+     ASYNC_LOOKUP,
+diff --git a/kv-cache/patch_lookup_invalidate.py b/kv-cache/patch_lookup_invalidate.py
+index 2a31040..886676d 100644
+--- a/kv-cache/patch_lookup_invalidate.py
++++ b/kv-cache/patch_lookup_invalidate.py
+@@ -114,7 +114,7 @@ restoring the pre-patch files and reloading the model.
+ import sysconfig
+ from pathlib import Path
+ 
+-from _patchlib import apply
++from _patchlib import apply, apply_any
+ 
+ SP = Path(sysconfig.get_paths()["purelib"])
+ KVO = SP / "vllm/v1/kv_offload"
+@@ -253,40 +253,42 @@ apply(
+ # ---------------------------------------------------------------------------
+ # 4. fs/manager.py submit_store(): record the store's keys unconditionally.
+ # ---------------------------------------------------------------------------
+-apply(
++apply_any(
+     FS_MANAGER,
+-    '''        if self.events is not None:
++    variants=[
++        (
++            '''        if self.events is not None:
+             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+         tasks = self._radiance_split(  # radiance R3.14''',
+-    '''        if self.events is not None:
++            '''        if self.events is not None:
+             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+         # radiance: always-on (independent of events) so get_finished_jobs() can
+         # invalidate the async-lookup cache when this store lands.
+         self._store_lookup_keys[job_metadata.job_id] = list(job_metadata.keys)
+         tasks = self._radiance_split(  # radiance R3.14''',
+-    "self._store_lookup_keys[job_metadata.job_id] = list(job_metadata.keys)",
+-    "4  fs/manager.py submit_store: track store keys unconditionally",
++        ),
++        (
++            # 0.29.0 hoists `keys = list(job_metadata.keys)`.
++            '''        if self.events is not None:
++            self._store_job_keys[job_metadata.job_id] = keys
++        tasks = self._radiance_split(  # radiance R3.14''',
++            '''        if self.events is not None:
++            self._store_job_keys[job_metadata.job_id] = keys
++        # radiance: always-on (independent of events) so get_finished_jobs() can
++        # invalidate the async-lookup cache when this store lands.
++        self._store_lookup_keys[job_metadata.job_id] = list(keys)
++        tasks = self._radiance_split(  # radiance R3.14''',
++        ),
++    ],
++    sentinel="self._store_lookup_keys[job_metadata.job_id]",
++    label="4  fs/manager.py submit_store: track store keys unconditionally",
+ )
+ 
+ # ---------------------------------------------------------------------------
+ # 5. fs/manager.py get_finished_jobs(): on a SUCCESSFUL store, invalidate the
+ #    cached verdict for those keys (and always drain the tracking map).
+ # ---------------------------------------------------------------------------
+-apply(
+-    FS_MANAGER,
+-    '''            if self.events is not None:
+-                keys = self._store_job_keys.pop(job_id, None)
+-                if success and keys:
+-                    self.events.append(
+-                        OffloadingEvent(
+-                            keys=keys,
+-                            medium=self.medium,
+-                            removed=False,
+-                            locality=self.locality,
+-                        )
+-                    )
+-            results.append(JobResult(job_id=job_id, success=success))''',
+-    '''            if self.events is not None:
++_STORE_EVENTS_BLOCK = '''            if self.events is not None:
+                 keys = self._store_job_keys.pop(job_id, None)
+                 if success and keys:
+                     self.events.append(
+@@ -297,7 +299,9 @@ apply(
+                             locality=self.locality,
+                         )
+                     )
+-            # radiance: a successful store put these blocks on disk, so any
++'''
++
++_INVALIDATE_BLOCK = '''            # radiance: a successful store put these blocks on disk, so any
+             # previously-cached `absent` verdict for them is stale. Drop it (the
+             # next lookup re-states the file, reflecting its real current state,
+             # robust to external eviction). A FAILED store leaves the verdict
+@@ -306,9 +310,29 @@ apply(
+             store_keys = self._store_lookup_keys.pop(job_id, None)
+             if store_keys and success and _RADIANCE_LOOKUP_INVALIDATE:
+                 self._lookup_manager.invalidate(store_keys)
+-            results.append(JobResult(job_id=job_id, success=success))''',
+-    "store_keys = self._store_lookup_keys.pop(job_id, None)",
+-    "5  fs/manager.py get_finished_jobs: invalidate on successful store",
++'''
++
++apply_any(
++    FS_MANAGER,
++    variants=[
++        (
++            _STORE_EVENTS_BLOCK
++            + "            results.append(JobResult(job_id=job_id, success=success))",
++            _STORE_EVENTS_BLOCK
++            + _INVALIDATE_BLOCK
++            + "            results.append(JobResult(job_id=job_id, success=success))",
++        ),
++        (
++            # 0.29.0 continues from the events block into the load-job handling.
++            _STORE_EVENTS_BLOCK
++            + "            load_keys = self._load_job_keys.pop(job_id, None)",
++            _STORE_EVENTS_BLOCK
++            + _INVALIDATE_BLOCK
++            + "            load_keys = self._load_job_keys.pop(job_id, None)",
++        ),
++    ],
++    sentinel="store_keys = self._store_lookup_keys.pop(job_id, None)",
++    label="5  fs/manager.py get_finished_jobs: invalidate on successful store",
+ )
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/kv-cache/patch_offload_fs_fanout.py b/kv-cache/patch_offload_fs_fanout.py
+index 8d43ed2..5c1473c 100644
+--- a/kv-cache/patch_offload_fs_fanout.py
++++ b/kv-cache/patch_offload_fs_fanout.py
+@@ -80,7 +80,7 @@ import sys
+ from pathlib import Path
+ 
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+-from _patchlib import apply  # noqa: E402
++from _patchlib import apply, apply_any  # noqa: E402
+ 
+ VLLM = Path(sys.prefix) / "lib" / f"python3.{sys.version_info.minor}" / "site-packages" / "vllm"
+ if not VLLM.exists():
+@@ -172,11 +172,9 @@ apply(
+ )
+ 
+ # --- 3. the splitter --------------------------------------------------------------------
+-apply(
+-    MGR,
+-    anchor='''    @override
+-    def submit_store(self, job_metadata: JobMetadata) -> None:''',
+-    new='''    def _radiance_split(self, io_fn, paths, offsets, n_threads):
++# submit_store's parameter type drifted JobMetadata -> TransferJob in 0.29.0; insert
++# the helper before whichever signature is present.
++_FANOUT_SPLIT_HELPER = '''    def _radiance_split(self, io_fn, paths, offsets, n_threads):
+         """radiance R3.14: turn one job into a list of partials, one per batch.
+ 
+         Returns a single full-range partial for jobs of 0 or 1 blocks, which is
+@@ -215,16 +213,32 @@ apply(
+             for a, b in _radiance_batches(total, n_batches)
+         ]
+ 
+-    @override
+-    def submit_store(self, job_metadata: JobMetadata) -> None:''',
++'''
++
++apply_any(
++    MGR,
++    variants=[
++        (
++            "    @override\n    def submit_store(self, job_metadata: JobMetadata) -> None:",
++            _FANOUT_SPLIT_HELPER
++            + "    @override\n    def submit_store(self, job_metadata: JobMetadata) -> None:",
++        ),
++        (
++            "    @override\n    def submit_store(self, job_metadata: TransferJob) -> None:",
++            _FANOUT_SPLIT_HELPER
++            + "    @override\n    def submit_store(self, job_metadata: TransferJob) -> None:",
++        ),
++    ],
+     sentinel="def _radiance_split",
+     label="3 fs manager: _radiance_split helper",
+ )
+ 
+ # --- 4. STORE path ----------------------------------------------------------------------
+-apply(
++apply_any(
+     MGR,
+-    anchor='''        task = functools.partial(
++    variants=[
++        (
++            '''        task = functools.partial(
+             batch_store_block,
+             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
+             self._primary_kv_view,
+@@ -233,21 +247,47 @@ apply(
+             self._use_o_direct,
+         )
+         self._pool.enqueue_store(job_metadata.job_id, 1, [task])''',
+-    new='''        tasks = self._radiance_split(  # radiance R3.14
++            '''        tasks = self._radiance_split(  # radiance R3.14
+             batch_store_block,
+             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
+             [int(bid) * self._block_size for bid in job_metadata.block_ids],
+             self._radiance_n_write_threads,
+         )
+         self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)''',
++        ),
++        (
++            # 0.29.0 hoists `keys = list(job_metadata.keys)` and uses it in the paths.
++            '''        task = functools.partial(
++            batch_store_block,
++            [self.file_mapper.get_file_name(key) for key in keys],
++            self._primary_kv_view,
++            [int(bid) * self._block_size for bid in job_metadata.block_ids],
++            self._block_size,
++            self._use_o_direct,
++        )
++        self._pool.enqueue_store(job_metadata.job_id, 1, [task])''',
++            '''        tasks = self._radiance_split(  # radiance R3.14
++            batch_store_block,
++            [self.file_mapper.get_file_name(key) for key in keys],
++            [int(bid) * self._block_size for bid in job_metadata.block_ids],
++            self._radiance_n_write_threads,
++        )
++        self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)''',
++        ),
++    ],
+     sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_store_block,",
+     label="4 fs manager: fan the store path out",
+ )
+ 
+ # --- 5. LOAD path -----------------------------------------------------------------------
+-apply(
+-    MGR,
+-    anchor='''        task = functools.partial(
++# 0.29.0 rewrote submit_load around a `load_task()` closure that also records per-task
++# progress, so the one-task split no longer maps cleanly. Skip load fan-out there; store
++# fan-out (4) still applies.
++if '''        task = functools.partial(
++            batch_load_block,''' in MGR.read_text():
++    apply(
++        MGR,
++        anchor='''        task = functools.partial(
+             batch_load_block,
+             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
+             self._primary_kv_view,
+@@ -257,16 +297,21 @@ apply(
+         )
+ 
+         self._pool.enqueue_load(job_metadata.job_id, 1, [task])''',
+-    new='''        tasks = self._radiance_split(  # radiance R3.14
++        new='''        tasks = self._radiance_split(  # radiance R3.14
+             batch_load_block,
+             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
+             [int(bid) * self._block_size for bid in job_metadata.block_ids],
+             self._radiance_n_read_threads,
+         )
+         self._pool.enqueue_load(job_metadata.job_id, len(tasks), tasks)''',
+-    sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_load_block,",
+-    label="5 fs manager: fan the load path out",
+-)
++        sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_load_block,",
++        label="5 fs manager: fan the load path out",
++    )
++else:
++    print(
++        "[radiance] fs load fan-out skipped: this vLLM uses a load_task() closure "
++        "(no functools.partial to split); store fan-out still applies"
++    )
+ 
+ print(f"[radiance] R3.14 applied -- target "
+       f"{os.environ.get('RADIANCE_FS_FANOUT_TARGET_MB', '32')} MiB, "
+diff --git a/kv-cache/patch_offload_instrumentation.py b/kv-cache/patch_offload_instrumentation.py
+index b6b7658..6ca5a2d 100755
+--- a/kv-cache/patch_offload_instrumentation.py
++++ b/kv-cache/patch_offload_instrumentation.py
+@@ -49,7 +49,7 @@ in the metrics path.
+ import sysconfig
+ from pathlib import Path
+ 
+-from _patchlib import apply
++from _patchlib import apply, apply_any
+ 
+ SP = Path(sysconfig.get_paths()["purelib"])
+ 
+@@ -75,9 +75,14 @@ _WIDE = """                    5,
+                 ),"""
+ 
+ # --- hunk 1: tiering LOOKUP_ASYNC_DELAY buckets --------------------------------------
+-apply(
++# Two shapes: vLLM <=0.27.x documents this histogram as "secondary-tier lookup until
++# the request is allocated or finishes"; 0.29.0 rewrote it and inserted a
++# labelnames=("tier",) line. Match either and lengthen the bucket ladder.
++apply_any(
+     TIERING_SPEC,
+-    """                    "secondary-tier lookup until the request is allocated or "
++    variants=[
++        (
++            """                    "secondary-tier lookup until the request is allocated or "
+                     "finishes, in seconds."
+                 ),
+                 buckets=(
+@@ -93,7 +98,7 @@ apply(
+                     5,
+                     10,
+                 ),""",
+-    """                    "secondary-tier lookup until the request is allocated or "
++            """                    "secondary-tier lookup until the request is allocated or "
+                     "finishes, in seconds."
+                 ),
+                 # radiance: extended past 10 s -- a measured 60.6 s stall was
+@@ -109,9 +114,52 @@ apply(
+                     0.5,
+                     1,
+ """
+-    + _WIDE,
+-    "radiance: extended past 10 s",
+-    "tiering lookup_async_delay buckets",
++            + _WIDE,
++        ),
++        (
++            """                documentation=(
++                    "Histogram of wall-clock time from a per-block tier lookup "
++                    "first returning retry until that same tier lookup resolves "
++                    "as a hit or miss, labeled by tier, in seconds."
++                ),
++                labelnames=("tier",),
++                buckets=(
++                    0.0001,
++                    0.0005,
++                    0.001,
++                    0.005,
++                    0.01,
++                    0.05,
++                    0.1,
++                    0.5,
++                    1,
++                    5,
++                    10,
++                ),""",
++            """                documentation=(
++                    "Histogram of wall-clock time from a per-block tier lookup "
++                    "first returning retry until that same tier lookup resolves "
++                    "as a hit or miss, labeled by tier, in seconds."
++                ),
++                labelnames=("tier",),
++                # radiance: extended past 10 s -- a measured 60.6 s stall was
++                # invisible in +Inf. See cache-preemption-patch-plan.md R3.5.
++                buckets=(
++                    0.0001,
++                    0.0005,
++                    0.001,
++                    0.005,
++                    0.01,
++                    0.05,
++                    0.1,
++                    0.5,
++                    1,
++"""
++            + _WIDE,
++        ),
++    ],
++    sentinel="radiance: extended past 10 s",
++    label="tiering lookup_async_delay buckets",
+ )
+ 
+ # --- hunk 2: connector LOOKUP_ASYNC_DELAY buckets ------------------------------------
+diff --git a/kv-cache/patch_offload_miss_deferral_metrics.py b/kv-cache/patch_offload_miss_deferral_metrics.py
+index 1d78e72..fc1d41c 100644
+--- a/kv-cache/patch_offload_miss_deferral_metrics.py
++++ b/kv-cache/patch_offload_miss_deferral_metrics.py
+@@ -71,7 +71,7 @@ anchors against, the same re-anchoring task 15 was forced into.
+ import sysconfig
+ from pathlib import Path
+ 
+-from _patchlib import apply
++from _patchlib import apply, apply_any
+ 
+ SP = Path(sysconfig.get_paths()["purelib"])
+ OFF_SCHED = (
+@@ -118,17 +118,12 @@ apply(
+ #    so they sit beside their siblings and are independent of the bundle's
+ #    tail-of-dict insertions.
+ # ---------------------------------------------------------------------------
+-apply(
+-    OFF_METRICS,
+-    """        _ConnectorMetricName.LOOKUP_SERVED_TOKENS: OffloadingCounterMetadata(
+-            documentation="Tokens returned by successful offload lookups.",
+-        ),
+-        # radiance tier-report: everything below carries a `tier` label so one
+-""",
+-    """        _ConnectorMetricName.LOOKUP_SERVED_TOKENS: OffloadingCounterMetadata(
++_SERVED_TOKENS_DEF = '''        _ConnectorMetricName.LOOKUP_SERVED_TOKENS: OffloadingCounterMetadata(
+             documentation="Tokens returned by successful offload lookups.",
+         ),
+-        # radiance deferral-outcomes (task 50/32): what happened AFTER a lookup
++'''
++
++_DEFERRAL_DEFS = _SERVED_TOKENS_DEF + '''        # radiance deferral-outcomes (task 50/32): what happened AFTER a lookup
+         # deferred. served + gave_up + unresolved = deferral_total. The
+         # transfer_jobs counter is the one lookup-path exit that records no
+         # outcome counter at all (it returns before _lookup()); it is a WAIT,
+@@ -181,10 +176,24 @@ apply(
+                 )
+             )
+         ),
+-        # radiance tier-report: everything below carries a `tier` label so one
+-""",
+-    "LOOKUP_DEFERRAL_TOTAL: OffloadingCounterMetadata(",
+-    "2  offloading/metrics.py: deferral-outcome definitions",
++'''
++
++# The old anchor carried a trailing tier-report comment line that only exists after
++# the tier-report bundle ran; 0.29.0 skips that bundle (upstream native metrics), so
++# match the definition without the comment too.
++apply_any(
++    OFF_METRICS,
++    variants=[
++        (
++            _SERVED_TOKENS_DEF
++            + "        # radiance tier-report: everything below carries a `tier` label so one\n",
++            _DEFERRAL_DEFS
++            + "        # radiance tier-report: everything below carries a `tier` label so one\n",
++        ),
++        (_SERVED_TOKENS_DEF, _DEFERRAL_DEFS),
++    ],
++    sentinel="LOOKUP_DEFERRAL_TOTAL: OffloadingCounterMetadata(",
++    label="2  offloading/metrics.py: deferral-outcome definitions",
+ )
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/kv-cache/patch_offload_promotion_wallclock.py b/kv-cache/patch_offload_promotion_wallclock.py
+index 6f94508..cc7d016 100644
+--- a/kv-cache/patch_offload_promotion_wallclock.py
++++ b/kv-cache/patch_offload_promotion_wallclock.py
+@@ -70,6 +70,8 @@ observe() asserts that every emitted name is registered.
+ import sysconfig
+ from pathlib import Path
+ 
++import sys
++
+ from _patchlib import apply
+ 
+ SP = Path(sysconfig.get_paths()["purelib"])
+@@ -81,6 +83,18 @@ CONN_METRICS = (
+     SP / "vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py"
+ )
+ 
++# 0.29.0 reworked the tiering manager (TieringMetricsTracker, batched promotions) and
++# the connector calls prepare_store() directly; its tracker already reports whole-job
++# READ/WRITE time and promotion failures, and the refusal-sentinel half would need the
++# connector's `is None` checks updated to stay safe. Skip both halves entirely.
++if TIERING_MANAGER.exists() and "TieringMetricsTracker" in TIERING_MANAGER.read_text():
++    print(
++        "[radiance] promotion-refusal + wallclock skipped: this vLLM's "
++        "TieringMetricsTracker already reports whole-job transfer time and promotion "
++        "failures, and its connector calls prepare_store() directly (upstream supersedes)"
++    )
++    sys.exit(0)
++
+ print("radiance: KV offload promotion-refusal instrumentation")
+ 
+ # ---------------------------------------------------------------------------
+@@ -273,33 +287,12 @@ apply(
+     "4b cpu/manager.py: widen prepare_store annotation",
+ )
+ 
+-apply(
+-    CPU_MANAGER,
+-    """            if num_blocks_to_evict > self._num_evictable_cache_blocks:
+-                # Eviction will fail.
+-                return None""",
+-    """            if num_blocks_to_evict > self._num_evictable_cache_blocks:
+-                # Eviction will fail.
+-                # radiance promotion-refusal: not enough evictable blocks; the
+-                # fix is a reserved headroom (B2). Distinct from PROTECTED.
+-                return PrepareStoreRefusal(PrepareStoreRefusal.NO_EVICTABLE)""",
+-    "return PrepareStoreRefusal(PrepareStoreRefusal.NO_EVICTABLE)",
+-    "4c cpu/manager.py: NO_EVICTABLE refusal sentinel",
+-)
+-
+-apply(
+-    CPU_MANAGER,
+-    """            evicted = self._policy.evict(num_blocks_to_evict, protected)
+-            if evicted is None:
+-                return None""",
+-    """            evicted = self._policy.evict(num_blocks_to_evict, protected)
+-            if evicted is None:
+-                # radiance promotion-refusal: the evictable blocks are held by
+-                # concurrent references; the fix is a bounded retry (B1).
+-                return PrepareStoreRefusal(PrepareStoreRefusal.PROTECTED)""",
+-    "return PrepareStoreRefusal(PrepareStoreRefusal.PROTECTED)",
+-    "4d cpu/manager.py: PROTECTED refusal sentinel",
+-)
++# NOTE: the two sentinel-return hunks (4c, 4d) are applied LAST, below, after both
++# consumers (5b promotion, 5d store) are in place. Flipping cpu/manager.prepare_store
++# to return a PrepareStoreRefusal BEFORE its callers know about it would leave a
++# refusal object flowing into a truthiness check (`if store_output is None`) and
++# crash the store path. Keeping them last means a drifted consumer hunk aborts the
++# patch with prepare_store still returning plain None -- a safe partial state.
+ 
+ # ---------------------------------------------------------------------------
+ # 5. tiering/manager.py: import the sentinel, count refusals by source tier and
+@@ -417,6 +410,40 @@ apply(
+     "5d tiering/manager.py: treat the sentinel as a store failure",
+ )
+ 
++# ---------------------------------------------------------------------------
++# 6. cpu/manager.py: the two return-None refusal paths become labelled sentinels.
++#    Kept LAST (after 5b and 5d): this changes prepare_store's return type, so the
++#    consumers must already know about PrepareStoreRefusal. Applied earlier, a
++#    drifted consumer hunk would leave a sentinel reaching `is None` checks.
++# ---------------------------------------------------------------------------
++apply(
++    CPU_MANAGER,
++    """            if num_blocks_to_evict > self._num_evictable_cache_blocks:
++                # Eviction will fail.
++                return None""",
++    """            if num_blocks_to_evict > self._num_evictable_cache_blocks:
++                # Eviction will fail.
++                # radiance promotion-refusal: not enough evictable blocks; the
++                # fix is a reserved headroom (B2). Distinct from PROTECTED.
++                return PrepareStoreRefusal(PrepareStoreRefusal.NO_EVICTABLE)""",
++    "return PrepareStoreRefusal(PrepareStoreRefusal.NO_EVICTABLE)",
++    "6a cpu/manager.py: NO_EVICTABLE refusal sentinel",
++)
++
++apply(
++    CPU_MANAGER,
++    """            evicted = self._policy.evict(num_blocks_to_evict, protected)
++            if evicted is None:
++                return None""",
++    """            evicted = self._policy.evict(num_blocks_to_evict, protected)
++            if evicted is None:
++                # radiance promotion-refusal: the evictable blocks are held by
++                # concurrent references; the fix is a bounded retry (B1).
++                return PrepareStoreRefusal(PrepareStoreRefusal.PROTECTED)""",
++    "return PrepareStoreRefusal(PrepareStoreRefusal.PROTECTED)",
++    "6b cpu/manager.py: PROTECTED refusal sentinel",
++)
++
+ """Time each secondary-tier transfer ONCE, in wall clock, not per I/O batch.
+ 
+ WHY
+diff --git a/kv-cache/patch_offload_tier_report.py b/kv-cache/patch_offload_tier_report.py
+index 2077852..05df550 100644
+--- a/kv-cache/patch_offload_tier_report.py
++++ b/kv-cache/patch_offload_tier_report.py
+@@ -147,6 +147,8 @@ means that assertion cannot be tripped by running a spec we did not think of.
+ import sysconfig
+ from pathlib import Path
+ 
++import sys
++
+ from _patchlib import apply
+ 
+ SP = Path(sysconfig.get_paths()["purelib"])
+@@ -161,6 +163,16 @@ CONN_METRICS = CONN / "metrics.py"
+ CONN_COMMON = CONN / "common.py"
+ CONN_SCHEDULER = CONN / "scheduler.py"
+ 
++# 0.29.0's TieringMetricsTracker already emits per-tier BLOCK_QUERIES/BLOCK_HITS,
++# LOOKUP_SYNC/ASYNC_DELAY histograms, READ/WRITE bytes+time per job, and
++# active-job/usage gauges, superseding the tier-report set below.
++if TIERING_MANAGER.exists() and "TieringMetricsTracker" in TIERING_MANAGER.read_text():
++    print(
++        "[radiance] tier-report skipped: this vLLM's TieringMetricsTracker already "
++        "emits per-tier hit/lookup/transfer metrics (upstream supersedes this patch)"
++    )
++    sys.exit(0)
++
+ print("radiance: KV offload tier-report instrumentation")
+ 
+ # --- prerequisite -----------------------------------------------------------

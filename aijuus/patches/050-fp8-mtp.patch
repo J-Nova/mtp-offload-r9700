@@ -1,8 +1,8 @@
 diff --git a/fp8_mtp.py b/fp8_mtp.py
-index 56dc47d..850c7ec 100755
+index 56dc47d..1b01605 100755
 --- a/fp8_mtp.py
 +++ b/fp8_mtp.py
-@@ -1,35 +1,55 @@
+@@ -1,35 +1,58 @@
  #!/usr/bin/env python3
  """MXFP4 body + FP8 drafter, in one checkpoint.
  
@@ -69,7 +69,10 @@ index 56dc47d..850c7ec 100755
 +import sys
 +
 +sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-+from quant_defaults import DEFAULT_MTP_EXCLUDE, DEFAULT_MTP_KEEP_IN_EXCLUDE  # noqa: E402
++try:  # quant_defaults.py lives beside fp8_mtp.py in some trees ...
++    from quant_defaults import DEFAULT_MTP_EXCLUDE, DEFAULT_MTP_KEEP_IN_EXCLUDE  # noqa: E402
++except ImportError:  # ... and under the aijuus package in this repo (repo root is on sys.path)
++    from aijuus.quant_defaults import DEFAULT_MTP_EXCLUDE, DEFAULT_MTP_KEEP_IN_EXCLUDE  # noqa: E402
  
 -# Checked before importing torch, so a bare invocation on a host without it still explains itself.
 +# Checked before importing torch, so a bare invocation on a host without it still
@@ -77,7 +80,7 @@ index 56dc47d..850c7ec 100755
  if len(sys.argv) != 3:
      sys.exit(f"usage: {pathlib.Path(sys.argv[0]).name} <src-checkpoint> <dst-checkpoint>\n"
               "  src  a Quark AWQ MXFP4 snapshot, e.g. the directory under\n"
-@@ -40,14 +60,37 @@ if len(sys.argv) != 3:
+@@ -40,14 +63,37 @@ if len(sys.argv) != 3:
  
  import torch
  
@@ -121,7 +124,7 @@ index 56dc47d..850c7ec 100755
  
  def spec(dtype, dynamic, qscheme, ch_axis):
      return {"block_size": None, "ch_axis": ch_axis, "dtype": dtype, "enable_buffer_reuse": False,
-@@ -58,87 +101,215 @@ def spec(dtype, dynamic, qscheme, ch_axis):
+@@ -58,87 +104,215 @@ def spec(dtype, dynamic, qscheme, ch_axis):
              "qscheme": qscheme, "round_method": "half_even", "scale_calculation_mode": None,
              "scale_format": None, "scale_type": "float", "symmetric": True}
  

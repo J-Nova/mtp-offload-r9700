@@ -1,8 +1,77 @@
 diff --git a/Dockerfile b/Dockerfile
-index 48bbdf2..ac713fe 100644
+index 48bbdf2..8fab64a 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -379,7 +379,8 @@ ENV VIRTUAL_ENV=/opt/vllm \
+@@ -99,7 +99,19 @@ RUN mkdir -p /wheels
+ 
+ # --- torch (AOTriton off: its gfx1201 source-configure fails and vLLM never uses torch
+ #     SDPA-flash; USE_MAGMA=0: base has no magma) ---
+-RUN git clone --depth 1 -b v${TORCH_VERSION} --recurse-submodules --shallow-submodules \
++# GitHub rate-limits the anonymous burst of ~100 submodule fetches this clone makes and answers
++# with a 401 ("could not read Username"); the repos are public. Authenticate the fetches with a
++# token passed as a build secret -- --mount=type=secret is not stored in the layer, so the token
++# is never baked. GIT_CONFIG_* env is inherited by the submodule child processes (a plain
++# `git -c` would not be). If the secret is absent this falls back to the anonymous clone.
++RUN --mount=type=secret,id=github_token \
++    TOKEN="$(cat /run/secrets/github_token 2>/dev/null || true)"; \
++    if [ -n "$TOKEN" ]; then \
++      export GIT_CONFIG_COUNT=1 \
++             GIT_CONFIG_KEY_0="url.https://x-access-token:${TOKEN}@github.com/.insteadOf" \
++             GIT_CONFIG_VALUE_0="https://github.com/"; \
++    fi; \
++    git clone --depth 1 -b v${TORCH_VERSION} --recurse-submodules --shallow-submodules \
+         https://github.com/pytorch/pytorch.git /src/pytorch \
+     && cd /src/pytorch \
+     && pip install -r requirements.txt \
+@@ -222,19 +234,17 @@ ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd \
+     SAFETENSORS_FAST_GPU=1 TOKENIZERS_PARALLELISM=false TRITON_CACHE_AUTOTUNING=1 \
+     PYTHONDONTWRITEBYTECODE=1
+ 
+-# --- runtime modules and configs ---
+-# radiance_amdsmi.py and .pth: amdsmi init-order fix. amdsmi must init before HIP at site-init in
+-# every process, otherwise it enumerates 0 devices and platform detection fails.
+-COPY radiance_amdsmi.py radiance_amdsmi.pth \
+-     radiance_kernels.py radiance_vit_attn.py radiance_allreduce.py \
+-     radiance_draft.py radiance_draft_gpu.py radiance_drafthead.py radiance_gemm.py \
+-     radiance_r4d_attn.py radiance_gdn.py radiance_w4.py radiance_mxfp4.py ${SP}/
+-COPY fp8-configs/ ${SP}/vllm/model_executor/layers/quantization/utils/configs/
+-COPY moe-configs/ ${SP}/vllm/model_executor/layers/fused_moe/configs/
+-# mxfp4-configs: aiter ships GEMM-AFP4WFP4 tiles for gfx950/gfx1250 only, and its gfx1250
+-# bands set matrix_instr_nonkdim=32 for M>=64, which gfx1201 (WMMA 16x16x16 only) cannot
+-# lower. These pin 16 across every band. Used only when RADIANCE_MXFP4=1.
+-COPY mxfp4-configs/ ${SP}/aiter/ops/triton/configs/gemm/
++# --- runtime modules and configs: NOT baked (runtime overlay) ---
++# radiance_*.py, radiance_amdsmi.pth, aijuus/, and the config dirs are copied into
++# site-packages at CONTAINER START by aijuus/kv-offload/ops/entrypoint.sh, from the
++# /patches repo bind -- so every Radiance/AIJUUS source file can be iterated without a
++# rebuild, and the release image carries only infrastructure: ROCm, the torch/triton/vLLM
++# venv, the patched vLLM source, r4d.so and radiance_mxfp4_fp8.so (the two compiled .so
++# files are the only radiance artifacts that stay baked, since they are build products).
++# radiance_amdsmi.pth still has to init amdsmi before HIP at interpreter startup; the
++# entrypoint copies it before launching any python. mxfp4-configs pin matrix_instr_nonkdim=16
++# for gfx1201 (aiter's gfx1250 bands set 32, which WMMA 16x16x16 cannot lower). See the
++# entrypoint's "runtime overlay" block.
+ 
+ # --- gfx1201 fixes and tuned-kernel patches ---
+ # Each patch edits a vLLM (or aiter/triton) source file in place and checks for source drift before
+@@ -280,10 +290,13 @@ RUN set -eu; cd /opt/patches; \
+              patch_unpad patch_mtp_mm_mask patch_mtp_loopbreak patch_qwen3_toolparse patch_from_json_filter \
+              patch_dynamo_metrics patch_conv1d_blockn patch_r4d patch_dflash_base patch_dflash2 \
+              patch_dflash_fused_kv_fp8 patch_dflash_w4 patch_gdn_metadata \
+-             patch_quark_mxfp4 patch_ar_maxbytes patch_topk_triton_rows patch_qwen3_thinkoff; do \
++             patch_quark_mxfp4 patch_topk_triton_rows patch_qwen3_thinkoff; do \
+       echo "== applying $p =="; python "$p.py"; \
+-    done; \
+-    python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; print('radiance modules parse OK')"
++    done
++    # NOTE: patch_ar_maxbytes is NOT here -- it targets radiance_allreduce.py, which is no longer
++    # baked. The entrypoint overlays radiance_*.py from /patches and runs it there instead.
++    # (radiance_*.py are no longer baked, so there is nothing to parse here; the runtime
++    #  overlay installs them from /patches at container start.)
+ 
+ # --- R4D: the gfx1201 kernel library, cloned and compiled from source ---
+ # One shared object holding every hand-written kernel this image runs: paged attention (prefill and
+@@ -379,7 +392,8 @@ ENV VIRTUAL_ENV=/opt/vllm \
  ENV RADIANCE_USE_R4D=1 \
      RADIANCE_USE_R4D_AR=1 RADIANCE_USE_R4D_AR_QUANT=1 \
      RADIANCE_PRESHUFFLE=1 RADIANCE_FUSE_RMS_QUANT=1 \

@@ -60,32 +60,60 @@ KVU = SP / "vllm" / "v1" / "core" / "kv_cache_utils.py"
 
 print("[radiance] offload eagle-group annotation")
 
-apply(
+# A. Two shapes, because 0.29.0 moved the gate to the caller:
+#   pre-0.29.0 -- the function carries an in-body `model_version == "deepseek_v4"` early
+#     return; drop the gate so the positional rule runs for any draft model.
+#   0.29.0 -- upstream renamed it `_annotate_eagle_groups`, moved the gate to a
+#     `use_deepseek_v4_fallback=` argument, and already calls it on the hybrid
+#     uniform-page-size path; turn the positional fallback on at that call site.
+apply_any(
     KVU,
-    anchor=(
-        "    # Detection uses the merged MLA spec's model_version.\n"
-        "    if not any(\n"
-        '        getattr(spec, "model_version", None) == "deepseek_v4"\n'
-        "        for spec in kv_cache_spec.values()\n"
-        "    ):\n"
-        "        return\n"
-    ),
-    new=(
-        "    # Detection uses the merged MLA spec's model_version.\n"
-        "    # The rule this function applies -- the draft model's attention layer is registered\n"
-        "    # last, so flag whichever group holds the last layer -- is a fact about how vLLM\n"
-        "    # registers a draft model, not anything specific to DeepSeek. Gating it on\n"
-        "    # model_version leaves every other speculative model unannotated, which trips the\n"
-        "    # offload scheduler's flag-them-all fallback. RADIANCE_OFFLOAD_EAGLE_GROUPS=0 restores\n"
-        "    # the DeepSeek-only gate.\n"
-        "    if os.environ.get(\"RADIANCE_OFFLOAD_EAGLE_GROUPS\", \"0\") != \"1\" and not any(\n"
-        '        getattr(spec, "model_version", None) == "deepseek_v4"\n'
-        "        for spec in kv_cache_spec.values()\n"
-        "    ):\n"
-        "        return\n"
-    ),
+    variants=[
+        (
+            "    # Detection uses the merged MLA spec's model_version.\n"
+            "    if not any(\n"
+            '        getattr(spec, "model_version", None) == "deepseek_v4"\n'
+            "        for spec in kv_cache_spec.values()\n"
+            "    ):\n"
+            "        return\n",
+            "    # Detection uses the merged MLA spec's model_version.\n"
+            "    # The rule this function applies -- the draft model's attention layer is registered\n"
+            "    # last, so flag whichever group holds the last layer -- is a fact about how vLLM\n"
+            "    # registers a draft model, not anything specific to DeepSeek. Gating it on\n"
+            "    # model_version leaves every other speculative model unannotated, which trips the\n"
+            "    # offload scheduler's flag-them-all fallback. RADIANCE_OFFLOAD_EAGLE_GROUPS=0 restores\n"
+            "    # the DeepSeek-only gate.\n"
+            "    if os.environ.get(\"RADIANCE_OFFLOAD_EAGLE_GROUPS\", \"0\") != \"1\" and not any(\n"
+            '        getattr(spec, "model_version", None) == "deepseek_v4"\n'
+            "        for spec in kv_cache_spec.values()\n"
+            "    ):\n"
+            "        return\n",
+        ),
+        (
+            "    _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)\n"
+            "    _warn_if_unannotated_eagle_mamba(vllm_config, groups)\n"
+            "    return groups\n",
+            "    # radiance: enable the positional draft-group annotation on the hybrid\n"
+            "    # uniform-page-size path (see patch_offload_eagle_groups.py). Upstream gates\n"
+            "    # the positional rule on the model being DeepSeek-V4; a hybrid Mamba+attention\n"
+            "    # MTP model lands here with nothing annotated, so the offload scheduler flags\n"
+            "    # every group as a draft group. filtered_spec excludes the hidden-state layers\n"
+            "    # that are not in `groups` yet. RADIANCE_OFFLOAD_EAGLE_GROUPS=0 restores the\n"
+            "    # upstream behaviour.\n"
+            "    _annotate_eagle_groups(\n"
+            "        vllm_config,\n"
+            "        filtered_spec,\n"
+            "        groups,\n"
+            "        use_deepseek_v4_fallback=(\n"
+            '            os.environ.get("RADIANCE_OFFLOAD_EAGLE_GROUPS", "0") == "1"\n'
+            "        ),\n"
+            "    )\n"
+            "    _warn_if_unannotated_eagle_mamba(vllm_config, groups)\n"
+            "    return groups\n",
+        ),
+    ],
     sentinel="RADIANCE_OFFLOAD_EAGLE_GROUPS",
-    label="A kv_cache_utils: generalize eagle annotation past the deepseek_v4 gate",
+    label="A kv_cache_utils: enable draft-group annotation past the deepseek_v4 gate",
 )
 
 _ANNOT = (
@@ -98,23 +126,32 @@ _ANNOT = (
     "    _annotate_eagle_groups_deepseek_v4(vllm_config, filtered_spec, groups)\n"
 )
 
-# Two shapes: the shipped tree has already had patch_kv_group_size.py add `, vllm_config`
-# to this call; a tree without that patch still has the single-argument form.
-apply_any(
-    KVU,
-    variants=[
-        (
-            "    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)\n",
-            "    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)\n"
-            + _ANNOT,
-        ),
-        (
-            "    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)\n",
-            "    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)\n" + _ANNOT,
-        ),
-    ],
-    sentinel="_annotate_eagle_groups_deepseek_v4(vllm_config, filtered_spec, groups)",
-    label="B kv_cache_utils: annotate eagle groups on the hybrid page-size path",
-)
+# B. Pre-0.29.0 only. 0.29.0 already calls `_annotate_eagle_groups` on this path (and
+#    gates the positional rule via the flag hunk A sets), so inserting the old symbol
+#    here would only add a NameError. Gate on the old function existing.
+if "def _annotate_eagle_groups_deepseek_v4" in KVU.read_text():
+    # Two shapes: the shipped tree has already had patch_kv_group_size.py add `, vllm_config`
+    # to this call; a tree without that patch still has the single-argument form.
+    apply_any(
+        KVU,
+        variants=[
+            (
+                "    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)\n",
+                "    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)\n"
+                + _ANNOT,
+            ),
+            (
+                "    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)\n",
+                "    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)\n" + _ANNOT,
+            ),
+        ],
+        sentinel="_annotate_eagle_groups_deepseek_v4(vllm_config, filtered_spec, groups)",
+        label="B kv_cache_utils: annotate eagle groups on the hybrid page-size path",
+    )
+else:
+    print(
+        "[radiance] hunk B not needed: this vLLM already calls _annotate_eagle_groups "
+        "on the uniform-page-size path"
+    )
 
 print("[radiance] applied -- with RADIANCE_OFFLOAD_EAGLE_GROUPS=1 expect 'draft attention groups [8]'")

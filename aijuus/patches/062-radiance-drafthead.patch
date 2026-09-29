@@ -1,8 +1,8 @@
 diff --git a/radiance_drafthead.py b/radiance_drafthead.py
-index 2b5a783..c281202 100644
+index 2b5a783..84ea4e7 100644
 --- a/radiance_drafthead.py
 +++ b/radiance_drafthead.py
-@@ -68,6 +68,17 @@ except Exception:                       # pragma: no cover - triton always prese
+@@ -68,6 +68,27 @@ except Exception:                       # pragma: no cover - triton always prese
  #                it exact: on 8192 real draft-head inputs it matches the bf16 argmax on every row.
  FAST = os.environ.get("RADIANCE_FAST_DRAFT", "0") == "1"
  
@@ -17,10 +17,20 @@ index 2b5a783..c281202 100644
 +#                every proposal); only draft depth and acceptance can move.
 +TOP1 = os.environ.get("RADIANCE_DRAFT_HEAD_TOP1", "0") == "1"
 +
++# --- local (2026-09-29): pruned DRAFT vocabulary (port of the R9700 branch, REVIEW-LOG §2) --------
++# RADIANCE_DRAFT_VOCAB=<file, one token id per line>: the int2 head scores ONLY those rows -- the
++# coarse pass is run on the index_selected sub-matrix (~1/5 the reads for a 49k list) and every
++# other entry of the returned row is -inf. Drafter-side only: the target verifies with its own
++# head, so the OUTPUT cannot change; only acceptance/speed can. Unset (default): nothing changes.
++# RADIANCE_DRAFT_EXACTSET=1: only the exactly-reranked candidates stay eligible (the rest of the row
++# is -inf), so a SAMPLED draft cannot pick a coarse 2-bit entry. Lossless; argmax unaffected.
++VOCAB_FILE = os.environ.get("RADIANCE_DRAFT_VOCAB", "")
++EXACT_SET = os.environ.get("RADIANCE_DRAFT_EXACTSET", "0") == "1"
++
  GROUP = 128        # weight-quantisation group along K; also the kernel's BLOCK_K
  BLOCK_N = 64       # do_bench optimum, and the width of one block-max entry
  BITS = 2
-@@ -163,6 +174,47 @@ if triton is not None:
+@@ -163,6 +184,47 @@ if triton is not None:
                   mask=mask_n[None, :])
          _emit(acc, mask_n, BM, BI, offs_m, pid, NBLK, KC, BLOCK_N)
  
@@ -68,7 +78,7 @@ index 2b5a783..c281202 100644
      @triton.jit
      def _rerank_exact(X, W, S, IDX, OUT, K: tl.constexpr, stride_w, R: tl.constexpr,
                        BLOCK_K: tl.constexpr, FP8: tl.constexpr):
-@@ -228,6 +280,18 @@ def _pow2_at_least(m):
+@@ -228,6 +290,18 @@ def _pow2_at_least(m):
  
  def _apply_head_int2(self, lm_head, hidden_states, embedding_bias):
      """Drop-in for LogitsProcessor._apply_head against the quantised draft head."""
@@ -87,7 +97,7 @@ index 2b5a783..c281202 100644
      x = hidden_states.reshape(-1, hidden_states.shape[-1])
      m, k = x.shape
      M = _pow2_at_least(m)
-@@ -254,10 +318,10 @@ def _apply_head_int2(self, lm_head, hidden_states, embedding_bias):
+@@ -254,10 +328,10 @@ def _apply_head_int2(self, lm_head, hidden_states, embedding_bias):
          ex = torch.empty(M, RERANK, dtype=torch.float32, device=x.device)
          if wsc is not None:
              _rerank_exact[(M, RERANK)](x, w.view(torch.uint8), wsc, idx, ex, k, w.stride(0),
@@ -100,7 +110,7 @@ index 2b5a783..c281202 100644
          if getattr(self, "_radiance_topk_only", False):
              # A top-k caller ranks the whole row against itself, so the ~124k entries the rerank
              # did NOT touch are still coarse 2-bit values competing with exact ones -- and a
-@@ -285,6 +349,94 @@ def _apply_head_int2(self, lm_head, hidden_states, embedding_bias):
+@@ -285,6 +359,97 @@ def _apply_head_int2(self, lm_head, hidden_states, embedding_bias):
      return y.reshape(*hidden_states.shape[:-1], -1)
  
  
@@ -166,13 +176,16 @@ index 2b5a783..c281202 100644
 +        S = (sm * torch.exp(blockmax - Mrow.unsqueeze(1))).sum(dim=1)
 +        max_ex = ex_masked.max(dim=1).values
 +        conf = torch.exp(max_ex - Mrow) / S
-+    elif not self._radiance_warned:
-+        # Without the exact weight the coarse pass stands on its own
-+        self._radiance_warned = True
-+        sys.stderr.write(f"[radiance] INT{BITS}_DRAFT_HEAD: no bf16 lm_head to rerank against "
-+                         f"({None if w is None else (tuple(w.shape), w.dtype)}); "
-+                         "running the coarse 2-bit head unreranked\n")
-+        sys.stderr.flush()
++    else:
++        # Without the exact weight the coarse pass stands on its own. The warn line is emitted
++        # once, but the coarse ids/conf MUST be recomputed on every call: _radiance_warned stays
++        # True after the first, and returning unbound locals would raise UnboundLocalError.
++        if not self._radiance_warned:
++            self._radiance_warned = True
++            sys.stderr.write(f"[radiance] INT{BITS}_DRAFT_HEAD: no bf16 lm_head to rerank against "
++                             f"({None if w is None else (tuple(w.shape), w.dtype)}); "
++                             "running the coarse 2-bit head unreranked\n")
++            sys.stderr.flush()
 +        # Fall back to coarse argmax
 +        npad = getattr(getattr(lm_head, "shard_indices", None), "num_org_vocab_padding", 0) or 0
 +        valid = bi < (n - npad)
@@ -195,3 +208,81 @@ index 2b5a783..c281202 100644
  def _apply_head_lazy(self, lm_head, hidden_states, embedding_bias):
      """First real call quantises, then hands over to the quantised path for good.
  
+@@ -302,6 +467,45 @@ def _apply_head_lazy(self, lm_head, hidden_states, embedding_bias):
+     return self._apply_head(lm_head, hidden_states, embedding_bias)
+ 
+ 
++class _SubHead:
++    """Kept rows, in the shape _head_matrix reads: .weight [n_sub, K] (+ optional .weight_scale)."""
++
++    def __init__(self, weight, weight_scale=None):
++        self.weight = weight
++        if weight_scale is not None:
++            self.weight_scale = weight_scale
++
++
++def _apply_head_vocab(self, lm_head, hidden_states, embedding_bias):
++    """RADIANCE_DRAFT_VOCAB: build the sub-head once, then score only its rows.
++
++    The sub-matrix is index_selected from the SAME lm_head the full head would use, quantised by
++    _quantize_head_now, and the returned row is expanded to the full vocabulary with -inf outside
++    the kept ids. Drafter-side only -- the target still verifies with its own head. Port of the
++    R9700 branch's _apply_head_vocab (REVIEW-LOG §2).
++    """
++    sub = getattr(self, "_dv_sub", None)
++    if sub is None:
++        rows, rsc = _head_matrix(lm_head)
++        if rows is None or _head_is_empty(rows, rsc):
++            return type(self)._apply_head(self, lm_head, hidden_states, embedding_bias)
++        ids = self._dv_ids.to(rows.device)
++        w_sub = rows.index_select(0, ids).contiguous()
++        s_sub = rsc.index_select(0, ids).reshape(-1, 1).contiguous() if rsc is not None else None
++        sub = _SubHead(w_sub, s_sub)
++        status = _quantize_head_now(self, sub)   # rebinds _apply_head to the int2 path; take it back
++        self._apply_head = types.MethodType(_apply_head_vocab, self)
++        self._dv_sub, self._dv_ids_dev, self._dv_nfull = sub, ids, rows.shape[0]
++        sys.stderr.write(f"[radiance] DRAFT_VOCAB: {ids.numel()} of {rows.shape[0]} rows -> {status}\n")
++        sys.stderr.flush()
++    eb = embedding_bias.index_select(0, self._dv_ids_dev) if embedding_bias is not None else None
++    y_sub = _apply_head_int2(self, sub, hidden_states, eb)
++    y = torch.full((*y_sub.shape[:-1], self._dv_nfull), float("-inf"),
++                   dtype=y_sub.dtype, device=y_sub.device)
++    y[..., self._dv_ids_dev] = y_sub
++    return y
++
++
+ def _quantize_draft_head(mtp, lp_attr="logits_processor"):
+     """Quantise the head a drafter scores with, and rebind that LogitsProcessor's _apply_head.
+ 
+@@ -320,7 +524,30 @@ def _quantize_draft_head(mtp, lp_attr="logits_processor"):
+     if rows is None or w.dim() != 2 or \
+             (rsc is None and w.dtype not in (torch.bfloat16, torch.float16, torch.float32)):
+         return f"unsupported draft-head weight {tuple(w.shape)} {w.dtype}"
+-    lp._radiance_topk_only = lp_attr == "candidate_logits_processor"
++    lp._radiance_topk_only = (lp_attr == "candidate_logits_processor") or EXACT_SET
++    # RADIANCE_DRAFT_VOCAB: score only the kept rows. Built lazily on the first real call (the
++    # tensor is only guaranteed populated then), exactly like the lazy full-head path below.
++    if VOCAB_FILE:
++        if TOP1:
++            return "DRAFT_VOCAB set but RADIANCE_DRAFT_HEAD_TOP1=1 (fused top-1 returns ids/conf); vocab needs it off -- full head kept"
++        try:
++            ids = sorted({int(t) for t in open(VOCAB_FILE).read().split()})
++        except Exception as e:
++            return f"DRAFT_VOCAB unreadable ({e!r}); full head kept"
++        if not ids:
++            return "DRAFT_VOCAB empty; full head kept"
++        bad = [i for i in ids if i < 0 or i >= rows.shape[0]]
++        if bad:
++            return f"DRAFT_VOCAB has {len(bad)} ids outside [0,{rows.shape[0]}); full head kept"
++        nblk_sub = (len(ids) + BLOCK_N - 1) // BLOCK_N
++        if nblk_sub * KCAND < RERANK:
++            return (f"DRAFT_VOCAB too small ({len(ids)} ids -> {nblk_sub * KCAND} candidates "
++                    f"< RERANK {RERANK}); full head kept")
++        lp._dv_ids = torch.tensor(ids, dtype=torch.long)
++        lp._dv_sub = None
++        lp._apply_head = types.MethodType(_apply_head_vocab, lp)
++        return (f"DRAFT_VOCAB: {len(ids)} of {rows.shape[0]} rows (EXACTSET={EXACT_SET}); "
++                f"quantised on first call")
+     # A drafter whose checkpoint carries no lm_head (DFlash2) gets the target's tensor shared in
+     # AFTER load_weights returns, so at this point the parameter is not yet the weight we want.
+     # Quantising it yields a garbage head, and the failure is silent and total: the serve comes up,

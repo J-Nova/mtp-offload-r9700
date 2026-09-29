@@ -165,10 +165,39 @@ echo "[run] TP=1 shape: seqs=$SEQS maxlen=$MLEN chunk=$CHUNK kv=${KMEM:-none}($K
 
 SP=/opt/vllm/lib/python3.12/site-packages
 cd /patches
+
+# ---- runtime overlay: Radiance/AIJUUS source + configs come from the repo bind, NOT the image ----
+# The release image bakes only infrastructure (ROCm, the torch/triton/vLLM venv, the patched vLLM
+# source, r4d.so, radiance_mxfp4_fp8.so). Everything under this banner is copied into
+# site-packages here so any Radiance/AIJUUS source file can be iterated without a rebuild.
+# This MUST run before any python below: radiance_amdsmi.pth has to initialise amdsmi ahead of HIP
+# at interpreter startup, and radiance_kernels is imported by vLLM's plugin loader
+# (vllm/plugins/__init__.py -> radiance_kernels.install_all()). The fork-local hooks there
+# (_install_token_collector, _install_draft_w4) are env-gated, so a plain run is unchanged.
+mkdir -p "$SP"/aijuus "$SP"/vllm/model_executor/kernels \
+         "$SP"/vllm/model_executor/layers/quantization/utils/configs \
+         "$SP"/vllm/model_executor/layers/fused_moe/configs \
+         "$SP"/aiter/ops/triton/configs/gemm
+cp radiance_*.py "$SP"/
+cp radiance_amdsmi.pth "$SP"/
+# Optional AIJUUS overlay modules: warn (do not abort the boot under `set -e`) when a file is
+# absent, so a deploy from a tree that lacks an optional module still starts.
+for f in aijuus/__init__.py aijuus/collect_tokens.py aijuus/qwen3_5_mtp_w4.py; do
+  if [ -f "$f" ]; then cp "$f" "$SP"/aijuus/; else echo "[run] WARN: overlay file missing: $f"; fi
+done
+if [ -f aijuus/draft_w4_lmhead.py ]; then cp aijuus/draft_w4_lmhead.py "$SP"/vllm/model_executor/kernels/draft_w4_lmhead.py; else echo "[run] WARN: overlay file missing: aijuus/draft_w4_lmhead.py"; fi
+if [ -f aijuus/r4d_lib.py ]; then cp aijuus/r4d_lib.py "$SP"/r4d_lib.py; else echo "[run] WARN: overlay file missing: aijuus/r4d_lib.py"; fi
+cp radiance_preamble.py /opt/radiance_preamble.py
+cp fp8-configs/* "$SP"/vllm/model_executor/layers/quantization/utils/configs/ 2>/dev/null || true
+cp moe-configs/* "$SP"/vllm/model_executor/layers/fused_moe/configs/ 2>/dev/null || true
+cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/ 2>/dev/null || true
+echo "[run] runtime overlay installed from /patches (radiance_*.py + aijuus/ + configs)"
+
 python3 patch_quark_mxfp4.py
 python3 patch_nvfp4_mxfp4.py
 python3 patch_tp3_pad.py
 python3 patch_ar_maxbytes.py
+python3 patch_aot_envkey.py || echo "[run] WARN: patch_aot_envkey.py missing/failed; AOT env-key gate not applied"
 python3 patch_topk_triton_rows.py
 python3 patch_dflash_calib.py
 python3 patch_dflash_mxfp4_kv.py
@@ -192,9 +221,10 @@ python3 patch_qwen3_thinkoff.py || echo "[radiance] WARNING: thinkoff patch did 
 # ---- KV offload patches (mirror serve-mxfp4.sh). All inert unless KV_OFFLOAD_GIB
 # turns the OffloadingConnector on; they are what make the CPU/fs tiers correct.
 bash aijuus/kv-offload/ops/apply-kv-patches.sh
-cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
-cp radiance_preamble.py /opt/radiance_preamble.py
-cp radiance_nvfp4.py radiance_mxfp4.py radiance_gdn.py radiance_gdn_lazy.py radiance_rmsquant.py radiance_drafthead.py radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py radiance_topk.py radiance_arnq.py radiance_tp3pad.py "$SP"/
+
+# (radiance modules, aijuus/, and the configs were already overlaid near the top, before the
+#  patch scripts, so the amdsmi .pth is active for every python process. Nothing to copy here.)
+
 hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $([ "${MXFP4_CUMODE:-0}" = 1 ] && echo -mcumode) $(python3 -m pybind11 --includes) radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
 if [ -n "${R4D_SO:-}" ] && [ -f /r4d/r4d.so ]; then
   cp /r4d/r4d.so "$SP"/r4d.so

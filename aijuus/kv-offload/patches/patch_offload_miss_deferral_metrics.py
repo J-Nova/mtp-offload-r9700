@@ -74,7 +74,7 @@ from pathlib import Path
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from _patchlib import apply
+from _patchlib import apply, apply_any
 
 SP = Path(sysconfig.get_paths()["purelib"])
 OFF_SCHED = (
@@ -121,17 +121,12 @@ apply(
 #    so they sit beside their siblings and are independent of the bundle's
 #    tail-of-dict insertions.
 # ---------------------------------------------------------------------------
-apply(
-    OFF_METRICS,
-    """        _ConnectorMetricName.LOOKUP_SERVED_TOKENS: OffloadingCounterMetadata(
+_SERVED_TOKENS_DEF = '''        _ConnectorMetricName.LOOKUP_SERVED_TOKENS: OffloadingCounterMetadata(
             documentation="Tokens returned by successful offload lookups.",
         ),
-        # radiance tier-report: everything below carries a `tier` label so one
-""",
-    """        _ConnectorMetricName.LOOKUP_SERVED_TOKENS: OffloadingCounterMetadata(
-            documentation="Tokens returned by successful offload lookups.",
-        ),
-        # radiance deferral-outcomes (task 50/32): what happened AFTER a lookup
+'''
+
+_DEFERRAL_DEFS = _SERVED_TOKENS_DEF + '''        # radiance deferral-outcomes (task 50/32): what happened AFTER a lookup
         # deferred. served + gave_up + unresolved = deferral_total. The
         # transfer_jobs counter is the one lookup-path exit that records no
         # outcome counter at all (it returns before _lookup()); it is a WAIT,
@@ -184,10 +179,24 @@ apply(
                 )
             )
         ),
-        # radiance tier-report: everything below carries a `tier` label so one
-""",
-    "LOOKUP_DEFERRAL_TOTAL: OffloadingCounterMetadata(",
-    "2  offloading/metrics.py: deferral-outcome definitions",
+'''
+
+# The old anchor carried a trailing tier-report comment line that only exists
+# after the tier-report bundle ran; 0.29.0 skips that bundle (upstream native
+# metrics), so match the definition without the comment too.
+apply_any(
+    OFF_METRICS,
+    variants=[
+        (
+            _SERVED_TOKENS_DEF
+            + "        # radiance tier-report: everything below carries a `tier` label so one\n",
+            _DEFERRAL_DEFS
+            + "        # radiance tier-report: everything below carries a `tier` label so one\n",
+        ),
+        (_SERVED_TOKENS_DEF, _DEFERRAL_DEFS),
+    ],
+    sentinel="LOOKUP_DEFERRAL_TOTAL: OffloadingCounterMetadata(",
+    label="2  offloading/metrics.py: deferral-outcome definitions",
 )
 
 # ---------------------------------------------------------------------------
