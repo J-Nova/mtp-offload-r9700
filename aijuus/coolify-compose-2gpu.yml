@@ -141,7 +141,7 @@ services:
       - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-12}
       # DAVETHA_DRAFTER_QUANT: int4 group-128 draft lm_head via libr4d r4d_gemm_w4a16_nt_m64.
       # 0 = disabled (uses radiance_drafthead 2-bit), 1 = enabled. Measured +4..+8% tok/s net.
-      - DAVETHA_DRAFTER_QUANT=${DAVETHA_DRAFTER_QUANT:-0}
+      - DAVETHA_DRAFTER_QUANT=${DAVETHA_DRAFTER_QUANT:-1}
       # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
       # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
       # (Adaptive Replacement Cache) balances recency + frequency, which can lift the
@@ -352,7 +352,7 @@ services:
       - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-12}
       # DAVETHA_DRAFTER_QUANT: int4 group-128 draft lm_head via libr4d r4d_gemm_w4a16_nt_m64.
       # 0 = disabled (uses radiance_drafthead 2-bit), 1 = enabled. Measured +4..+8% tok/s net.
-      - DAVETHA_DRAFTER_QUANT=${DAVETHA_DRAFTER_QUANT:-0}
+      - DAVETHA_DRAFTER_QUANT=${DAVETHA_DRAFTER_QUANT:-1}
       # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
       # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
       # (Adaptive Replacement Cache) balances recency + frequency, which can lift the

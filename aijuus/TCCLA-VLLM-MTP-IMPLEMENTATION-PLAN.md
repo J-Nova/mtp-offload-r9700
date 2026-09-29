@@ -394,6 +394,12 @@ variable at a time.
 (lossless head surface), Phase 2.1 no-calibration, Phase 3.1 TunableOp table — all proven
 lossless/byte-exact and complementary, so gating them behind an A/B only wastes wall-clock.
 
+### Battery results (log)
+- **B1 SPEC depth**: SPEC 4 **worse** than 8 on our workload (greedy 86.5 vs 88.1, sampled 77.6 vs
+  80.2 t/s; acceptance length ~3 vs ~5-6). Kept `spec_tokens=8`.
+- **B2 W4 head**: armed (`DAVETHA_DRAFTER_QUANT=1`), pending measurement vs the SPEC-8 int2 baseline.
+- B3/B4: pending.
+
 ### How to run an arm
 One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the
 Coolify UI env), redeploy, then measure with the same harness:

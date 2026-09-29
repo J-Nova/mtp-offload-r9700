@@ -6,7 +6,20 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
-## 2026-09-29 (cont. 2) — Phase 1.0 FUSED ported+validated; Phase 3.1 verified
+## 2026-09-29 (cont. 3) — A/B battery: B1 result, B2 armed
+
+### B1 (SPEC depth) — RESULT: SPEC 8 wins
+SPEC 4 (`spec_tokens=4`, redeployed): greedy mean 86.5, sampled mean 77.6 t/s vs the SPEC 8
+baseline greedy 88.1 / sampled 80.2. Acceptance length dropped to ~2.8-3.4. **Reverted to
+spec_tokens=8.** The branch's "SPEC 4 best under sampling" does not transfer to our workload/hw.
+
+### B2 (head) — ARMED
+`DAVETHA_DRAFTER_QUANT=1` set for both services (compose default). This runs the reduced-vocab W4
+draft head (`Qwen3_5MTPW4`) instead of the int2+vocab head; will be measured against the recorded
+SPEC-8 int2 baseline (greedy ~88, sampled ~80). Revert to 0 to switch back.
+
+---
+
 
 ### Deploy verification (redeploy)
 - `[radiance] using patched r4d.so from /home/juup/.cache/radiance-libr4d/v0.5.0-w4a16`;
