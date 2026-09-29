@@ -420,6 +420,10 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   **Baseline (DRY off, 2026-09-29)**: loop-phrase rep 0.523 / 217 tok / stop; loop-sentence rep 0.941
   / 176 tok (degen); loop-count rep 0.047 / 509 tok; normal-code rep 0.431; normal-prose rep 0.341;
   t/s greedy 87.6 / sampled 90.3. Probe: repeat inducing prompts + t/s (see WORKLOG).
+  **ARM RESULT (DRY 0.8, range 2048) — NOT ADOPTED.** Quality is marginal (loop-phrase rep 0.523 →
+  0.451, but loop-count 0.047 → 0.105 and normal-code 0.431 → 0.511; the forced loop is already
+  caught by degen either way) and **sampled t/s regressed 90.3 → 76-83** (DRY adds per-step work on
+  the rejection-sampler path). Revert: clear `RADIANCE_DRY_MULTIPLIER`/`RADIANCE_DRY_RANGE`.
 - B3/B4: pending (B4 AITER neutral → reverted).
 
 ### Remaining work status (2026-09-29)

@@ -6,6 +6,21 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 15) — DRY A/B: marginal quality, sampled t/s regression -> NOT adopted
+
+- Arm `RADIANCE_DRY_MULTIPLIER=0.8` + `RADIANCE_DRY_RANGE=2048` (boot: `[run] DRY enabled:
+  --dry-multiplier 0.8 --dry-range 2048`).
+- Quality vs baseline (rep = 1 - unique/total words): loop-phrase 0.523 → 0.451 (better);
+  loop-count 0.047 → 0.105; loop-sentence 0.941 → 0.941 (degen fires either way); normal-code
+  0.431 → 0.511; normal-prose 0.341 → 0.333. Only the forced phrase loop clearly improved.
+- t/s: greedy 87.6 → 91.4-91.6; **sampled 90.3 → 76.3-83.4** (consistent regression across runs;
+  DRY adds per-step work in the rejection-sampler path). Acceptance healthy (~54%).
+- **Verdict: not adopted** — no clear quality win, degen already covers pathological loops, and
+  sampled throughput regressed. Revert: clear `RADIANCE_DRY_MULTIPLIER`/`RADIANCE_DRY_RANGE`.
+- The DRY code/port stays in the tree (default-off, selectable) — only the env is cleared.
+
+---
+
 ## 2026-09-29 (cont. 14) — DRY (4.1) ported and validated
 
 - Added `patch_dry.py` (repo root): runtime overlay porting tcclaviger's `patches/dry_sampler` onto
