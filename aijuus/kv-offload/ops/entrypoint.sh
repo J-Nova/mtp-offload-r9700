@@ -205,6 +205,7 @@ python3 patch_nvfp4_mxfp4.py
 python3 patch_tp3_pad.py
 python3 patch_ar_maxbytes.py
 python3 patch_aot_envkey.py || echo "[run] WARN: patch_aot_envkey.py missing/failed; AOT env-key gate not applied"
+python3 patch_degen.py || echo "[run] WARN: patch_degen failed; server-wide degen detection not applied"
 python3 patch_topk_triton_rows.py
 python3 patch_dflash_calib.py
 python3 patch_dflash_mxfp4_kv.py

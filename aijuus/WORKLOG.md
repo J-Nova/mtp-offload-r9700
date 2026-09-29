@@ -6,6 +6,22 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 9) — Degen (4.2) ported, tested, wired
+
+- Added `patch_degen.py` (repo root): runtime overlay porting tcclaviger's `patches/degen_detect`
+  onto our vLLM 0.29.0 — `DegenParams` + `check_degeneration` in `v1/core/sched/utils.py`,
+  `check_stop(..., degen_params)`, scheduler hook, `SchedulerConfig` fields, `EngineArgs`/CLI
+  `--degen-*`, `Request.degen_counter`. All-or-nothing buffered edits, idempotent markers,
+  `RADIANCE_LOCAL_DEGEN=0` disables.
+- Wired into the entrypoint (`python3 patch_degen.py`, warn-and-continue).
+- **Tested in-container**: patch applies, all modules import, `check_stop` signature updated,
+  `SchedulerConfig`/`EngineArgs` defaults 100/6/128; detector fires on a period-1 run at ~129
+  tokens, period-4 at ~132, never on a non-periodic sequence. Enabled by default (tcclaviger
+  defaults); `--degen-max-period 0` disables.
+- **4.1 DRY** remains staged (refs complete); not rushed into the production sampler.
+
+---
+
 ## 2026-09-29 (cont. 8) — B4 neutral; wvSplitK already upstream; DRY/degen refs complete; ROCm 10 dug in
 
 - **B4 (AITER off)**: greedy 92.1 / sampled 87.4 vs the 3.3 baseline 92.4 / 88.1 → **neutral** (within

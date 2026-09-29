@@ -421,13 +421,13 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   purpose-built R4D attention → low expected value; optional attention-backend A/B.
 - **B3 MXFP4+GPTQ drafter**: NOT pursued — needs the R9700 branch's paroquant plugin + a GPTQ
   calibration `.pt`; overlaps the W4 head we dropped.
-- **4.1 DRY / 4.2 degen**: **reference EXTRACTED** from the now-public `tcclaviger/vllm:29.05.12`
-  image (which is vLLM `0.29.0.dev0+g2bdbbc8080`, ~our 0.29.0). Stored in
-  `aijuus/refs/tcclaviger-vllm-29.05.12/`. Port scope: new `vllm/v1/sample/ops/dry.py` (391 lines) +
-  ~200 changed lines across `sampling_params.py`, `v1/sample/{ops/penalties,sampler,metadata,rejection_sampler}.py`,
-  `v1/core/sched/{utils,scheduler}.py`, `entrypoints/cli/serve.py`, `v1/engine/input_processor.py`,
-  `v1/worker/gpu_input_batch.py`, `v1/request.py`. Deferred to a dedicated port task (multi-file
-  vLLM patch; quality-only, not throughput).
+- **4.2 degen**: **DONE (2026-09-29)** — `patch_degen.py` (runtime overlay, wired into the
+  entrypoint; defaults `max_period 100 / min_repeats 6 / min_span 128`, `--degen-max-period 0`
+  disables). Validated: fires on a period-1 run at ~129 tokens, period-4 at ~132, never on a
+  non-periodic sequence; finishes with `finish_reason "repetition"`.
+- **4.1 DRY**: reference complete in `aijuus/refs/tcclaviger-vllm-29.05.12/`; port staged. Touches
+  sampler/rejection-sampler math across ~8 files with interleaved fork-local changes; deferred to a
+  dedicated pass rather than rushed into the production sampler.
 - **5.1 tcclaviger repos**: DONE — public radiance repo cloned; the current "davetha" path is the
   DFlash2 drafter int4 projections under `RADIANCE_FAST_DRAFT`, not the MTP quant we removed.
 - **5.2 ROCm 10**: RESEARCHED — see below; deferred as a major upgrade.
