@@ -478,7 +478,9 @@ against our tree:
    deeper 0.20 is the right value here (tcclaviger's +5.3% was vs *their* 0.35 baseline, not ours).
 2. **`RADIANCE_SKINNY_GEMM=all`**: adds the ULP-level shapes (notably GDN `in_proj_ba`, 48x/step,
    28.5→3.6us) — **+3.5% tokens/s** in their DFlash2 case, no acceptance cost, but a bf16-ULP
-   change can move acceptance under spec decode. **ARMED** (next redeploy) vs the 0.20 baseline.
+   change can move acceptance under spec decode. **RESULT: REGRESSED on our MTP — greedy 92.6 (flat)
+   but sampled 84.5 vs 88.1, acceptance down to 27-40% (mean accept ~3.2-4.2 vs ~5-6). Reverted to
+   `1`.** The ULP-level shapes hurt MTP drafting acceptance here.
 
 ### How to run an arm
 One variable at a time. Each arm = change one env knob in `coolify-compose-2gpu.yml` (or the

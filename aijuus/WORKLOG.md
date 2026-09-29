@@ -6,6 +6,16 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 12) — SKINNY=all regressed (reverted); both tcclaviger tuning levers were worse
+
+- **`RADIANCE_SKINNY_GEMM=all`**: greedy 92.6 (flat) but sampled **84.5** vs baseline 88.1;
+  acceptance fell to 27-40% (mean accept ~3.2-4.2 vs ~5-6). **Reverted to `1`.** The bf16-ULP
+  shapes hurt MTP drafting acceptance on our workload.
+- Both tcclaviger tuning suggestions (TAU 0.28, SKINNY=all) are **worse** for our MTP config →
+  our existing tuning (TAU 0.20, SKINNY=1, captures ladder) stands.
+
+---
+
 ## 2026-09-29 (cont. 11) — Degen live; TAU 0.28 worse (kept 0.20); SKINNY=all armed
 
 - Redeploy confirmed `[patch_degen] applied` and the banner shows `RADIANCE_DRAFT_TAU = 0.28`.
