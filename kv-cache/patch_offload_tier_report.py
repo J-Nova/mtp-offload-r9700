@@ -147,6 +147,8 @@ means that assertion cannot be tripped by running a spec we did not think of.
 import sysconfig
 from pathlib import Path
 
+import sys
+
 from _patchlib import apply
 
 SP = Path(sysconfig.get_paths()["purelib"])
@@ -160,6 +162,16 @@ CONN = SP / "vllm/distributed/kv_transfer/kv_connector/v1/offloading"
 CONN_METRICS = CONN / "metrics.py"
 CONN_COMMON = CONN / "common.py"
 CONN_SCHEDULER = CONN / "scheduler.py"
+
+# 0.29.0's TieringMetricsTracker already emits per-tier BLOCK_QUERIES/BLOCK_HITS,
+# LOOKUP_SYNC/ASYNC_DELAY histograms, READ/WRITE bytes+time per job, and
+# active-job/usage gauges, superseding the tier-report set below.
+if TIERING_MANAGER.exists() and "TieringMetricsTracker" in TIERING_MANAGER.read_text():
+    print(
+        "[radiance] tier-report skipped: this vLLM's TieringMetricsTracker already "
+        "emits per-tier hit/lookup/transfer metrics (upstream supersedes this patch)"
+    )
+    sys.exit(0)
 
 print("radiance: KV offload tier-report instrumentation")
 

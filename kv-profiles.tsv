@@ -19,6 +19,11 @@
 # capture sizes and the activation peak; CHUNK changes the prefill transient directly.
 #
 # sig                 maxseqs chunk   maxlen  spec    bytes           note
+# A pin is only valid at the speculative DEPTH it was measured at (SPEC moves the cudagraph capture
+# set and the decode band). New rows carry `spec` as `method:depth` (e.g. dflash:7, mtp:8); the bare
+# `method` rows below predate the depth field and are still read for dflash, but a bare `mtp` row is
+# deliberately NOT accepted, so an mtp pin measured before the default moved to 8 falls back to
+# vLLM profiling instead of being reused at the wrong depth.
 2x7551-32624	8	8192	262144	dflash	18563072000	2x R9700 32 GiB, gfx1201; 943,581 KV tokens vs 892,799 profiled (+5.7%); survives a full 260k prefill sweep
 1x7551-32624	8	4096	65536	dflash	6535819798	1x R9700 32 GiB, gfx1201, TP=1 single-GPU profile; measured 2026-09-16 on the NVFP4 checkpoint (the largest footprint served: bf16 lm_head) from a pinned start (its profile run cannot reach the minimum); 7.00 GiB served 161,057 tokens, 7.60 OOM, backed off one step; ~140k KV tokens at the pin
 1x7551-32624	3	2560	220000	dflash	9126805504	1x R9700 32 GiB, gfx1201, TP=1 long-context shape; ~220k KV tokens. REPORTED by a user at these settings, NOT measured here by calibrate-kv.sh -- unlike every other row in this file. Consistent with the 65536 row's 40.6 KB/token (9.13 GB / 40.6 KB = 225k), and the smaller batch (seqs 8->3, chunk 4096->2560) genuinely frees the extra memory, so it is a new key rather than an inflated one. Re-measure with calibrate-kv.sh before trusting it on other hardware.

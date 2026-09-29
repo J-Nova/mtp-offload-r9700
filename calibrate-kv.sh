@@ -73,6 +73,14 @@ MAXLEN=${MAXLEN:-262144}
 # search still works from a pin that is known to serve -- pass 2 raises it from there.
 KV_START=${KV_START:-}
 SPEC_METHOD=${SPEC_METHOD:-dflash}
+# A pin is only valid at the depth it was measured at, so the key carries method:depth. Derive the
+# same per-method default as serve-mxfp4.sh and require an integer before it reaches arithmetic.
+if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-7};
+elif [ "$SPEC_METHOD" = none ]; then SPEC=${SPEC:-0};
+else SPEC=${SPEC:-8}; fi
+case "$SPEC" in ''|*[!0-9]*) echo "calibrate-kv: SPEC must be a non-negative integer (got '$SPEC')" >&2; exit 1 ;;
+esac
+SPEC_KEY="$SPEC_METHOD:$SPEC"
 GPU_UTIL=${GPU_UTIL:-0.98}
 NAME=${NAME:-vllmkvcal}
 
@@ -88,9 +96,9 @@ BACKOFF_STEPS=${BACKOFF_STEPS:-1}
 LOCAL_TABLE=${KV_TABLE_LOCAL:-${XDG_CACHE_HOME:-$HOME/.cache}/radiance-mxfp4/kv-profiles.local.tsv}
 
 say "hardware:  $RAD_GPU_COUNT x $RAD_GPU_NAME ($RAD_GPU_MIB MiB), tp=$RAD_TP, sig=$RAD_GPU_SIG"
-say "shape:     maxseqs=$MAXSEQS chunk=$CHUNK maxlen=$MAXLEN spec=$SPEC_METHOD util=$GPU_UTIL"
+say "shape:     maxseqs=$MAXSEQS chunk=$CHUNK maxlen=$MAXLEN spec=$SPEC_KEY util=$GPU_UTIL"
 say "table:     $LOCAL_TABLE"
-existing=$(rad_kv_lookup "$RAD_GPU_SIG" "$MAXSEQS" "$CHUNK" "$MAXLEN" "$SPEC_METHOD")
+existing=$(rad_kv_lookup "$RAD_GPU_SIG" "$MAXSEQS" "$CHUNK" "$MAXLEN" "$SPEC_METHOD" "$SPEC")
 if [ -n "$existing" ]; then
   say "note:      a pin already resolves for this key ($existing bytes). The measurement below"
   say "           is written to the local table, which is read last, so it shadows that row"
@@ -235,14 +243,15 @@ if [ ! -s "$LOCAL_TABLE" ]; then
 # Delete a row to go back to profiling for that key. Re-run calibrate-kv.sh after changing
 # MAXSEQS or CHUNK: a pin is only valid for the batch shape it was measured at.
 # sig	maxseqs	chunk	maxlen	spec	bytes	note
+# `spec` is `method:depth` (e.g. dflash:7, mtp:8): a pin is only valid at the depth it was measured at.
 HDR
 fi
 # Drop any previous row for this key before appending, so the table does not grow a history that
 # rad_kv_lookup would then resolve by "last one wins" rather than by "most recent measurement".
 tmp=$(mktemp)
-awk -F'\t' -v s="$RAD_GPU_SIG" -v q="$MAXSEQS" -v c="$CHUNK" -v l="$MAXLEN" -v m="$SPEC_METHOD" \
-  '$1 ~ /^#/ || !($1==s && $2==q && $3==c && $4==l && $5==m)' "$LOCAL_TABLE" > "$tmp"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RAD_GPU_SIG" "$MAXSEQS" "$CHUNK" "$MAXLEN" "$SPEC_METHOD" \
+awk -F'\t' -v s="$RAD_GPU_SIG" -v q="$MAXSEQS" -v c="$CHUNK" -v l="$MAXLEN" -v m="$SPEC_METHOD" -v d="$SPEC" \
+  '$1 ~ /^#/ || !($1==s && $2==q && $3==c && $4==l && ($5==(m ":" d) || $5==m))' "$LOCAL_TABLE" > "$tmp"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RAD_GPU_SIG" "$MAXSEQS" "$CHUNK" "$MAXLEN" "$SPEC_KEY" \
   "$best" "measured $(date +%Y-%m-%d) by calibrate-kv.sh; ${best_toks} KV tokens, +${gain}% over profiled" >> "$tmp"
 mv "$tmp" "$LOCAL_TABLE"
 

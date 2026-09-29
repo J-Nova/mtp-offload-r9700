@@ -92,7 +92,7 @@ def ask(messages, tag, salt, max_tokens):
                "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(BASE + "/v1/chat/completions",
                                  data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=T.auth_headers({"Content-Type": "application/json"}))
     t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=T.PER_REQ_TIMEOUT) as r:

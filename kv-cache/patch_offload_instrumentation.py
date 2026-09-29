@@ -49,7 +49,7 @@ in the metrics path.
 import sysconfig
 from pathlib import Path
 
-from _patchlib import apply
+from _patchlib import apply, apply_any
 
 SP = Path(sysconfig.get_paths()["purelib"])
 
@@ -75,9 +75,14 @@ _WIDE = """                    5,
                 ),"""
 
 # --- hunk 1: tiering LOOKUP_ASYNC_DELAY buckets --------------------------------------
-apply(
+# Two shapes: vLLM <=0.27.x documents this histogram as "secondary-tier lookup until
+# the request is allocated or finishes"; 0.29.0 rewrote it and inserted a
+# labelnames=("tier",) line. Match either and lengthen the bucket ladder.
+apply_any(
     TIERING_SPEC,
-    """                    "secondary-tier lookup until the request is allocated or "
+    variants=[
+        (
+            """                    "secondary-tier lookup until the request is allocated or "
                     "finishes, in seconds."
                 ),
                 buckets=(
@@ -93,7 +98,7 @@ apply(
                     5,
                     10,
                 ),""",
-    """                    "secondary-tier lookup until the request is allocated or "
+            """                    "secondary-tier lookup until the request is allocated or "
                     "finishes, in seconds."
                 ),
                 # radiance: extended past 10 s -- a measured 60.6 s stall was
@@ -109,9 +114,52 @@ apply(
                     0.5,
                     1,
 """
-    + _WIDE,
-    "radiance: extended past 10 s",
-    "tiering lookup_async_delay buckets",
+            + _WIDE,
+        ),
+        (
+            """                documentation=(
+                    "Histogram of wall-clock time from a per-block tier lookup "
+                    "first returning retry until that same tier lookup resolves "
+                    "as a hit or miss, labeled by tier, in seconds."
+                ),
+                labelnames=("tier",),
+                buckets=(
+                    0.0001,
+                    0.0005,
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.05,
+                    0.1,
+                    0.5,
+                    1,
+                    5,
+                    10,
+                ),""",
+            """                documentation=(
+                    "Histogram of wall-clock time from a per-block tier lookup "
+                    "first returning retry until that same tier lookup resolves "
+                    "as a hit or miss, labeled by tier, in seconds."
+                ),
+                labelnames=("tier",),
+                # radiance: extended past 10 s -- a measured 60.6 s stall was
+                # invisible in +Inf. See cache-preemption-patch-plan.md R3.5.
+                buckets=(
+                    0.0001,
+                    0.0005,
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.05,
+                    0.1,
+                    0.5,
+                    1,
+"""
+            + _WIDE,
+        ),
+    ],
+    sentinel="radiance: extended past 10 s",
+    label="tiering lookup_async_delay buckets",
 )
 
 # --- hunk 2: connector LOOKUP_ASYNC_DELAY buckets ------------------------------------

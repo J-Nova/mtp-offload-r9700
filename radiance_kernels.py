@@ -403,6 +403,17 @@ def install_r4d_report():
     Worker.compile_or_warm_up_model = compile_or_warm_up_model
 
 
+def _install_token_collector():
+    """Delegate to the single token-collector implementation in aijuus.collect_tokens.
+
+    collect_tokens owns the class list and both hooks (compute_logits + get_top_tokens) with the
+    _capturing() guard and error swallowing. Keeping a second wrapper here diverged from it
+    (Qwen3_5MoeMTP missing, no capture guard). ensure_installed() is idempotent.
+    """
+    import aijuus.collect_tokens as collect_tokens
+    collect_tokens.ensure_installed()
+
+
 def install_all():
     """Install every gated radiance runtime hook. Called once per process by the vLLM plugin loader,
     after torch/vllm/aiter are imported but before the model loads. Idempotent; each hook is env-gated."""
@@ -445,6 +456,10 @@ def install_all():
         install_r4d_report()
     except Exception as e:
         sys.stderr.write(f"[radiance] install_r4d_report failed: {e!r}\n")
+    try:
+        _install_token_collector()
+    except Exception as e:
+        sys.stderr.write(f"[radiance] _install_token_collector failed: {e!r}\n")
 
 
 def block_scaled_mm(kernel, A, B, As, Bs):

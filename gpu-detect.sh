@@ -134,16 +134,22 @@ rad_detect_gpus() {
 RAD_KV_TABLE=${KV_TABLE:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/kv-profiles.tsv}
 RAD_KV_TABLE_LOCAL=${KV_TABLE_LOCAL:-${XDG_CACHE_HOME:-$HOME/.cache}/radiance-mxfp4/kv-profiles.local.tsv}
 
-# rad_kv_lookup <sig> <maxseqs> <chunk> <maxlen> <spec_method>
+# rad_kv_lookup <sig> <maxseqs> <chunk> <maxlen> <spec_method> [spec_depth]
 # Echoes the pin in bytes, or nothing. The local table is read LAST so a locally measured row
 # beats a shipped one for the same key -- your own hardware outranks our table on your host.
+# A pin is only valid at the speculative DEPTH it was measured at (SPEC moves the cudagraph capture
+# set and the decode band), so a row's `spec` field may carry a `method:depth` key. A bare `method`
+# row still matches dflash (the shipped rows predate the depth field) but is deliberately NOT
+# accepted for mtp: an mtp pin measured before the mtp default moved to 8 must fall back to vLLM's
+# own profiling rather than be reused at the wrong depth.
 rad_kv_lookup() {
-  local sig=$1 seqs=$2 chunk=$3 maxlen=$4 spec=$5 f hit=""
+  local sig=$1 seqs=$2 chunk=$3 maxlen=$4 spec=$5 depth=${6:-} f hit=""
   for f in "$RAD_KV_TABLE" "$RAD_KV_TABLE_LOCAL"; do
     [ -r "$f" ] || continue
     local row
-    row=$(awk -F'\t' -v s="$sig" -v q="$seqs" -v c="$chunk" -v l="$maxlen" -v m="$spec" \
-      '$1 !~ /^#/ && $1==s && $2==q && $3==c && $4==l && $5==m {print $6}' "$f" | tail -1)
+    row=$(awk -F'\t' -v s="$sig" -v q="$seqs" -v c="$chunk" -v l="$maxlen" -v m="$spec" -v d="$depth" \
+      '$1 !~ /^#/ && $1==s && $2==q && $3==c && $4==l && \
+       ( $5==(m ":" d) || (index($5,":")==0 && $5==m && m!="mtp") ) {print $6}' "$f" | tail -1)
     if [ -n "$row" ]; then hit=$row; fi
   done
   echo "$hit"
@@ -166,7 +172,7 @@ if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
   [ -n "$RAD_GPU_SKIPPED" ] && echo "skipped (<${RAD_MIN_GPU_MIB} MiB):$RAD_GPU_SKIPPED"
   echo "tensor parallel:  $RAD_TP   (supported: $RAD_TP_ALLOWED)"
   echo "hardware sig:     $RAD_GPU_SIG"
-  kv=$(rad_kv_lookup "$RAD_GPU_SIG" "${MAXSEQS:-8}" "${CHUNK:-8192}" "${MAXLEN:-262144}" "${SPEC_METHOD:-dflash}")
+  kv=$(rad_kv_lookup "$RAD_GPU_SIG" "${MAXSEQS:-8}" "${CHUNK:-8192}" "${MAXLEN:-262144}" "${SPEC_METHOD:-dflash}" "${SPEC:-}")
   if [ -n "$kv" ]; then
     echo "KV cache pin:     $kv bytes ($(awk -v b="$kv" 'BEGIN{printf "%.2f", b/1073741824}') GiB/GPU, measured)"
   else

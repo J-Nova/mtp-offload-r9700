@@ -161,14 +161,28 @@ def budget_check():
         raise Abort("runtime cap of %ds exceeded" % RUNTIME_CAP_S)
 
 
+def auth_headers(base_headers):
+    """Add a Bearer token when the server enforces an API key.
+
+    vLLM requires Authorization once --api-key / VLLM_API_KEY is set; these tools build
+    their own urllib requests, so without this they 401. Reads VLLM_API_KEY (the serving
+    env) or TIERBENCH_API_KEY. No key -> headers unchanged.
+    """
+    key = os.environ.get("VLLM_API_KEY") or os.environ.get("TIERBENCH_API_KEY")
+    headers = dict(base_headers)
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    return headers
+
+
 def http(url, payload=None, timeout=30, raw=False):
     if payload is None:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers=auth_headers({}))
     else:
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=auth_headers({"Content-Type": "application/json"}),
         )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = r.read().decode()
@@ -349,10 +363,13 @@ def parse_metrics(raw):
             labels = labels.rstrip("}")
             tt = re.search(r'transfer_type="([^"]+)"', labels)
             le = re.search(r'le="([^"]+)"', labels)
+            tier = re.search(r'tier="([^"]+)"', labels)
             if tt:
                 name = "%s|%s" % (name, tt.group(1))
             elif le:
                 name = "%s|le=%s" % (name, le.group(1))
+            elif tier:
+                name = "%s|tier=%s" % (name, tier.group(1))
         else:
             name = name_part
         out[name] = out.get(name, 0.0) + val
@@ -367,6 +384,12 @@ def delta(before, after):
     d = {}
     for k in COUNTERS:
         if k in after or k in before:
+            d[k] = after.get(k, 0.0) - before.get(k, 0.0)
+    # Per-tier chunk-hit counters carry a `tier=` label (e.g. "1:fs"). Include every such
+    # series so classify() can name the tier that served a load on builds (like the
+    # 0.29/radiance tree) whose TieringMetricsTracker emits these instead of fs_load_bytes.
+    for k in set(after) | set(before):
+        if k.startswith("vllm:kv_offload_tiering_chunk_"):
             d[k] = after.get(k, 0.0) - before.get(k, 0.0)
     for k in ("vllm:kv_offload_total_bytes_total", "vllm:kv_offload_total_time_total"):
         for tt in ("CPU_to_GPU", "GPU_to_CPU"):
@@ -444,7 +467,7 @@ def chat(base, text, tag, max_tokens=MAX_TOKENS):
     req = urllib.request.Request(
         base + "/v1/chat/completions",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=auth_headers({"Content-Type": "application/json"}),
     )
     t0 = time.time()
     ttft, usage, ntok = None, None, 0
@@ -591,8 +614,21 @@ def classify(d):
                    d.get("vllm:kv_offload_total_bytes_total|CPU_to_GPU", 0.0))
     fs_bytes = d.get("vllm:kv_offload_fs_load_bytes_total")
     if ext_hits > 0 or loaded > 0:
+        # Prefer this build's per-tier series: kv_offload_tiering_chunk_hits_total{tier="1:fs"}.
+        # The fs tier is the secondary tier (index 1); anything else with a tier label is the
+        # CPU primary. Fall back to the pre-R2.9.2 fs counter when the tier series is absent.
+        fs_hits = d.get("vllm:kv_offload_tiering_chunk_hits_total|tier=1:fs", 0.0)
+        cpu_hits = sum(
+            v for k, v in d.items()
+            if k.startswith("vllm:kv_offload_tiering_chunk_hits_total|tier=")
+            and ":fs" not in k
+        )
+        if fs_hits > 0:
+            return "OFFLOAD/FS"
+        if cpu_hits > 0:
+            return "OFFLOAD/CPU"
         if fs_bytes is None:
-            return "OFFLOAD(tier indistinguishable -- pre-R2.9.2)"
+            return "OFFLOAD(tier unlabelled -- no per-tier series)"
         return "OFFLOAD/FS" if fs_bytes > 0 else "OFFLOAD/CPU"
     if gpu_hits > 0:
         return "GPU"

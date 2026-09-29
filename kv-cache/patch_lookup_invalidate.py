@@ -114,7 +114,7 @@ restoring the pre-patch files and reloading the model.
 import sysconfig
 from pathlib import Path
 
-from _patchlib import apply
+from _patchlib import apply, apply_any
 
 SP = Path(sysconfig.get_paths()["purelib"])
 KVO = SP / "vllm/v1/kv_offload"
@@ -253,28 +253,42 @@ apply(
 # ---------------------------------------------------------------------------
 # 4. fs/manager.py submit_store(): record the store's keys unconditionally.
 # ---------------------------------------------------------------------------
-apply(
+apply_any(
     FS_MANAGER,
-    '''        if self.events is not None:
+    variants=[
+        (
+            '''        if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         tasks = self._radiance_split(  # radiance R3.14''',
-    '''        if self.events is not None:
+            '''        if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         # radiance: always-on (independent of events) so get_finished_jobs() can
         # invalidate the async-lookup cache when this store lands.
         self._store_lookup_keys[job_metadata.job_id] = list(job_metadata.keys)
         tasks = self._radiance_split(  # radiance R3.14''',
-    "self._store_lookup_keys[job_metadata.job_id] = list(job_metadata.keys)",
-    "4  fs/manager.py submit_store: track store keys unconditionally",
+        ),
+        (
+            # 0.29.0 hoists `keys = list(job_metadata.keys)`.
+            '''        if self.events is not None:
+            self._store_job_keys[job_metadata.job_id] = keys
+        tasks = self._radiance_split(  # radiance R3.14''',
+            '''        if self.events is not None:
+            self._store_job_keys[job_metadata.job_id] = keys
+        # radiance: always-on (independent of events) so get_finished_jobs() can
+        # invalidate the async-lookup cache when this store lands.
+        self._store_lookup_keys[job_metadata.job_id] = list(keys)
+        tasks = self._radiance_split(  # radiance R3.14''',
+        ),
+    ],
+    sentinel="self._store_lookup_keys[job_metadata.job_id]",
+    label="4  fs/manager.py submit_store: track store keys unconditionally",
 )
 
 # ---------------------------------------------------------------------------
 # 5. fs/manager.py get_finished_jobs(): on a SUCCESSFUL store, invalidate the
 #    cached verdict for those keys (and always drain the tracking map).
 # ---------------------------------------------------------------------------
-apply(
-    FS_MANAGER,
-    '''            if self.events is not None:
+_STORE_EVENTS_BLOCK = '''            if self.events is not None:
                 keys = self._store_job_keys.pop(job_id, None)
                 if success and keys:
                     self.events.append(
@@ -285,19 +299,9 @@ apply(
                             locality=self.locality,
                         )
                     )
-            results.append(JobResult(job_id=job_id, success=success))''',
-    '''            if self.events is not None:
-                keys = self._store_job_keys.pop(job_id, None)
-                if success and keys:
-                    self.events.append(
-                        OffloadingEvent(
-                            keys=keys,
-                            medium=self.medium,
-                            removed=False,
-                            locality=self.locality,
-                        )
-                    )
-            # radiance: a successful store put these blocks on disk, so any
+'''
+
+_INVALIDATE_BLOCK = '''            # radiance: a successful store put these blocks on disk, so any
             # previously-cached `absent` verdict for them is stale. Drop it (the
             # next lookup re-states the file, reflecting its real current state,
             # robust to external eviction). A FAILED store leaves the verdict
@@ -306,9 +310,29 @@ apply(
             store_keys = self._store_lookup_keys.pop(job_id, None)
             if store_keys and success and _RADIANCE_LOOKUP_INVALIDATE:
                 self._lookup_manager.invalidate(store_keys)
-            results.append(JobResult(job_id=job_id, success=success))''',
-    "store_keys = self._store_lookup_keys.pop(job_id, None)",
-    "5  fs/manager.py get_finished_jobs: invalidate on successful store",
+'''
+
+apply_any(
+    FS_MANAGER,
+    variants=[
+        (
+            _STORE_EVENTS_BLOCK
+            + "            results.append(JobResult(job_id=job_id, success=success))",
+            _STORE_EVENTS_BLOCK
+            + _INVALIDATE_BLOCK
+            + "            results.append(JobResult(job_id=job_id, success=success))",
+        ),
+        (
+            # 0.29.0 continues from the events block into the load-job handling.
+            _STORE_EVENTS_BLOCK
+            + "            load_keys = self._load_job_keys.pop(job_id, None)",
+            _STORE_EVENTS_BLOCK
+            + _INVALIDATE_BLOCK
+            + "            load_keys = self._load_job_keys.pop(job_id, None)",
+        ),
+    ],
+    sentinel="store_keys = self._store_lookup_keys.pop(job_id, None)",
+    label="5  fs/manager.py get_finished_jobs: invalidate on successful store",
 )
 
 # ---------------------------------------------------------------------------

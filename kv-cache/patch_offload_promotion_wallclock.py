@@ -70,6 +70,8 @@ observe() asserts that every emitted name is registered.
 import sysconfig
 from pathlib import Path
 
+import sys
+
 from _patchlib import apply
 
 SP = Path(sysconfig.get_paths()["purelib"])
@@ -80,6 +82,18 @@ TIERING_MANAGER = SP / "vllm/v1/kv_offload" / "tiering" / "manager.py"
 CONN_METRICS = (
     SP / "vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py"
 )
+
+# 0.29.0 reworked the tiering manager (TieringMetricsTracker, batched promotions) and
+# the connector calls prepare_store() directly; its tracker already reports whole-job
+# READ/WRITE time and promotion failures, and the refusal-sentinel half would need the
+# connector's `is None` checks updated to stay safe. Skip both halves entirely.
+if TIERING_MANAGER.exists() and "TieringMetricsTracker" in TIERING_MANAGER.read_text():
+    print(
+        "[radiance] promotion-refusal + wallclock skipped: this vLLM's "
+        "TieringMetricsTracker already reports whole-job transfer time and promotion "
+        "failures, and its connector calls prepare_store() directly (upstream supersedes)"
+    )
+    sys.exit(0)
 
 print("radiance: KV offload promotion-refusal instrumentation")
 
@@ -273,33 +287,12 @@ apply(
     "4b cpu/manager.py: widen prepare_store annotation",
 )
 
-apply(
-    CPU_MANAGER,
-    """            if num_blocks_to_evict > self._num_evictable_cache_blocks:
-                # Eviction will fail.
-                return None""",
-    """            if num_blocks_to_evict > self._num_evictable_cache_blocks:
-                # Eviction will fail.
-                # radiance promotion-refusal: not enough evictable blocks; the
-                # fix is a reserved headroom (B2). Distinct from PROTECTED.
-                return PrepareStoreRefusal(PrepareStoreRefusal.NO_EVICTABLE)""",
-    "return PrepareStoreRefusal(PrepareStoreRefusal.NO_EVICTABLE)",
-    "4c cpu/manager.py: NO_EVICTABLE refusal sentinel",
-)
-
-apply(
-    CPU_MANAGER,
-    """            evicted = self._policy.evict(num_blocks_to_evict, protected)
-            if evicted is None:
-                return None""",
-    """            evicted = self._policy.evict(num_blocks_to_evict, protected)
-            if evicted is None:
-                # radiance promotion-refusal: the evictable blocks are held by
-                # concurrent references; the fix is a bounded retry (B1).
-                return PrepareStoreRefusal(PrepareStoreRefusal.PROTECTED)""",
-    "return PrepareStoreRefusal(PrepareStoreRefusal.PROTECTED)",
-    "4d cpu/manager.py: PROTECTED refusal sentinel",
-)
+# NOTE: the two sentinel-return hunks (4c, 4d) are applied LAST, below, after both
+# consumers (5b promotion, 5d store) are in place. Flipping cpu/manager.prepare_store
+# to return a PrepareStoreRefusal BEFORE its callers know about it would leave a
+# refusal object flowing into a truthiness check (`if store_output is None`) and
+# crash the store path. Keeping them last means a drifted consumer hunk aborts the
+# patch with prepare_store still returning plain None -- a safe partial state.
 
 # ---------------------------------------------------------------------------
 # 5. tiering/manager.py: import the sentinel, count refusals by source tier and
@@ -415,6 +408,40 @@ apply(
             return None""",
     "if primary_result is None or isinstance(",
     "5d tiering/manager.py: treat the sentinel as a store failure",
+)
+
+# ---------------------------------------------------------------------------
+# 6. cpu/manager.py: the two return-None refusal paths become labelled sentinels.
+#    Kept LAST (after 5b and 5d): this changes prepare_store's return type, so the
+#    consumers must already know about PrepareStoreRefusal. Applied earlier, a
+#    drifted consumer hunk would leave a sentinel reaching `is None` checks.
+# ---------------------------------------------------------------------------
+apply(
+    CPU_MANAGER,
+    """            if num_blocks_to_evict > self._num_evictable_cache_blocks:
+                # Eviction will fail.
+                return None""",
+    """            if num_blocks_to_evict > self._num_evictable_cache_blocks:
+                # Eviction will fail.
+                # radiance promotion-refusal: not enough evictable blocks; the
+                # fix is a reserved headroom (B2). Distinct from PROTECTED.
+                return PrepareStoreRefusal(PrepareStoreRefusal.NO_EVICTABLE)""",
+    "return PrepareStoreRefusal(PrepareStoreRefusal.NO_EVICTABLE)",
+    "6a cpu/manager.py: NO_EVICTABLE refusal sentinel",
+)
+
+apply(
+    CPU_MANAGER,
+    """            evicted = self._policy.evict(num_blocks_to_evict, protected)
+            if evicted is None:
+                return None""",
+    """            evicted = self._policy.evict(num_blocks_to_evict, protected)
+            if evicted is None:
+                # radiance promotion-refusal: the evictable blocks are held by
+                # concurrent references; the fix is a bounded retry (B1).
+                return PrepareStoreRefusal(PrepareStoreRefusal.PROTECTED)""",
+    "return PrepareStoreRefusal(PrepareStoreRefusal.PROTECTED)",
+    "6b cpu/manager.py: PROTECTED refusal sentinel",
 )
 
 """Time each secondary-tier transfer ONCE, in wall clock, not per I/O batch.

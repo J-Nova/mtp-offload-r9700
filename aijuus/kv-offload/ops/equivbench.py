@@ -96,7 +96,7 @@ def ask(base, text, tag, cache_salt, max_tokens=MAX_TOKENS):
     req = urllib.request.Request(
         base + "/v1/chat/completions",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=T.auth_headers({"Content-Type": "application/json"}),
     )
     t0 = time.time()
     try:

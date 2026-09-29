@@ -20,6 +20,132 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
+## 2026-09-29 (cont. 17) — External tier: CPU is structurally unreachable; FS serves; mamba-from-tier proven bit-identical
+
+### Structural finding (why the tier looked inert)
+- Live redeploy: GPU KV cache **215,094 tokens**; CPU primary tier **104,720 tokens**
+  (mmap 12.87 GB, geometry 4 groups x 30,638,080 B per 880-token block).
+- Both tiers are LRU over the same stream, and the CPU tier is smaller than the GPU cache, so
+  **a prefix evicted from the GPU has already left the CPU tier** — a CPU-tier hit is impossible
+  by construction, in tierbench's own words "a staging buffer for the fs tier, not a cache."
+- `kv_offload_lookup_skip_short_window_total` firing on every production lookup is the correct
+  signature of "the GPU already holds >= what the tier offers", **not** the upstream #54360
+  zero-hit defect. There is nothing to patch here.
+- To make the CPU tier serve, its logical token capacity must exceed 215k — about **37 GiB** of
+  /dev/shm, impossible with two instances sharing 32 G. The reachable external tier is **fs**.
+
+### Proof: mamba-from-fs-tier restore is exact (equivbench --yes on vllm-1, isolated to that instance)
+- `coldA` 51.60s `coldB` 52.85s (RECOMPUTE), `gpu` 2.80s (GPU), `fs` **11.99s (OFFLOAD)**.
+- Served tier confirmed from the engine's per-tier series:
+  `kv_offload_tiering_chunk_hits_total{tier="1:fs"} = 106`, `external_prefix_cache_hits_total
+  = 84,480`, `kv_offload_load_bytes_total = 3.03 GB`.
+- Correctness: **`coldB vs fs` and `coldA vs fs` are both `tokens_identical=True` and
+  logprobs bit-identical (`max|dlogprob| = 0.000e+00`)**. The fs-tier restore of the hybrid
+  attention + Mamba/GDN + draft state reproduces the cold continuation exactly. Stride 4 was
+  live for this run.
+
+### How to force/verify external-tier hits (documented method)
+- `equivbench.py --yes` (phases `coldA,coldB,gpu,fs`): bit-exact correctness, drains then evicts
+  CPU+GPU then probes the fs tier. This is the "mamba from tier is correct" gate.
+- `tierbench.py --yes --phases cold,gpu,fs`: timing/attribution and per-tier validation.
+- Both **evict the whole KV cache of the instance they hit**, so run against one instance
+  (`:8001`) at idle; the other keeps serving. Pass `TIERBENCH_GPU_TOKENS`/`TIERBENCH_CPU_BLOCKS`
+  when running inside the container (it cannot read `docker logs` there).
+- Tool fixes: `tierbench` now preserves the `tier=` metric label and `classify()` names
+  `OFFLOAD/FS` from `kv_offload_tiering_chunk_hits_total|tier=1:fs` (this build emits
+  TieringMetricsTracker series, not the older `kv_offload_fs_load_bytes_total`). Verified:
+  `classify -> OFFLOAD/FS`.
+
+### Verdict
+- The external-tier path does **not** need fixing: CPU non-service is design, not defect, and the
+  fs tier restores the hybrid/Mamba state bit-identically. Keep CPU as a staging/fan-out buffer;
+  treat fs as the external hit tier. If more external hit rate is wanted, the lever is fs
+  residency/eviction policy, not the CPU tier size.
+
+---
+
+## 2026-09-29 (cont. 16) — Deep research: mamba-state correctness, KV-offload reality, ROCm 10; two config fixes
+
+### Live verification of the hybrid MTP + offload path (vllm-0, boot 10:18)
+- Boot log: **every functional KV-offload patch applied cleanly** (mixed-hit, instrumentation,
+  eagle-fix, eagle-groups, mamba-stride knob, swa-align, head-cap, reconcile re-ask, deferral
+  metrics) — no "did NOT apply" lines.
+- Live shape confirmed: `mtp/8`, `mamba_cache_mode=align`, `mamba_cache_dtype=bfloat16`,
+  `mamba_ssm_cache_dtype=float16`, `async_scheduling=False`, `OffloadingConnector` +
+  fs secondary tier, `kv_offloading_size=12 GiB`.
+- **The offload tier is inert on current traffic**: `vllm:prefix_cache_hits_total = 0` against
+  `vllm:prefix_cache_queries_total = 3228`; every one of the 40 `kv_offload_lookup_calls_total`
+  landed in `kv_offload_lookup_skip_short_window_total`; `kv_offload_cpu_cache_usage_perc = 0`.
+  This is the signature of **vLLM #54360** (spec decode on hybrid GDN silently zeroes
+  prefix-cache hits) and sits in the same connector-conditional path as **#53505** (hybrid
+  Mamba align + ANY KV connector corrupts under spec decode, even at zero transferred tokens)
+  and **#50454** (OffloadingConnector assert with kv offloading + mamba-hybrid + prefix caching
+  + MTP). The 12 GiB CPU tier + fs tier are provisioned but delivering ~0.
+- Correctness implication: the mamba recurrent state is the risk area the dev flagged. Our
+  `turnbench.py` exact gate is the right test, but the live server enforces `VLLM_API_KEY`
+  (401 without Bearer) and the harness (`turnbench`/`equivbench`/`tierbench`) sends no
+  `Authorization` header; its `--dry-run` otherwise works end to end against `:8000`.
+  ACTION: add optional Bearer auth to the KV tools before running the gate.
+
+### Bounded exact gate (session A, 2 turns; auth added)
+- Added `tierbench.auth_headers()` (reads `VLLM_API_KEY`/`TIERBENCH_API_KEY`) and wired it into
+  `tierbench.http`/its streaming request, `equivbench.ask`, `turnbench.ask`. `py_compile` OK;
+  header confirmed present in-container.
+- Result: A1 25,184 tok COLD (recomputed all); A2 38,782 tok **GPU hit 23,760, ext 0,
+  recomputed 15,022**. So the **GPU prefix cache works**, and the **external CPU/fs tier is
+  never asked beyond it** (`ext=0`) — the offload tier really is dead weight on this path, as
+  the metrics said.
+- Exactness: A1 **EXACT** (max|dlp| 0). A2 GPU-hit path **DIFF** at token 30, max|dlp| 0.133,
+  accepted 136/121. Harness verdicts: `HEALTH PASS: cache-caused none`, `TIER paths
+  INCONCLUSIVE: no turn was served from the tier`. Read: the cached-vs-cold delta is the
+  documented prefill-schedule numerics (`REVIEW-LOG.md:149-158`), not the #53505 corruption
+  signature (that is looping/garbage/runaway, none present). The tier-served mamba-restore path
+  remains unvalidated because no turn reached the tier; a full multi-session run plus a way to
+  force external hits is the remaining gate.
+
+### Mamba-state findings (upstream, not in our pinned v0.29.0 tag)
+- #53505 (closed on main; fix not confirmed in our tag): attaching a connector switches the
+  scheduler from `get_computed_blocks` to `get_computed_blocks_for_connector`; under spec decode
+  the boundary diverges from the mamba spec-verify rollback point → decode resumes from a
+  mismatched recurrent state.
+- #55450 align-mode mamba states pinned across null gaps → upstream backport `patch_mamba_retire.py`.
+  The R9700 review found it does NOT occur with async scheduling off + explicit previous-step
+  free (`aijuus/refs/r9700-tp1/REVIEW-LOG.md:293`), which is our config; not ported.
+- The GDN `torch.empty` nan/inf crash tcclaviger fixed in 29.04.1: **already avoided** — we run
+  `RADIANCE_GDN_EMPTY_OUT=0`, so `patch_gdn_glue.py` allocates `torch.zeros`.
+
+### Changes made
+- `aijuus/coolify-compose-2gpu.yml` (both services): **`RADIANCE_MAMBA_STORE_STRIDE=4`** — the
+  Coolify deploy never set it, so the mamba store-cadence patch ran inert (default 1) while
+  `serve-mxfp4.sh:919` ships 4. Prereq (eagle-groups) is applied. Trades a truncated-prefix
+  dead zone for ~2.4x more CPU-tier tokens at N=4. Validate with turnbench once auth is added.
+- `aijuus/kv-offload/ops/entrypoint.sh`: cudagraph ladder is now the **union** of the dense
+  small-step ladder and the exact `(SPEC+1)` multiples up to `CAP=SEQS*(SPEC+1)`. The exact
+  train covers fixed-depth steps (vLLM pads to the next captured size); the dense train is kept
+  because `RADIANCE_DYNAMIC_DRAFT` makes the per-step draft count variable, so a strict
+  `(SPEC+1)` grid would under-cover dynamic decode. Verified: SPEC8/SEQS8 →
+  `[1,2,4,8,9,12,16,18,20,24,27,28,32,36,40,44,45,48,52,54,56,60,63,64,68,72]`; `bash -n`, YAML parse OK.
+
+### ROCm 10 verdict (deepened)
+- Official AMD validation for ROCm 10.0.0 is **vLLM 0.27.0 only**. The one relevant gfx1201
+  change is that ROCm 10 **deprecates `ROCBLAS_USE_HIPBLASLT_BATCHED`** (batched hipBLASLt no
+  longer needs disabling) — it closes our logged batched-GEMM caution, but changes nothing about
+  our AOT kernels. Counter-evidence that a version bump hurts: ollama#16624 bisected a ~14-20%
+  gfx1201 regression to a Tensile-library selection change; ROCm#8242 is a gfx1201 hipBLASLt FP8
+  heuristic SIGSEGV in a 7.14 nightly.
+- tcclaviger's own image is a 0.29 tree on ROCm 10.0 / torch 2.11 / Python 3.14, so
+  0.29-on-ROCm-10 is demonstrably workable — but with their kernels. Ours (libr4d,
+  `radiance_mxfp4_fp8.so`, ~107 fork anchors, the TunableOp table) is AOT-built on 7.14 and
+  needs a full rebuild + revalidation. **Do not move for performance; revisit only if a fix we
+  need lands only on ROCm 10.**
+
+### Sources
+- vLLM #53505, #54360, #50454, #55450, #51599; ROCm 10.0.0 release notes;
+  `blog.robai.net/vllmdocs` (capture-ladder rule, per-op/state-copy kernels, mamba dtype notes);
+  `aijuus/refs/r9700-tp1/REVIEW-LOG.md:141-158,285-301`.
+
+---
+
 ## 2026-09-29 (cont. 15) — DRY A/B: marginal quality, sampled t/s regression -> NOT adopted
 
 - Arm `RADIANCE_DRY_MULTIPLIER=0.8` + `RADIANCE_DRY_RANGE=2048` (boot: `[run] DRY enabled:

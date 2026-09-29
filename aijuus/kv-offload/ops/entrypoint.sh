@@ -138,14 +138,28 @@ fi
 
 AR_MAX_KB=$(( CHUNK * 5120 * 2 / 1024 + 4096 ))
 
-# Cudagraph capture ceiling = SEQS*(SPEC+1), stock ladder trimmed to it
-# (mirrors serve-mxfp4.sh: SEQS=8 SPEC=16 -> 136, so the ladder runs to 256).
+# Cudagraph capture ceiling = SEQS*(SPEC+1).
+# The dense ladder covers DYNAMIC draft depth (RADIANCE_DYNAMIC_DRAFT varies the per-step
+# draft count, so a batch's token count is NOT a fixed multiple of SPEC+1). The second train
+# adds the exact (SPEC+1) multiples, covering FIXED-depth steps: vLLM pads every batch up to
+# the next captured size, so landing exactly avoids padding it never uses (tcclaviger docs,
+# "the ladder steps by num_speculative_tokens + 1"). Union, not replacement, so dynamic-depth
+# decode keeps its coverage.
 CAP=$(( SEQS * (SPEC + 1) ))
-SIZES=""
-for s in 1 2 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 \
+SPEC_STEP=$(( SPEC + 1 ))
+_sizes="1"
+for s in 2 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 \
           80 88 96 104 112 120 128 136 144 152 160 168 176 184 192 200 208 216 224 232 240 248 256; do
-  [ "$s" -le "$CAP" ] && SIZES="${SIZES:+$SIZES,}$s"
+  [ "$s" -le "$CAP" ] && _sizes="$_sizes $s"
 done
+if [ "$SPEC_STEP" -gt 1 ]; then
+  k=1
+  while [ "$((k * SPEC_STEP))" -le "$CAP" ]; do
+    _sizes="$_sizes $((k * SPEC_STEP))"
+    k=$((k + 1))
+  done
+fi
+SIZES=$(printf '%s\n' $_sizes | sort -n -u | paste -sd, -)
 CAPLIST="[$SIZES]"
 
 # Speculative config. mtp needs no drafter checkpoint; dflash does; none disables it.

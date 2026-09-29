@@ -485,6 +485,54 @@ lossless/byte-exact and complementary, so gating them behind an A/B only wastes 
   (`use_skinny` accepts `on_gfx1x()`; `VLLM_ROCM_USE_SKINNY_GEMM` default True; `wvSplitK_hf`
   wave32 kernels present in `_rocm_C.abi3.so`). Applies only to unquantized bf16 linears.
 
+### Mamba-state & KV-offload correctness research (2026-09-29)
+
+The hybrid-MTP axis is the highest-risk area, and the deploy was measured against it.
+
+- **Live finding (vllm-0, boot 10:18):** all functional offload patches applied, but the tier is
+  **inert**: `prefix_cache_hits_total = 0` over `prefix_cache_queries_total = 3228`, all 40
+  `kv_offload_lookup_calls_total` in `lookup_skip_short_window_total`, `cpu_cache_usage = 0`.
+  That is the signature of upstream **#54360** (spec decode + hybrid GDN silently zeroes
+  prefix hits), in the same connector-conditional path as **#53505** (hybrid Mamba align +
+  connector corrupts under spec decode even at zero transferred tokens) and **#50454**
+  (OffloadingConnector assert: kv offloading + mamba-hybrid + prefix caching + MTP). Our
+  `patch_offload_mixed_hit.py`/`patch_reconcile_reask.py` are the house mitigations for the
+  assert and the divergent-reconcile re-ask; they apply, but they do not create hits.
+- **Not in our pinned v0.29.0 tag:** #55450 (`patch_mamba_retire.py`; the R9700 review found it
+  unnecessary with async scheduling off, which we run — `REVIEW-LOG.md:293`). The GDN
+  `torch.empty` nan/inf crash tcclaviger fixed in 29.04.1 is already avoided by
+  `RADIANCE_GDN_EMPTY_OUT=0`.
+- **Correctness gate:** added `tierbench.auth_headers()` (Bearer from `VLLM_API_KEY`) and wired
+  it into `tierbench`/`equivbench`/`turnbench`. Bounded exact gate (session A, 2 turns): A1
+  EXACT; A2 had a **GPU** prefix hit (23,760 tok, ext 0) and diverged on the rate path at token
+  30 (max|dlp| 0.133) — harness verdicts `HEALTH PASS: cache-caused none`,
+  `TIER paths INCONCLUSIVE: no turn was served from the tier`. That is the documented
+  prefill-schedule sensitivity, not the #53505 corruption signature.
+- **Structural tier finding (live):** GPU KV cache 215,094 tok vs CPU primary tier 104,720 tok.
+  Both LRU over the same stream and CPU < GPU, so a GPU-evicted prefix has already left the CPU
+  tier — **CPU-tier external hits are impossible by construction**; it is a staging buffer for
+  the fs tier. `skip_short_window` on every lookup is that condition, not the #54360 defect. To
+  make CPU serve would need ~37 GiB of /dev/shm (two instances share 32 G). The reachable
+  external tier is **fs**.
+- **FS-tier proof (equivbench `--yes` on vllm-1, isolated):** coldA 51.6s / coldB 52.9s
+  (RECOMPUTE), gpu 2.80s, fs **11.99s OFFLOAD**; `kv_offload_tiering_chunk_hits_total{tier="1:fs"}
+  = 106`, `external_prefix_cache_hits_total = 84,480`. **`coldB vs fs` and `coldA vs fs` both
+  `tokens_identical=True` and logprobs bit-identical (max|dlogprob| = 0)** → the hybrid
+  attention + Mamba/GDN + draft state restores exactly from the tier. Stride 4 live for the run.
+- **Method / tooling:** `equivbench.py --yes` (correctness) and `tierbench.py --yes --phases
+  cold,gpu,fs` (attribution) are the forced-tier gates; both evict the whole cache of the
+  instance they hit, so run against one instance at idle. `tierbench.classify()` now names
+  `OFFLOAD/FS` from the per-tier series (this build emits `TieringMetricsTracker`, not the old
+  `fs_load_bytes` counter).
+- **Changes landed:** `RADIANCE_MAMBA_STORE_STRIDE=4` in the Coolify compose (it was unset →
+  patch inert; prereq eagle-groups applied); cudagraph ladder is now the union of the dense
+  ladder and the exact `(SPEC+1)` multiples (dynamic draft depth makes a strict grid wrong).
+- **ROCm 10:** do not move for performance. Validated vLLM is 0.27.0; the gfx1201-relevant change
+  is ROCm 10 deprecating `ROCBLAS_USE_HIPBLASLT_BATCHED` (closes our batched-GEMM caution), but
+  our AOT libr4d/`radiance_mxfp4_fp8.so`/TunableOp stack needs a full rebuild. ollama#16624
+  (gfx1201 Tensile regression, ~14-20%) and ROCm#8242 (gfx1201 hipBLASLt FP8 SIGSEGV) show a
+  bump can hurt.
+
 ### Deep dive: tcclaviger MTP/kernel comparison (2026-09-29)
 Compared the public `tcclaviger/vllm-radiance` repo and the `tcclaviger/vllm:29.05.12` image
 against our tree:

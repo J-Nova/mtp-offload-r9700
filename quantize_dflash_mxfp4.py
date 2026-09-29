@@ -55,6 +55,36 @@ E2M1_MAX = 6.0
 GROUP = 32
 
 
+def _codes_at(wb: torch.Tensor, exp: torch.Tensor):
+    """RNE-snap groups wb [N, nG, 32] at exponents exp [N, nG].
+
+    Returns (signed codes uint8 [N, nG, 32], dequant fp32 [N, nG, 32]). The code
+    carries the sign in bit 3; ties go to the even mantissa, matching the OCP
+    e2m1 convention.
+    """
+    scale = torch.exp2(exp).unsqueeze(-1)
+    v = wb / scale
+    sign = torch.signbit(v)
+    mag = v.abs().clamp(max=E2M1_MAX)
+    grid = E2M1.to(wb.device)
+    d = (mag.unsqueeze(-1) - grid).abs()
+    code = d.argmin(-1).to(torch.uint8)
+    tie = (d.min(-1).values.unsqueeze(-1) == d).sum(-1) > 1
+    if tie.any():
+        even = (code // 2) * 2
+        code = torch.where(tie, even.to(torch.uint8), code)
+    vals = grid.to(wb.dtype)[code.long()]
+    deq = torch.where(sign, -vals, vals) * scale
+    return code | (sign.to(torch.uint8) << 3), deq
+
+
+# Floor first so it wins ties; +1 (ceil) only when the clipped amax costs more
+# than the bulk loses from the coarser step. Never below floor. Same static
+# E8M0 rule the unified OCP quantizer uses (mxfp4_ocp_quant._scan_exponent);
+# the scale is chosen from the weights alone and never activation-weighted.
+_SCAN_DELTAS = (0, 1)
+
+
 def quantize_mxfp4(w: torch.Tensor, chunk: int = 2048):
     """[N, K] float -> (packed uint8 [N, K/2], e8m0 uint8 [N, K/32]). Round-half-even.
 
@@ -73,21 +103,22 @@ def quantize_mxfp4(w: torch.Tensor, chunk: int = 2048):
     amax = wb.abs().amax(-1)
     # OCP: the block scale is a power of two chosen so the block maximum lands at the top of the
     # element range. e2m1's largest normal is 6.0 = 1.5 * 2^2, hence the -2.
-    exp = torch.where(amax > 0, torch.floor(torch.log2(amax)) - 2.0, torch.zeros_like(amax))
-    exp = exp.clamp(-127, 127)
-    scale = torch.exp2(exp)
-    v = wb / scale.unsqueeze(-1)
-    sign = torch.signbit(v)
-    mag = v.abs().clamp(max=E2M1_MAX)
-    grid = E2M1.to(w.device)
-    # nearest representable magnitude, ties to even code
-    d = (mag.unsqueeze(-1) - grid).abs()
-    code = d.argmin(-1).to(torch.uint8)
-    tie = (d.min(-1).values.unsqueeze(-1) == d).sum(-1) > 1
-    if tie.any():
-        even = (code // 2) * 2
-        code = torch.where(tie, even.to(torch.uint8), code)
-    code = code | (sign.to(torch.uint8) << 3)
+    base = torch.where(amax > 0, torch.floor(torch.log2(amax)) - 2.0, torch.zeros_like(amax))
+    base = base.clamp(-127, 127)
+    # Pick floor or one exponent above by per-group plain MSE (lower is better).
+    exp = base
+    best_mse = None
+    for delta in _SCAN_DELTAS:
+        cand = (base + delta).clamp(-127, 127)
+        _, deq = _codes_at(wb, cand)
+        mse = ((wb - deq) ** 2).sum(-1)
+        if best_mse is None:
+            best_mse = mse
+        else:
+            take = mse < best_mse
+            best_mse = torch.where(take, mse, best_mse)
+            exp = torch.where(take, cand, exp)
+    code, _ = _codes_at(wb, exp)
     code = code.reshape(n, k)
     packed = (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous()
     e8m0 = (exp + 127).to(torch.uint8).contiguous()

@@ -3,9 +3,11 @@
 Reports acc/draft, tokens per update and completion tok/s over the whole set -- tens of thousands of
 tokens across every pool source, instead of the 3-5 prompts of bench_decode_ctx.
 Usage: eval_drafter.py <heldout.jsonl> <out.json> [max_tokens]"""
-import json, sys, time, urllib.request
+import json, os, sys, time, urllib.request
 prompts, out = sys.argv[1], sys.argv[2]; max_tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 512
-URL = "http://localhost:8080/v1/chat/completions"; MODEL = "Qwen3.8-PARO-MXFP4"; METRICS = "http://localhost:8080/metrics"
+URL = os.environ.get("BENCH_URL", "http://localhost:8080/v1/chat/completions")
+MODEL = os.environ.get("BENCH_MODEL", "Qwen3.8-PARO-MXFP4")
+METRICS = os.environ.get("BENCH_METRICS", "http://localhost:8080/metrics")
 def counters():
     time.sleep(2.0); raw = urllib.request.urlopen(METRICS, timeout=10).read().decode(); o = {}
     for line in raw.splitlines():

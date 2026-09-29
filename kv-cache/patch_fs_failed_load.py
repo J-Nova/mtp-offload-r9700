@@ -65,6 +65,15 @@ if "_RADIANCE_FANOUT_MAX = int(" not in s:
 if "def invalidate(self, keys" not in (ASYNC_LOOKUP.read_text() if ASYNC_LOOKUP.exists() else ""):
     raise SystemExit("[radiance] needs patch_kv_offload_lookup_cache_invalidate.py applied first")
 
+# 0.29.0's submit_load already tracks _load_job_keys and mark_miss()es the failed
+# keys, so the radiance forget() would be a second, conflicting bookkeeping path.
+if "def submit_load(self, job_metadata: TransferJob) -> None:" in s:
+    print(
+        "[radiance] fs failed-load forget skipped: 0.29.0's submit_load already "
+        "tracks load keys and mark_miss()es a failed load (upstream supersedes)"
+    )
+    raise SystemExit(0)
+
 # 1. async_lookup.py: forget() right before cleanup().
 apply(
     ASYNC_LOOKUP,

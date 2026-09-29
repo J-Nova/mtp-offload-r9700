@@ -170,6 +170,12 @@ services:
       # Phase 2 (behavioral): reconcile re-ask + prompt last-block alignment.
       - RADIANCE_RECONCILE_REASK=${RADIANCE_RECONCILE_REASK:-1}
       - RADIANCE_ALIGN_PROMPT_LAST_BLOCK=${RADIANCE_ALIGN_PROMPT_LAST_BLOCK:-1}
+      # Mamba store cadence (patch_mamba_stride.py): a Mamba group holds ONE recurrent state but
+      # the store path writes a full 6-group snapshot at every chunk boundary (~4.17x temporal
+      # amplification). Keep every Nth snapshot; 1 disables. Prereq: RADIANCE_OFFLOAD_EAGLE_GROUPS.
+      # At N=4 the CPU tier holds ~2.4x more tokens; the cost is a truncated-prefix dead zone
+      # (a prefix shorter than N chunks gets no external hit). Matches serve-mxfp4.sh:919.
+      - RADIANCE_MAMBA_STORE_STRIDE=${RADIANCE_MAMBA_STORE_STRIDE:-4}
       # Phase 5 (optional metrics): lookup counters, debug instrument, tier report, promotion wallclock, miss deferral.
       - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-1}
       - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-1}
@@ -376,6 +382,12 @@ services:
       # Phase 2 (behavioral): reconcile re-ask + prompt last-block alignment.
       - RADIANCE_RECONCILE_REASK=${RADIANCE_RECONCILE_REASK:-1}
       - RADIANCE_ALIGN_PROMPT_LAST_BLOCK=${RADIANCE_ALIGN_PROMPT_LAST_BLOCK:-1}
+      # Mamba store cadence (patch_mamba_stride.py): a Mamba group holds ONE recurrent state but
+      # the store path writes a full 6-group snapshot at every chunk boundary (~4.17x temporal
+      # amplification). Keep every Nth snapshot; 1 disables. Prereq: RADIANCE_OFFLOAD_EAGLE_GROUPS.
+      # At N=4 the CPU tier holds ~2.4x more tokens; the cost is a truncated-prefix dead zone
+      # (a prefix shorter than N chunks gets no external hit). Matches serve-mxfp4.sh:919.
+      - RADIANCE_MAMBA_STORE_STRIDE=${RADIANCE_MAMBA_STORE_STRIDE:-4}
       # Phase 5 (optional metrics): lookup counters, debug instrument, tier report, promotion wallclock, miss deferral.
       - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-1}
       - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-1}

@@ -16,3 +16,4 @@ libr4d/
 # editor / os
 *.swp
 .DS_Store
+.radiance-knobs.json

@@ -80,7 +80,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _patchlib import apply  # noqa: E402
+from _patchlib import apply, apply_any  # noqa: E402
 
 VLLM = Path(sys.prefix) / "lib" / f"python3.{sys.version_info.minor}" / "site-packages" / "vllm"
 if not VLLM.exists():
@@ -172,11 +172,9 @@ apply(
 )
 
 # --- 3. the splitter --------------------------------------------------------------------
-apply(
-    MGR,
-    anchor='''    @override
-    def submit_store(self, job_metadata: JobMetadata) -> None:''',
-    new='''    def _radiance_split(self, io_fn, paths, offsets, n_threads):
+# submit_store's parameter type drifted JobMetadata -> TransferJob in 0.29.0; insert
+# the helper before whichever signature is present.
+_FANOUT_SPLIT_HELPER = '''    def _radiance_split(self, io_fn, paths, offsets, n_threads):
         """radiance R3.14: turn one job into a list of partials, one per batch.
 
         Returns a single full-range partial for jobs of 0 or 1 blocks, which is
@@ -215,16 +213,32 @@ apply(
             for a, b in _radiance_batches(total, n_batches)
         ]
 
-    @override
-    def submit_store(self, job_metadata: JobMetadata) -> None:''',
+'''
+
+apply_any(
+    MGR,
+    variants=[
+        (
+            "    @override\n    def submit_store(self, job_metadata: JobMetadata) -> None:",
+            _FANOUT_SPLIT_HELPER
+            + "    @override\n    def submit_store(self, job_metadata: JobMetadata) -> None:",
+        ),
+        (
+            "    @override\n    def submit_store(self, job_metadata: TransferJob) -> None:",
+            _FANOUT_SPLIT_HELPER
+            + "    @override\n    def submit_store(self, job_metadata: TransferJob) -> None:",
+        ),
+    ],
     sentinel="def _radiance_split",
     label="3 fs manager: _radiance_split helper",
 )
 
 # --- 4. STORE path ----------------------------------------------------------------------
-apply(
+apply_any(
     MGR,
-    anchor='''        task = functools.partial(
+    variants=[
+        (
+            '''        task = functools.partial(
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             self._primary_kv_view,
@@ -233,21 +247,47 @@ apply(
             self._use_o_direct,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])''',
-    new='''        tasks = self._radiance_split(  # radiance R3.14
+            '''        tasks = self._radiance_split(  # radiance R3.14
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._radiance_n_write_threads,
         )
         self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)''',
+        ),
+        (
+            # 0.29.0 hoists `keys = list(job_metadata.keys)` and uses it in the paths.
+            '''        task = functools.partial(
+            batch_store_block,
+            [self.file_mapper.get_file_name(key) for key in keys],
+            self._primary_kv_view,
+            [int(bid) * self._block_size for bid in job_metadata.block_ids],
+            self._block_size,
+            self._use_o_direct,
+        )
+        self._pool.enqueue_store(job_metadata.job_id, 1, [task])''',
+            '''        tasks = self._radiance_split(  # radiance R3.14
+            batch_store_block,
+            [self.file_mapper.get_file_name(key) for key in keys],
+            [int(bid) * self._block_size for bid in job_metadata.block_ids],
+            self._radiance_n_write_threads,
+        )
+        self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)''',
+        ),
+    ],
     sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_store_block,",
     label="4 fs manager: fan the store path out",
 )
 
 # --- 5. LOAD path -----------------------------------------------------------------------
-apply(
-    MGR,
-    anchor='''        task = functools.partial(
+# 0.29.0 rewrote submit_load around a `load_task()` closure that also records per-task
+# progress, so the one-task split no longer maps cleanly. Skip load fan-out there; store
+# fan-out (4) still applies.
+if '''        task = functools.partial(
+            batch_load_block,''' in MGR.read_text():
+    apply(
+        MGR,
+        anchor='''        task = functools.partial(
             batch_load_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             self._primary_kv_view,
@@ -257,16 +297,21 @@ apply(
         )
 
         self._pool.enqueue_load(job_metadata.job_id, 1, [task])''',
-    new='''        tasks = self._radiance_split(  # radiance R3.14
+        new='''        tasks = self._radiance_split(  # radiance R3.14
             batch_load_block,
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._radiance_n_read_threads,
         )
         self._pool.enqueue_load(job_metadata.job_id, len(tasks), tasks)''',
-    sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_load_block,",
-    label="5 fs manager: fan the load path out",
-)
+        sentinel="tasks = self._radiance_split(  # radiance R3.14\n            batch_load_block,",
+        label="5 fs manager: fan the load path out",
+    )
+else:
+    print(
+        "[radiance] fs load fan-out skipped: this vLLM uses a load_task() closure "
+        "(no functools.partial to split); store fan-out still applies"
+    )
 
 print(f"[radiance] R3.14 applied -- target "
       f"{os.environ.get('RADIANCE_FS_FANOUT_TARGET_MB', '32')} MiB, "
