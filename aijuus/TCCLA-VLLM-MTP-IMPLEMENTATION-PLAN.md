@@ -126,12 +126,12 @@ behaviour on its own; both are integrations, not A/Bs:
 ### Phase 1.0: Draft-head surface port (R9700 branch, lossless)
 
 **Priority**: HIGH — cheapest gain, feeds and de-risks Phase 1.1
-**Status**: PARTIAL — `RADIANCE_DRAFT_VOCAB` + `RADIANCE_DRAFT_EXACTSET` implemented in
-`radiance_drafthead.py` and GPU-validated (outside-`-inf`; argmax matches the full head wherever
-the winner is kept; EXACTSET leaves exactly RERANK eligible/row); `RADIANCE_DRAFT_FUSED` still
-pending. Wired into the MTP registry entry (`RADIANCE_DRAFT_VOCAB=/patches/aijuus/draft_keep/keep-union.txt`,
-`RADIANCE_DRAFT_EXACTSET=1`). Keep file built by `aijuus/draft_keep/build_vocab.py` = union of the
-branch seed and our collector output (caveat (a)).
+**Status**: COMPLETE — `RADIANCE_DRAFT_VOCAB` + `RADIANCE_DRAFT_EXACTSET` + `RADIANCE_DRAFT_FUSED`
+implemented in `radiance_drafthead.py` and GPU-validated. FUSED is byte-identical to the unfused
+exact-set path and inert without the exact set; since the MTP entry keeps EXACTSET off (tau-gate,
+finding #3), FUSED is inert here until the tau-gate confidence is decoupled. Wired into the MTP
+registry entry (`RADIANCE_DRAFT_VOCAB=…/keep-union.txt`). Keep file built by
+`aijuus/draft_keep/build_vocab.py` (union of the branch seed and our collector output).
 **Source**: `aijuus/refs/r9700-tp1/REVIEW-LOG.md` §2 + `aijuus/draft_keep/qwen38-draft-vocab-49152.txt`
 
 Ports onto OUR existing `radiance_drafthead.py` (the int2 head we already run). Its hooks —
@@ -252,7 +252,9 @@ defaults to the same union set (`keep-union.json`).
 #### 3.1 Adopt the R9700 prebuilt TunableOp table for the skinny fp8 GEMMs
 **Priority**: HIGH (replaces the earlier sweep-from-scratch plan)
 **Expected Impact**: +5.1% sampled (measured on the branch); MTP GEMMs 1.30 → 0.85 ms, lm_head 2.47 → 2.32 ms, step 41.8 → 39.9 ms, acceptance identical
-**Status**: IN PROGRESS (2026-09-29) — entrypoint copies the table to `/cache/tunableop/skinny0.csv`; `PYTORCH_TUNABLEOP_*` wired in `_defaults.server_env` (VERBOSE=1 temporary). Awaiting redeploy to confirm the table loads, then benchmark and drop VERBOSE.
+**Status**: DONE (2026-09-29) — table copied to `/cache/tunableop/skinny0.csv` and loaded
+(`reading tuning results from …`). Smoke bench: greedy flat, sampled 64.5 → 72.3 t/s (+12% on the
+test prompt), acceptance unchanged. VERBOSE removed.
 
 **Details:**
 - The branch's `fp8_tune.py` sweeps the six skinny fp8 shapes at every M the V2 runner uses (1..12) → a 78-entry per-shape table; hipBLASLt's heuristic gives the MTP drafter's N=5120 GEMMs a 16x128 tile (40 workgroups on 64 CUs, no split) and the lm_head 64x64; tuned solutions are 16x16.

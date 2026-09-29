@@ -6,7 +6,32 @@ Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 
 ---
 
-## 2026-09-29 (cont.) — Phase 1.1 BLOCKED; Phase 3.1 wired
+## 2026-09-29 (cont. 2) — Phase 1.0 FUSED ported+validated; Phase 3.1 verified
+
+### Deploy verification (redeploy)
+- `[radiance] using patched r4d.so from /home/juup/.cache/radiance-libr4d/v0.5.0-w4a16`;
+  `import r4d` reports **0.5.0** and exposes `gemm_w4a16_nt_m64` → **Phase 1.1 fully unblocked**.
+- `[aot-envkey] applied` (env key changed with the new env).
+- `[radiance] DRAFT_VOCAB: 49159 of 248320 rows … EXACTSET=False`.
+- TunableOp: **`reading tuning results from /cache/tunableop/skinny0.csv`** (validator accepted).
+
+### Phase 1.0 COMPLETE — `RADIANCE_DRAFT_FUSED` ported
+- Ported `_draft_head_int2_cand` + `_rerank_scatter` + `_apply_vocab_fused` from the R9700 branch,
+  env-gated `RADIANCE_DRAFT_FUSED` (default 0).
+- GPU-validated with the live module: with the exact set on, fused output is **byte-identical** to
+  the unfused path (same finite mask, same bf16 values, 32 finite/row == RERANK); with the exact
+  set off it is correctly **inert** (identical, all 512 sub rows finite).
+- Precondition: `_radiance_topk_only` (EXACTSET or a candidate processor) and no embedding bias.
+  Our MTP keeps EXACTSET **off** (finding #3, tau-gate), so FUSED is inert here until the tau-gate
+  confidence is decoupled from the masked row — the follow-up that would unlock EXACTSET+FUSED.
+
+### Phase 3.1 verified (TunableOp table)
+- Table loads. Smoke bench on one prompt: greedy 123.3 t/s (flat), **sampled 64.5 → 72.3 t/s
+  (+12%)**, acceptance ~60% unchanged. Dropped the temporary `PYTORCH_TUNABLEOP_VERBOSE=1`.
+
+---
+
+## 2026-09-29 (cont.) — Phase 1.1 blocked then unblocked; Phase 3.1 wired
 
 ### Verified live (post-redeploy)
 - `[aot-envkey] applied` (env key `1f2e5a7357ca`); new AOT dir seeded from the base inductor cache.
