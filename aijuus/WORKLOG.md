@@ -1633,3 +1633,28 @@ kernel `restore_ok` flag + fallback via the incremental `r4d.so` rebuild (higher
 cache-key bump, must compile with the image's hipcc). Chosen route: **3c** (self-contained overlay),
 with 3a as an interim loud-failure if desired. Lazy is currently off (`RADIANCE_GDN_LAZY=0`), so E3 is a
 memory optimization (≈865 MB/req device → ≈260 MB), not a correctness emergency.
+
+## 2026-09-30 (cont. 51) — MT1 is single-session; alignment/phase hypothesis
+
+`turnbench --exact --sessions A` (single session, to ~108k, warm pool, gates off) STILL diverges:
+COLD A1 EXACT, then A2 GPU partial hit DIFF (first-div 28, max|dlp| 1.05e-01), decreasing over turns
+(A4 4.99e-03). So MT1 is **not cross-session** — it is the single-session GPU partial-hit resume, and
+my `hit_oracle` (synthetic 24k prompt, reply reuse) was exact because it did not hit the problematic
+alignment/shape that turnbench's stdlib prompts do.
+
+Leading hypotheses, now narrowed to the resume geometry (not the KV writer, which the oracle showed
+faithful):
+1. **Chunk-phase / block alignment.** The resumed suffix prefill starts on a grid anchored at the hit
+   boundary; cold starts at 0. GDN scan is chunk-local (internal `CHUNK=64`; block 880; gcd=16) and
+   R4D/MXFP4 splits are per-launch, so phase-shifted grids can round differently, amplified to whole
+   ulp flips by fp8 KV. `patch_sched_align_last_block` (`RADIANCE_ALIGN_PROMPT_LAST_BLOCK=1`) fixes the
+   prompt's last block only, not the resume boundary's state write.
+2. A genuine writer/reader mismatch that appears only at specific lengths (e.g. reply block reused
+   before re-prefill, or a state block written at a hit boundary different from cold).
+Either way it is *resume-specific*, not a general KV corruption.
+
+Decisive next test (research §4 tertiary): a **phase sweep** — pick prompt lengths so the resume/hit
+boundary is an exact multiple of `lcm(880, 64, chunk)` vs deliberately misaligned, and see if aligned
+is EXACT and misaligned DIFFs. If aligned is exact → chunk-phase (inherent; E1 validation should be on
+acceptance, not bit-exactness). If misaligned-exact too and only specific lengths diverge → writer-side
+bug to bisect (`patch_sched_align_last_block` / reconcile / mamba stride).
