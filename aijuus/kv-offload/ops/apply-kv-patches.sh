@@ -46,5 +46,9 @@ if [ "${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-1}" = 1 ]; then run_patch patch_
 
 # E2 lazy-commit: take the store D2H off the step path (inert unless RADIANCE_OFFLOAD_LAZY_COMMIT=1).
 run_patch patch_offload_lazy_commit.py "offload lazy commit (E2)"
+# E1 suffix-only invalidation plumbing (inert unless RADIANCE_OFFLOAD_SUFFIX_INV=1).
+run_patch patch_offload_suffix_inv.py "offload suffix invalidation (E1)"
+# E1 Stage 2: include eagle/MTP groups (inert unless RADIANCE_OFFLOAD_EAGLE_INCLUDE=1).
+run_patch patch_offload_eagle_include.py "offload eagle include (E1 Stage 2)"
 
 exit 0

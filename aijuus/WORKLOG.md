@@ -1481,3 +1481,42 @@ standalone cause. Remaining hypotheses need in-engine instrumentation (can wedge
 scratch allocated inside a FULL-graph replay, **H2** `_match_gather` OOB row read at ML=160k,
 **H5** bad continuation corrupting the next step. Next step is the cont.42 in-engine plan
 (pre-create/pre-compile buffers before capture first, as it is the most likely and is a safe change).
+
+## 2026-09-30 (cont. 45) — E1 Stage 1 implemented + validated inert
+
+`aijuus/kv-offload/patches/patch_offload_suffix_inv.py` (wired into `apply-kv-patches.sh`, gate
+`RADIANCE_OFFLOAD_SUFFIX_INV`, default off). Stage 1 = full invalidation plumbing, end to end:
+- `v1/core/sched/scheduler.py`: on `num_rejected>0` (post-rollback) call `connector.on_draft_rejected`.
+- `offloading_connector.py`: delegate.
+- `offloading/scheduler.py`: `on_draft_rejected` — for eagle/MTP groups, `first_stale = b//C-1`,
+  `manager.invalidate(stale_keys)`, trim `offload_keys`, clamp `next_stored_chunk_idx`.
+- `kv_offload/base.py`: `OffloadingManager.invalidate` default no-op.
+- `cpu/manager.py`: conservative removal (ready, `ref_cnt==0` only; no tombstones needed yet).
+- `tiering/manager.py`: primary + cascade to secondary tiers.
+- `tiering/fs/manager.py`: remove on-disk file + `_lookup_manager.invalidate` (forget).
+
+Fix during bring-up: fs tier lacks `Collection` import → annotation-free signature (boot had
+crash-looped, now fixed). Validation: gate=1 vs gate=0, `temperature=0 seed=1`, two prompts →
+**byte-identical** outputs, boot healthy, no crash. Stage 1 is confirmed inert (the volatile tail is
+not stored under the current drop, so there is nothing to invalidate).
+
+Next: **Stage 2** (`RADIANCE_OFFLOAD_EAGLE_INCLUDE`) — remove the store-side trailing-chunk drop and
+the load-side extra-chunk pop so MTP groups are included; needs the multi-turn byte-identical oracle.
+
+## 2026-09-30 (cont. 46) — E1 Stage 2 implemented + correctness-validated
+
+`aijuus/kv-offload/patches/patch_offload_eagle_include.py` (wired into `apply-kv-patches.sh`, gate
+`RADIANCE_OFFLOAD_EAGLE_INCLUDE`, default off): removes the two withholding mechanisms so eagle/MTP
+groups are included — the store-side trailing-chunk drop (`storable_chunks`) and the load-side extra
+query/pop (`query_max`+`required_window`+`num_hit_chunks`). Correctness relies on Stage 1 invalidation.
+
+Validation (both gates on, `temperature=0 seed=1`, two prompts): outputs **byte-identical** to the
+gate-off baseline; per-position acceptance unchanged (p0≈0.78 … p3≈0.61, p4≈0.01); boot healthy, no
+crash. conc-8 aggregate was cache-confounded (new RADIANCE_* env → fresh AOT key), so the offload
+hit-rate benefit was NOT measured here — that needs the multi-turn/prefix-reuse oracle
+(`turnbench --exact`) with a warm cache. Both E1 patches are left **dormant** (default off), so the
+served configuration is unchanged. Baseline restored (c1 67.8).
+
+- Both E1 stages are runtime patches only; no image/libr4d rebuild.
+- E3 remains the one item needing a (small, incremental, non-image) `r4d.so` rebuild via the rx10
+  extras patch, or a runtime Triton fail-closed validator.
