@@ -238,3 +238,14 @@ turn 4+. COLD-only turns are EXACT. This is independent of E1 (both arms diverge
 
 This is a real correctness item the E1 work surfaced; it gates trusting MTP group inclusion at high
 hit rates, and may affect production multi-turn long-context quality today.
+
+## 20. Resume bit-identity research verdict (cont.54)
+
+Solvable only by (A) a pure-Python overlay that quantizes every prefix hit down to cold's real chunk
+stride `C = B·floor((CHUNK−draft_slots)/B) = 15840` (`single_type_kv_cache_manager.py:77,783`,
+`kv_cache_coordinator.py:666`; align the Mamba/offload store grid to C too) — cost: forfeits up to
+~15.8k tokens of reuse per hit, and `prompt ≤ CHUNK` forces hit=0; or (B) kernel work (absolute-phase
+GDN scan + fixed-grid fp16 state rounding; alters cold numerics; `r4d.so` rebuild). **Not recommended**:
+fp8 KV sets a ~6 %/element noise floor, chunked prefill re-partitions reductions, and R4D opts out of
+batch-invariance (`radiance_r4d_attn.py:260`, `backend.py:200,321`). Validate on acceptance/served
+semantics. Route A left unimplemented (benefit-destroying) unless bit-exactness becomes a hard requirement.
