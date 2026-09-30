@@ -88,6 +88,15 @@ LB_METRICS_STALE = float(os.environ.get("RADIANCE_LB_METRICS_STALE", "3"))
 # the shared fs KV tier already gives cross-instance reuse (see WORKLOG W4).
 LB_AFFINITY = _on("RADIANCE_LB_AFFINITY", "0")
 LB_AFFINITY_SLACK = int(os.environ.get("RADIANCE_LB_AFFINITY_SLACK", "1"))
+# Ordered preference of endpoints/instance names (comma-separated, most preferred
+# first). When the fleet is IDLE -- no request running/queued and no open
+# connection -- the least-loaded tie-break sends the cold/first request to the
+# most preferred card instead of the arbitrary round-robin default. Under real
+# concurrent load the preference is ignored and the router still balances across
+# every card (so the weaker card is used, not starved). Empty = disabled.
+# Example: "vllm-1" or "http://vllm-1:8001".
+LB_PREFER = [p.strip() for p in os.environ.get("RADIANCE_LB_PREFER", "").split(",")
+             if p.strip()]
 # Verbose per-request routing decision.
 LB_DEBUG = _on("RADIANCE_LB_DEBUG", "0")
 
@@ -178,9 +187,24 @@ def all_targets(state):
     return list(groups.values())
 
 
+def _pref_rank(endpoint):
+    """Rank of an endpoint in LB_PREFER (lower = more preferred).
+
+    Matches either the full endpoint or a substring (so an instance name like
+    "vllm-1" matches "http://vllm-1:8001"). Unranked endpoints sort last.
+    """
+    for i, p in enumerate(LB_PREFER):
+        if p == endpoint or p in endpoint:
+            return i
+    return len(LB_PREFER)
+
+
 def pick(targets):
     """Least-in-flight target that is both state-ready and independently alive;
-    ties rotate round-robin so sequential bursts still spread across instances."""
+    ties rotate round-robin so sequential bursts still spread across instances.
+
+    When LB_PREFER is set and the least-loaded tier is idle (no open connections
+    to any candidate), the preferred card wins the tie instead of rotating."""
     global _rr
     ready = [t for t in targets
              if t["ready"] and _alive.get(t["endpoint"], True)]
@@ -191,6 +215,9 @@ def pick(targets):
         minload = min(_inflight.get(t["endpoint"], 0) for t in ready)
         cands = [t for t in ready
                  if _inflight.get(t["endpoint"], 0) == minload]
+        if LB_PREFER and minload == 0:
+            cands.sort(key=lambda t: (_pref_rank(t["endpoint"]), t["endpoint"]))
+            return cands[0]
         t = cands[_rr % len(cands)]
         _rr += 1
     return t
@@ -223,18 +250,34 @@ def load_key(endpoint):
     return (float(infl), 0.0, 0.0, infl)
 
 
+def _idle(endpoint):
+    """True when nothing is running or queued on the endpoint and no request is
+    open to it, i.e. it is safe to treat this as a cold/first request."""
+    k = load_key(endpoint)
+    return k[0] == 0 and k[1] == 0 and k[3] == 0
+
+
 def order_targets(targets):
     """Ready, independently-alive targets, least-loaded first.
 
     Retry/failover order for `_forward`. With LB_RR the equally-loaded head
     group rotates round-robin (`_rr`) so sequential / non-overlapping traffic
     spreads across cards instead of always hitting vllm-0.
+
+    When LB_PREFER is set and the whole fleet is idle, the head group is ordered
+    by preference instead of rotating, so the first/cold request lands on the
+    most capable card. As soon as anything is in flight the normal least-loaded
+    + round-robin path takes over.
     """
     ready = [t for t in targets
              if t["ready"] and _alive.get(t["endpoint"], True)]
     if not ready:
         return []
     ready.sort(key=lambda t: (load_key(t["endpoint"]), t["endpoint"]))
+    if LB_PREFER and _idle(ready[0]["endpoint"]):
+        ready.sort(key=lambda t: (load_key(t["endpoint"]),
+                                  _pref_rank(t["endpoint"]), t["endpoint"]))
+        return ready
     if not LB_RR:
         return ready
     global _rr
@@ -805,8 +848,9 @@ def main():
         threading.Thread(target=metrics_loop, daemon=True).start()
     log("model-router up on :%d (registry: %s)"
         % (PORT, ", ".join(sorted(reg)) or "<none>"))
-    log("lb: rr=%d metrics=%d affinity=%d slack=%d debug=%d"
-        % (int(LB_RR), int(LB_METRICS), int(LB_AFFINITY), LB_AFFINITY_SLACK, int(LB_DEBUG)))
+    log("lb: rr=%d metrics=%d affinity=%d slack=%d debug=%d prefer=%s"
+        % (int(LB_RR), int(LB_METRICS), int(LB_AFFINITY), LB_AFFINITY_SLACK,
+           int(LB_DEBUG), ",".join(LB_PREFER) or "<none>"))
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     # Default backlog is 5, which drops connections under a high-concurrency burst.

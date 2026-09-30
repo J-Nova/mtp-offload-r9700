@@ -31,7 +31,7 @@ Status legend: **READY** = actionable now, no blockers · **BLOCKED** = needs a 
 | B1 | #58114 PLE — verdict + portable D2H-sync audit | **VERDICT (nothing to port)** | none | none found | `gdn_attn.py` already CPU-side |
 | B2 | #58845 MLA qlnorm — verdict + redundant-call audit | **VERDICT** | none | audit only | our attention forward |
 | B3 | #57951 long-prefill-alone scheduler overlay | BLOCKED | C decision | small; needed only if threshold≠0 | new `patch_sched_long_prefill_alone.py` |
-| B4 | #54440 rDNA h256 backend finding | BLOCKED | reload | A/B R4D vs AITER attn at h256 | `R4D_ATTN=0` switch |
+| B4 | #54440 rDNA h256 backend finding | **IN PROGRESS** | redeploy | A/B R4D vs AITER attn at h256 | `R4D_ATTN=0` in compose (AITER arm staged) |
 | B5 | #39060 speculative/sparse prefill | PARKED | research track | biggest TTFT, high cost | scheduler + model runner |
 | C | `long_prefill_token_threshold` policy | **VERDICT** | B3 if adopted | keep 0 unless p99 ITL bad | `config/scheduler.py` |
 | D | Measurement & validation harness | **READY** | per change | — | BetterBench sweep + 18k probe + GSM8K |

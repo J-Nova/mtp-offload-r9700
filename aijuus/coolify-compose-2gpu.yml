@@ -85,12 +85,12 @@ services:
       - SYS_PTRACE
     # Hard HOST RAM cap (VLLM_MEM_LIMIT). VRAM is NOT bounded by this: GPU device memory
     # is a different cgroup resource, so --gpu-memory-utilization 0.98 still uses all of
-    # VRAM. Sized for the default 12 GiB pinned CPU KV tier plus runtime/load headroom
+    # VRAM. Sized for the 16 GiB pinned CPU KV tier plus runtime/load headroom
     # (lower KV_OFFLOAD_GIB if you shrink this). Memswap == mem so a runaway cannot refill
     # host swap (which was 100% full at both 2026-09-23 freezes); it is cgroup-OOM-killed
-    # instead. Production runs 24g; the repo .env carries a stale single-instance 20g.
-    mem_limit: ${VLLM_MEM_LIMIT:-24g}
-    memswap_limit: ${VLLM_MEM_LIMIT:-24g}
+    # instead. Production runs 28g; the repo .env carries a stale single-instance 20g.
+    mem_limit: ${VLLM_MEM_LIMIT:-28g}
+    memswap_limit: ${VLLM_MEM_LIMIT:-28g}
     networks:
       - coolify
     expose:
@@ -127,12 +127,13 @@ services:
       # here: the entrypoint resolves them per model from model-registry.json
       # (keyed by this instance's model in state.json). A value set here would be
       # silently overwritten by that eval -- see the model-selection block below.
-      # CPU KV-offload tier, GiB (0 = off). Default 12 per PERFORMANCE.md for the prod
-      # 2-instance shape: both share the host /dev/shm (ipc: host, 32 G) so the two tiers must
-      # SUM to <= ~28 G (both default 12 -> 24 G). The head cap is "auto" (a fair share per
-      # concurrent request) so an over-subscribed cycle restores a partial prefix instead of
-      # nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV offload".
-      - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-12}
+      # CPU KV-offload tier, GiB (0 = off). Default 16 per PERFORMANCE.md for the prod
+      # 2-instance shape: both share the host /dev/shm (ipc: host, raised to 40 G; was 32 G)
+      # so the two tiers SUM to <= ~36 G (both default 16 -> 32 G) plus headroom. The head cap
+      # is "auto" (a fair share per concurrent request) so an over-subscribed cycle restores a
+      # partial prefix instead of nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV
+      # offload".
+      - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-16}
       # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
       # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
       # (Adaptive Replacement Cache) balances recency + frequency, which can lift the
@@ -307,12 +308,12 @@ services:
       - SYS_PTRACE
     # Hard HOST RAM cap (VLLM_MEM_LIMIT). VRAM is NOT bounded by this: GPU device memory
     # is a different cgroup resource, so --gpu-memory-utilization 0.98 still uses all of
-    # VRAM. Sized for the default 12 GiB pinned CPU KV tier plus runtime/load headroom
+    # VRAM. Sized for the 16 GiB pinned CPU KV tier plus runtime/load headroom
     # (lower KV_OFFLOAD_GIB if you shrink this). Memswap == mem so a runaway cannot refill
     # host swap (which was 100% full at both 2026-09-23 freezes); it is cgroup-OOM-killed
-    # instead. Production runs 24g; the repo .env carries a stale single-instance 20g.
-    mem_limit: ${VLLM_MEM_LIMIT:-24g}
-    memswap_limit: ${VLLM_MEM_LIMIT:-24g}
+    # instead. Production runs 28g; the repo .env carries a stale single-instance 20g.
+    mem_limit: ${VLLM_MEM_LIMIT:-28g}
+    memswap_limit: ${VLLM_MEM_LIMIT:-28g}
     networks:
       - coolify
     expose:
@@ -345,12 +346,13 @@ services:
       # here: the entrypoint resolves them per model from model-registry.json
       # (keyed by this instance's model in state.json). A value set here would be
       # silently overwritten by that eval -- see the model-selection block below.
-      # CPU KV-offload tier, GiB (0 = off). Default 12 per PERFORMANCE.md for the prod
-      # 2-instance shape: both share the host /dev/shm (ipc: host, 32 G) so the two tiers must
-      # SUM to <= ~28 G (both default 12 -> 24 G). The head cap is "auto" (a fair share per
-      # concurrent request) so an over-subscribed cycle restores a partial prefix instead of
-      # nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV offload".
-      - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-12}
+      # CPU KV-offload tier, GiB (0 = off). Default 16 per PERFORMANCE.md for the prod
+      # 2-instance shape: both share the host /dev/shm (ipc: host, raised to 40 G; was 32 G)
+      # so the two tiers SUM to <= ~36 G (both default 16 -> 32 G) plus headroom. The head cap
+      # is "auto" (a fair share per concurrent request) so an over-subscribed cycle restores a
+      # partial prefix instead of nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV
+      # offload".
+      - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-16}
       # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
       # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
       # (Adaptive Replacement Cache) balances recency + frequency, which can lift the
@@ -545,6 +547,12 @@ services:
       - HOLD_TIMEOUT=${HOLD_TIMEOUT:-3600}
       # HOLD_TIMEOUT/KEEPALIVE_SECONDS/POLL_SECONDS/UPSTREAM_TIMEOUT also default
       # in the script; override them here to A/B the hold behaviour.
+      # Idle routing preference (see model-router.py): when nothing is in flight,
+      # send the cold/first request to this card instead of the round-robin
+      # default. Concurrent load still balances across both cards. vllm-1 is the
+      # CPU-attached x16 slot; vllm-0 sits behind the chipset at 1x Gen3, so it
+      # is the backup, not the default. Comma-separate to rank more than one.
+      - RADIANCE_LB_PREFER=${RADIANCE_LB_PREFER:-vllm-1}
     volumes:
       # state.json is read per request; trigger.json is written here (so the dir
       # is mounted rw even though only trigger.json is new).

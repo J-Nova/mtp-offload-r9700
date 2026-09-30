@@ -4,6 +4,95 @@ A running, dated log of what was changed, why, and how it was verified. Newest e
 Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 `TCCLA-VLLM-MTP-IMPLEMENTATION-PLAN.md`, which hold the analysis and the plan.
 
+## 2026-09-30 (cont. 33) — Reorder batch threshold corruption analysis + overlay fix plan (vLLM #55894 / PR #55898)
+
+### Problem
+`GPUModelRunner.calculate_reorder_batch_threshold` takes `min` across all attention groups'
+`reorder_batch_threshold`. FlashInfer reports 1; GDN/Mamba report `1+k` (k = num_spec_tokens).
+With MTP spec-decode + a threshold-1 backend (FlashInfer), the global threshold drops to 1,
+causing draft-decode rows to be misclassified as prefills → state slot corruption → garbage output.
+Upstream issue: [vLLM #55894](https://github.com/vllm-project/vllm/issues/55894); fix PR:
+[vLLM #55898](https://github.com/vllm-project/vllm/pull/55898) (open since Sep 8, 2026, 22 days,
+awaiting review from 10 code owners, no approvals).
+
+### Current deployment: safe by configuration
+- `serve-mxfp4.sh:784` pins target to `ATTN=R4D`
+- `serve-mxfp4.sh:438` pins dflash drafter to `TRITON_ATTN`
+- `serve-mxfp4.sh:831` pins MTP drafter to `ATTN=R4D`
+- R4D (`radiance_r4d_attn.py:146`) subclasses `TritonAttentionMetadataBuilder`; neither sets
+  `reorder_batch_threshold` → inherits `None` from `backend.py:592`
+- GDN reports `1+SPEC` (5 or 8)
+- So global threshold stays at `1+SPEC` — no corruption under current config
+- Production entrypoint (`aijuus/kv-offload/ops/entrypoint.sh:177,179`) also hardcodes R4D/TRITON_ATTN
+
+### PR #55898 fix (verified via diff)
+Adds `requires_decode_ordering: bool = False` to `AttentionMetadataBuilder` base class; sets `True`
+on GDN/Linear/Mamba builders; modifies `calculate_reorder_batch_threshold` to use
+`max(min(all_thresholds), max(required_thresholds))` instead of plain `min`.
+
+### Recommended approach: runtime patch script (Option 2)
+Create `aijuus/kv-offload/patches/patch_reorder_threshold.py` (not a build-time overlay patch in
+`aijuus/patches/`):
+- **Why runtime**: no Docker rebuild needed; consistent with existing pattern
+  (`patch_gdn_metadata.py`, `patch_dynamic_depth.py`, etc.); easier to remove when upstream merges
+- **Defensive value**: doesn't change current behavior (threshold already 5/8) but protects against
+  configuration drift (drafter backend change to FlashInfer, new threshold-1 backend, etc.)
+- **Risk**: patch may conflict if upstream changes same files before PR merges; standard aijuus
+  revert workflow handles removal when PR lands
+
+### Plan (6 steps, code not yet written — user said "do not edit code yet")
+1. Create `aijuus/kv-offload/patches/patch_reorder_threshold.py`: idempotent Python script that
+   (a) adds `requires_decode_ordering: bool = False` to `AttentionMetadataBuilder` in `backend.py`,
+   (b) sets `True` on GDN/Linear/Mamba builders, (c) modifies `calculate_reorder_batch_threshold`
+   in `gpu_model_runner.py` to use `max(min(all), max(required))` logic, (d) includes logger.info
+   when threshold is raised
+2. Verify clean apply against current vLLM source
+3. Test CPU regression
+4. Deploy (user restarts containers)
+5. Monitor upstream PR #55898; remove patch when it merges
+6. Add documentation to WORKLOG and plan doc
+
+### Relevant files
+- `vllm/v1/worker/gpu_model_runner.py:7308-7326`: `calculate_reorder_batch_threshold`
+- `vllm/v1/attention/backend.py:592`: `AttentionMetadataBuilder` base class
+- `vllm/v1/attention/backends/gdn_attn.py`: `GDNAttentionMetadataBuilder`
+- `vllm/v1/attention/backends/mamba_attn.py`: `BaseMambaAttentionMetadataBuilder`
+- `vllm/v1/attention/backends/linear_attn.py`: `LinearAttentionMetadataBuilder`
+- `aijuus/kv-offload/patches/patch_gdn_metadata.py`: existing runtime patch pattern to follow
+
+---
+
+## 2026-09-30 (cont. 32) — B4: R4D vs AITER attention A/B prep
+
+**Task B4** from `MTP-PREFILL-PLAN.md`: A/B `R4D_ATTN=0` (AITER unified attention) vs
+`R4D_ATTN=1` (R4D paged attention, default) at h256. Baseline (R4D_ATTN=1, vllm-0,
+BetterBench prefill sweep): **1813 / 1995 / 2117 / 2050 / 1909 PP t/s** at 2k/8k/16k/32k/64k.
+
+### Current state
+- vllm-0: ThinkingCap (ready), vllm-1: MTP (ready). User requested MTP on both cards via
+  `POST /load` (controller needs restart first to pick up the new endpoint).
+- `R4D_ATTN` not explicitly set in compose or registry; defaults to `1` (R4D).
+
+### Plan
+1. ~~Add `R4D_ATTN=0` to compose env for both vllm services (after `R4D_ATTN_FP8=3`).~~ **DONE** (both vllm-0 and vllm-1 blocks).
+2. User **redeploys** the compose (Coolify) to activate `R4D_ATTN=0` (AITER attention). A `/reload` won't pick up compose env changes.
+3. Run BetterBench prefill sweep on the MTP card with `R4D_ATTN=0`.
+4. Revert to `R4D_ATTN=1` (remove the line or set to 1).
+5. User redeploys again.
+6. Run BetterBench prefill sweep with `R4D_ATTN=1` (confirm baseline).
+7. Compare and log results.
+
+### Current state (2026-09-30 10:05)
+- vllm-0: ThinkingCap (ready), vllm-1: MTP (ready).
+- Compose now has `R4D_ATTN=0` for both vllm services (AITER attention arm).
+- Next: user redeploy + run prefill sweep.
+
+### Notes
+- `R4D_ATTN` is read by the vLLM/radiance stack to select the attention backend:
+  `1` = R4D paged attention (default, +37.8% prefill at 260k vs AITER per README),
+  `0` = AITER unified attention (`VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1` already set).
+- This is a config-only change; no code changes needed. One reload per arm.
+
 ## 2026-09-30 (cont. 31) — model-controller: new `POST /load` (load a model onto cards that don't have it)
 
 The controller previously had no way to *change* which model an instance serves over
