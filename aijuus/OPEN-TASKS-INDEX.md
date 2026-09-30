@@ -41,7 +41,7 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 
 | ID | Task | Status | Source | Notes |
 |---|---|---|---|---|
-| K1 | **MTP KV calibrate**: `./calibrate-kv.sh SPEC_METHOD=mtp SPEC=8` to replace the interim borrowed pin (`8761733283`; later reduced to ~6.5 GiB manually). | READY | WORKLOG cont.28 4, R9700 residual | needs GPU run/serving stopped |
+| K1 | MTP KV calibrate. | **N/A for compose** cont.57 | `calibrate-kv.sh` writes `~/.cache/radiance-mxfp4/kv-profiles.local.tsv`, which only `serve-mxfp4.sh` reads; our compose uses explicit registry `kv_cache_memory` pins. Recalibrate only if we move to serve-mxfp4.sh. |
 | K2 | ~~Dflash pilot pins 8.16 GiB~~ **CLOSED**: `dflash-27B-MXFP4`, `-blend`, `-Thinkingcap` now all `6442450944` (6.0 GiB). Remaining: `mtp-27B-MXFP4-Thinkingcap` still `8761733283` (not served; align if/when piloted). | CLOSED | WORKLOG cont.27/28 5 | registry shows 6.0 GiB |
 | K3 | Capture-ladder trim: dense 26 sizes vs `[4,8,12,16,20,24,28,32]`. | **CLOSED (neutral)** cont.33 | `RADIANCE_CAPTURE_SIZES` knob added; coarse 11-bucket ladder c8 370.9 vs 369.1, KV 171,320 unchanged. |
 
