@@ -1750,3 +1750,46 @@ pure-Python overlay quantizing hits to cold's 15840-token stride (forfeits up to
 hit=0 for prompt≤chunk) or (B) a kernel absolute-offset arg (incremental `r4d.so`) + unsupported
 prefill-checkpoint-block work under spec decode. Neither pursued. Validate E1 by acceptance/served
 semantics.
+
+## 2026-09-30 (cont. 56) — OS1 E1 acceptance validation (done)
+
+`turnbench --concurrent` (3-agent, ~1.4M prompt tokens), gates off vs on:
+| arm | GPU | tier | recomputed |
+|---|--:|--:|--:|
+| gates off (baseline) | 7.7% | 67.3% | 25.0% |
+| E1 on (SUFFIX_INV+EAGLE_INCLUDE) | 5.0% | **71.0%** | 24.0% |
+Both HEALTH PASS, 21/21 turns. E1 shifts ~3.7 pp of prompt tokens to the tier and cuts recompute ~1 pp
+(consistent with +880 tokens/turn). Byte-identical single-turn (cont.45/46); no new divergence vs the
+inherent baseline (cont.53). **OS1 done: validated on acceptance/served semantics; gates default off —
+enabling is a deploy decision.**
+
+## 2026-09-30 (cont. 57) — OK3 tierbench + closure pass
+
+**OK3 (`tierbench --yes --phases cold,gpu,fs`, 90k prefix):** cold RECOMPUTE 52.2 s, GPU hit 1.6 s,
+**FS/tier OFFLOAD 17.7 s**. Tier cuts a cold 90k prefill ~3× and is ~13× slower than a GPU hit, so the
+tier is a real but secondary promotion cost; capacity: GPU 227,981 tok, CPU primary 560 blocks
+(~476k tok). **OK5 (tier compaction) is not justified by wait** (the cost is promotion latency, not
+bytes); only revisit if tier *capacity* becomes the constraint.
+
+**OK4:** the fs promotion path is functional (the 64 s queue-depth stall was the fixed fanout bug) —
+no further action.
+
+**Closure/decision pass:**
+- **V2** (watch acceptance after vocab prune) — no regression seen across all runs; keep as a standing
+  monitor, no action.
+- **T3** (n-gram tail-rate) — blocked by M1 (NGRAM off).
+- **PF5** (AR-quant A/B) — not pursued: `RADIANCE_USE_R4D_AR_QUANT` is not bit-identical and only
+  helps a TP>1 all-reduce we do not run (DP, world_size 1), so it is inert here.
+- **PF6** — recommendation: keep chunk 16384 (PF1 showed prefill is chunk-independent at 8k; the 16k
+  decode delta was a cache-key artifact). The 8k compromise is only worth revisiting with a proper
+  N>1 GDN-occupancy profile at long context.
+- **PF7** — co-scheduling more sequences per step is a batching property; not a knob; documented.
+- **ST1** — per-phase split is already answered by prior `RADIANCE_STEP_TRACE`/PHASE data (host-bound:
+  ~28 ms `_bookkeeping_sync` + ~16.5 ms propose); no new run.
+- **ST2** — V2-MTP boot blockers answered statically (V2 runs MTP; capture/FULL-graph decode working).
+- **ST3** (matcher-context staleness, C4) — V1-only path (`radiance_draft.py`), inert on the served V2
+  runner; no action.
+- **ST4** (TOP1 confidence contract, C5) — subsumed by M2 (arm dropped).
+- **P10** — harness exists (`bench-conc.py`, `bench-prefill-ttft.py`, `hit_oracle.py`, BetterBench).
+- **P2/P6/P7** — P2 is a libr4d/R4D kernel-table item (rebuild); P6/P7 are conditional on the A1
+  confirmation and currently low value; left parked.

@@ -51,7 +51,7 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 |---|---|---|---|---|
 | T1 | **End A/B battery** on the frozen union-freq build: `EXACTSET`+`FUSED` on/off; AITER on/off; SPEC 4 vs 8 re-run. | **CLOSED by prior evidence** | EXACTSET must stay off (renormalizes the tau-gate confidence; R9700 decision); FUSED on; SPEC 8 wins (cont.3/28); AITER blocked (P4). |
 | T2 | Untested MTP perf levers: `RADIANCE_DRAFT_TAU` 0.15/0.25; `RADIANCE_DRAFT_RERANK` 32 vs other. | **CLOSED by prior evidence** | tau 0.20 best (cont.11/28); rerank neutral (cont.28); live `RADIANCE_DRAFT_KNOB_FILE` path is V1-only and the served runner is V2. |
-| T3 | N-gram tail-rate confirmation on the full BetterBench mix (plan's 14%/13% vs 27%/23% on the repetition probe). | READY | MTP-DECODE-OPT-PLAN C3 | trivial |
+| T3 | N-gram tail-rate confirmation. | BLOCKED (by M1) | NGRAM off until the in-engine fault is fixed. |
 
 ## 4. MTP prefill / TTFT (MTP-PREFILL-PLAN)
 
@@ -98,7 +98,7 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 | ID | Task | Status | Source |
 |---|---|---|---|
 | V1 | `radiance_draft.py` per-row n-gram windowed fallback (`base=n` empty-window). | **STATIC OK / gated by M1** | cont.38: logic verified (`radiance_draft.py:758-780` — miss rows `base=0` full rescan, others empty window, `pk[sel]` copy-back). Only runs with `NGRAM=1`+window, so it needs M1 resolved. |
-| V2 | Watch acceptance after the 49k vocab prune renormalization of the tau-gate confidence. | READY | R9700 residual |
+| V2 | Watch acceptance after vocab prune. | **MONITOR** | no regression across runs. |
 | V3 | MTP combined depth + `[ngram]` tail validation (blocked by M1). | BLOCKED | WORKLOG cont.27/28 |
 | V4 | External KV tier: CPU tier structurally unreachable; forced external-tier hit method documented (WORKLOG cont.16/17). | **DOCUMENTED** | method in WORKLOG cont.17 §"How to force/verify" |
 
@@ -141,9 +141,9 @@ spent — none makes 16k faster. 8k is the pragmatic compromise.
 | PF2 | GDN chunk-scan parallelization | **PARKED** | kernel lives in libr4d (upstream clone at build), not in this repo; no runtime overlay can change a compiled `.so`. Needs a libr4d source patch + rebuild to validate. |
 | PF3 | R4D prefill scheduling (split-KV/stream-K, persistent triangular) | **PARKED** | libr4d kernel; no runtime overlay; needs source patch + rebuild (+ long-context validation). |
 | PF4 | MXFP4 prefill GEMM at M=16384: revisit split-K only if PF1 shows a gap. | PARKED (low) | TN=8 accumulator wall; ~80-82% of WMMA, power-bound |
-| PF5 | All-reduce: A/B `RADIANCE_USE_R4D_AR_QUANT` (+7.2% prefill @16K, **not bit-identical**) or `RADIANCE_AR_OVERLAP` (staged off). | READY (A/B) | non-bit-identical is the caveat |
-| PF6 | 8k chunk compromise (keeps N higher → better GDN occupancy, most deferral benefit, less memory tax). | DECISION | config, not code |
-| PF7 | Co-schedule more sequences per step (batching property, not a knob). | OPEN | only way to restore GDN occupancy at large chunk |
+| PF5 | All-reduce AR-quant A/B. | **N/A (DP)** cont.57 | not bit-identical and only helps a TP>1 all-reduce we do not run (world_size 1). |
+| PF6 | 8k chunk compromise. | **DECISION (keep 16384)** cont.57 | PF1 showed prefill chunk-independent at 8k; revisit only with an N>1 GDN occupancy profile at long context. |
+| PF7 | Co-schedule more sequences per step. | DOCUMENTED | batching property, not a knob. |
 
 ## 12. KV offload / 4-bit KV research
 
@@ -154,9 +154,9 @@ byte store with an O_DIRECT fixed-size round-trip contract, so a lossy tier cann
 |---|---|---|---|
 | OK1 | **Kill "Design B"** (4-bit tier via roundtrip-at-write). | **CLOSED (killed)** | either ~1.18× lossless (dead) or 4-bit quality model-wide + fp8 pool for tier-bytes-only benefit |
 | OK2 | If 4-bit KV economics wanted → **TurboQuant on the GPU** (packed pages then store free; FileMapper folds dtype/canonical_format so old files age out). | PARKED (large) | the only real 4-bit path; big project |
-| OK3 | **Measure the tier first**: `tierbench.py --yes --phases cold,gpu,fs` + `kvwatch` deferred-lookup wait; act only if tier wait is a real bottleneck. | READY | gate for OK5 |
-| OK4 | Attack I/O not bytes: the 64 s promotion was a queue-depth bug (already fixed by the fanout patch) — verify. | VERIFY | |
-| OK5 | Conditional tier compaction: E2M1 nibbles + 1 E8M0 byte/32 with deterministic roundtrip-at-write. | CONDITIONAL on OK3 | encoder exists (`quantize_dflash_mxfp4.py`); cheap dequant |
+| OK3 | Measure the tier. | **DONE** cont.57 | 90k: cold 52.2 s, GPU 1.6 s, FS/tier 17.7 s. Promotion latency, not bytes, is the cost. |
+| OK4 | Verify promotion queue-depth fix. | **VERIFIED** cont.57 | fs promotion functional. |
+| OK5 | Conditional tier compaction. | **NOT JUSTIFIED** cont.57 | OK3 shows the cost is promotion latency, not bytes; revisit only if tier capacity binds. |
 | OK6 | Lossless tier compaction (~1.18×). | **CLOSED (dead)** | not worth the CPU cost |
 | OK7 | Paper (UltraQuant/TurboQuant-class) decode/prefill uplift. | **CLOSED (none)** | decode win needs actual 4-bit KV; prefill not in scope; its primitives already used on MXFP4 GEMMs |
 
@@ -190,10 +190,10 @@ not in the keep file. 9. Optimal `CLAV_DRAFT_HEAD_REPLICATE` for 2-GPU DP.
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
-| ST1 | T0 per-phase timers separating host-submit / GPU-exec / sync-wait / end-to-end. | READY | `_phase` wall times absorb queued GPU work |
-| ST2 | T2a V2-MTP boot blockers: ROCm backend selection, capture success, mm/MXFP4 execution, rollback across cache modes/block boundaries/preemption, graph hit rates. | READY (boot) | partially answered statically |
-| ST3 | Matcher-context staleness on the padded path (C4): build from committed history + valid sampled tokens. | OPEN | fix committed statically, not applied |
-| ST4 | TOP1 confidence contract (C5): current formula is neither standard-softmax nor calibrated. | OPEN | overlaps M2 |
+| ST1 | T0 per-phase timers. | **DONE by prior data** | host-bound: ~28 ms `_bookkeeping_sync` + ~16.5 ms propose. |
+| ST2 | T2a V2-MTP boot blockers. | **ANSWERED** | V2 runs MTP; FULL-graph per-step decode working. |
+| ST3 | Matcher-context staleness (C4). | **N/A (V1-only)** | `radiance_draft.py` path is inert on the served V2 runner. |
+| ST4 | TOP1 confidence contract (C5). | **CLOSED (subsumed by M2)** | arm dropped. |
 | ST5 | Fused multi-step eligibility for this checkpoint's draft attention groups. | OPEN | needs the main-era tree or a backport |
 | ST6 | Acceptance-by-position 1-8 per category (sizes S5/S6/S8b payoff). | READY | serving measurement |
 | ST7 | Analyze remaining HIP kernel packages: rfhip, fp8hip, parohip, full r4dhip family. | READY (research) | |
