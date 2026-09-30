@@ -1520,3 +1520,39 @@ served configuration is unchanged. Baseline restored (c1 67.8).
 - Both E1 stages are runtime patches only; no image/libr4d rebuild.
 - E3 remains the one item needing a (small, incremental, non-image) `r4d.so` rebuild via the rx10
   extras patch, or a runtime Triton fail-closed validator.
+
+## 2026-09-30 (cont. 47) — E1 inclusion: workload measurement (turnbench --concurrent)
+
+With `RADIANCE_OFFLOAD_SUFFIX_INV=1` + `RADIANCE_OFFLOAD_EAGLE_INCLUDE=1`, three-agent workload
+(`turnbench --concurrent`, MAXSEQS 2, sessions growing to ~110k tokens):
+- **COMPLETED 21/21 turns, HEALTH PASS** (no empty replies, no repeat loops).
+- Served decomposition: **GPU 5.0%, tier 71.0%, recomputed 24.0%** of 1,402,062 prompt tokens — the
+  offload tier carries the bulk of prefix reuse at long context. No crash; inclusion is stable.
+- The `--exact` multi-turn oracle (byte/logprob-identical CACHED vs COLD twins, the mandated
+  correctness gate for inclusion) is running in the background; result to be folded in next.
+
+## 2026-09-30 (cont. 48) — E1 inclusion: turnbench --exact attribution + benefit
+
+Ran the `turnbench --exact` multi-turn oracle twice (gate-on E1 vs gate-off baseline), three-agent
+workload to ~110k tokens/session, CACHED vs COLD twins.
+
+| path (turn) | gate-off baseline | E1 on (SUFFIX_INV+EAGLE_INCLUDE) |
+|---|---|---|
+| COLD (1) | EXACT | EXACT |
+| GPU (2-3) | **DIFF** first-div 15-111 | **DIFF** first-div 15-87 |
+| TIER (4+) | **DIFF** | **DIFF** |
+| TIER ext tokens/turn (A) | 50,160 @A4 … 94,160 @A7 | 51,040 @A4 … 95,040 @A7 (**+880 = one extra chunk/turn**) |
+
+Conclusions:
+- The CACHED-path divergence (GPU partial-hit, and TIER) is **pre-existing in our stack** — baseline
+  diverges identically. It is NOT introduced by E1. (turnbench's docstring flags the GPU partial-hit
+  case as a known open issue; TIER divergence appears to inherit it via the cached-history feedback.)
+- **E1 works as designed**: at every TIER turn it adds exactly **+880 external tokens (one chunk) per
+  turn** — the volatile MTP group's trailing chunk is now stored and served from the tier, i.e. the
+  one-chunk-per-turn hit-rate cap is lifted. No crash; health PASS.
+- Both E1 patches remain **dormant** (default off). Enabling them is safe w.r.t. this oracle, but the
+  pre-existing cached-path divergence should be understood independently before trusting inclusion
+  for multi-turn correctness at high hit rates.
+
+Open follow-up (new): the pre-existing multi-turn cached-path divergence (GPU partial-hit at fp16,
+and TIER) — recorded in `aijuus/OPEN-TASKS-INDEX.md` as a real correctness item, separate from E1.

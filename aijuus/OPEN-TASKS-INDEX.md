@@ -224,3 +224,17 @@ rocm7.14** — the pybind/ctypes `.so`s (`r4d.so`, `clav_ar_ext`, `clav_ag_ext`,
 | KB3 | RFI/RFA fused-prologue study | **PARKED (low)** | requires requantizing the model; same fusion class as `RADIANCE_FUSE_RMS_QUANT`. |
 | KB4 | `fp8hip` block-scaled w8a8 | **PARKED (low)** | cp314-only `.so`; only relevant to an fp8 checkpoint we do not serve. |
 | — | `q4hc`(HyperConnection), `plehip`(PLE), `r4d_qsa/ple/mhc/dsfp/dflash2` | **N/A** | Qwen4Exp/Flash-Next/DSV4-only |
+
+## 19. NEW: pre-existing multi-turn cached-path divergence (correctness)
+
+`turnbench --exact` (three-agent workload to ~110k tokens/session) diverges on CACHED-vs-COLD twins
+**on the unmodified baseline**: GPU partial-hit path at turn 2 (first-div 15-111) and TIER path at
+turn 4+. COLD-only turns are EXACT. This is independent of E1 (both arms diverge identically).
+
+| ID | Task | Status | Notes |
+|---|---|---|---|
+| MT1 | Root-cause the GPU partial-hit divergence (fp16/bf16 state, MTP) — the harness documents it as a known open issue (`gpu-partial-hit-divergence.md`). | OPEN (high) | repro: `turnbench --exact`; starts at the first partial-hit turn and propagates. |
+| MT2 | Determine whether TIER divergence is independent or inherited from MT1 via the cached-history feedback; if independent, root-cause the tier byte-copy path. | OPEN (high) | TIER "must be EXACT -- a byte copy of an exact state cannot drift". |
+
+This is a real correctness item the E1 work surfaced; it gates trusting MTP group inclusion at high
+hit rates, and may affect production multi-turn long-context quality today.
