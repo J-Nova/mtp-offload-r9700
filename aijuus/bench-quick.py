@@ -24,6 +24,18 @@ import sys
 import time
 import urllib.request
 
+# vllm-0/vllm-1 require Bearer auth (VLLM_API_KEY). A/B against a compose instance
+# rather than the self-launched serve-mxfp4.sh arm needs the header on every call.
+API_KEY = os.environ.get("BENCH_API_KEY") or os.environ.get("VLLM_API_KEY") or ""
+
+
+def _req(url, body=None, headers=None):
+    hdrs = dict(headers or {})
+    if API_KEY:
+        hdrs["Authorization"] = "Bearer " + API_KEY
+    return urllib.request.Request(url, body, hdrs)
+
+
 # (category, prompt). Small prompts -> prefill is negligible and decode dominates.
 PROMPTS = [
     ("echo",
@@ -44,7 +56,7 @@ PROMPTS = [
 def metrics(base):
     """(drafts, draft_tokens, accepted) cumulative, or None. Only deltas are meaningful."""
     try:
-        raw = urllib.request.urlopen(base + "/metrics", timeout=10).read().decode()
+        raw = urllib.request.urlopen(_req(base + "/metrics"), timeout=10).read().decode()
     except Exception:
         return None
     want = {"n": "vllm:spec_decode_num_drafts_total",
@@ -64,7 +76,7 @@ def one(base, model, prompt, gen, temp, seed, timeout, thinking=False):
                        "max_tokens": gen, "temperature": temp, "seed": seed, "stream": True,
                        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
                        "stream_options": {"include_usage": True}}).encode()
-    req = urllib.request.Request(base + "/v1/chat/completions", body, {"Content-Type": "application/json"})
+    req = _req(base + "/v1/chat/completions", body, {"Content-Type": "application/json"})
     time.sleep(0.5)  # let the previous request's counters settle before snapshotting
     before = metrics(base)
     t0 = time.time()
@@ -133,10 +145,13 @@ def main():
     ap.add_argument("--thinking", type=int, default=int(os.environ.get("BENCH_THINKING", "0")),
                     help="1 = enable qwen3 thinking (mirrors production chat); 0 = off (repeatable)")
     ap.add_argument("--out", default="")
+    ap.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY") or os.environ.get("VLLM_API_KEY") or "")
     a = ap.parse_args()
+    global API_KEY
+    API_KEY = a.api_key
     if not a.model:
         try:
-            a.model = json.load(urllib.request.urlopen(a.base + "/v1/models", timeout=10))["data"][0]["id"]
+            a.model = json.load(urllib.request.urlopen(_req(a.base + "/v1/models"), timeout=10))["data"][0]["id"]
         except Exception as e:
             sys.exit(f"could not discover a model at {a.base}: {e}")
     # A tiny request first: it forces one engine step so a live knob-file change (benched A/B arms on
@@ -147,7 +162,7 @@ def main():
                                "max_tokens": 8, "temperature": a.temp, "seed": a.seed,
                                "chat_template_kwargs": {"enable_thinking": bool(a.thinking)}}).encode()
             urllib.request.urlopen(
-                urllib.request.Request(a.base + "/v1/chat/completions", body, {"Content-Type": "application/json"}),
+                _req(a.base + "/v1/chat/completions", body, {"Content-Type": "application/json"}),
                 timeout=a.timeout).read()
         except Exception:
             pass

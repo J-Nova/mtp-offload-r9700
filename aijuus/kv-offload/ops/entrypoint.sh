@@ -48,6 +48,8 @@ print("SPEC_SCHEDULE=" + q(pick("spec_schedule", "")))
 print("KV_CACHE_MEMORY=" + q(e.get("kv_cache_memory", "")))
 print("VERIFY_HEAD=" + q(e.get("verify_head", "")))
 print("MAX_MODEL_LEN=" + q(pick("max_model_len", "")))
+# Per-model chunk override (registry wins over the compose global below).
+print("REG_CHUNK=" + q(pick("max_num_batched_tokens", "")))
 print("KV_CACHE_DTYPE=" + q(pick("kv_cache_dtype", "fp8")))
 print("CHAT_TEMPLATE=" + q(pick("chat_template", "")))
 print("TOOL_CALL_PARSER=" + q(pick("tool_call_parser", "")))
@@ -60,12 +62,23 @@ for k in sorted(env):
     print("export " + k + "=" + q(env[k]))
 PY
 )"
+# ---- A/B override hook (dev): /patches/aijuus/ab.env, sourced on every container start ----
+# Container env is fixed at `docker create`; a `docker kill && docker start` only re-runs this
+# entrypoint, so an A/B arm that needs different RADIANCE_* values writes them here and restarts
+# instead of recreating the service. Applied after the registry server_env so it has the last word.
+if [ -f /patches/aijuus/ab.env ]; then
+  echo "[run] A/B overrides from aijuus/ab.env:"
+  sed 's/^/    /' /patches/aijuus/ab.env
+  set -a; . /patches/aijuus/ab.env; set +a
+fi
 echo "[run] model selected: $MODEL_NAME path=$VLLM_MODEL_PATH spec=$SPEC_METHOD/$SPEC_TOKENS kv=$KV_CACHE_MEMORY vhead=${VERIFY_HEAD:-auto}"
 
 # ---- parametrized serving shape (env vars, defaults = measured TP=1) ----
 SEQS=${MAX_NUM_SEQS:-8}
 MLEN=${MAX_MODEL_LEN:-160000}
-CHUNK=${MAX_NUM_BATCHED_TOKENS:-4096}
+# Chunk = model-registry override (per model) > compose global MAX_NUM_BATCHED_TOKENS > 4096.
+# Changing it invalidates the calibrated kv_cache_memory pin (pin key includes chunk).
+CHUNK=${REG_CHUNK:-${MAX_NUM_BATCHED_TOKENS:-4096}}
 SMETHOD=${SPEC_METHOD:-dflash}
 case "$SMETHOD" in dflash|mtp|none) ;; *) echo "SPEC_METHOD must be dflash, mtp or none, got: $SMETHOD" >&2; exit 1 ;; esac
 
@@ -164,7 +177,18 @@ if [ "$SPEC_STEP" -gt 1 ]; then
   done
 fi
 SIZES=$(printf '%s\n' $_sizes | sort -n -u | paste -sd, -)
+# A/B override (K3): an explicit comma-separated capture ladder replaces the derived union.
+if [ -n "${RADIANCE_CAPTURE_SIZES:-}" ]; then
+  SIZES="$RADIANCE_CAPTURE_SIZES"
+  echo "[run] capture ladder overridden: $SIZES"
+fi
 CAPLIST="[$SIZES]"
+
+# Target attention backend. A/B parity with serve-mxfp4.sh: R4D_ATTN=0 selects AITER unified
+# attention, 1 (default) keeps R4D. For mtp the drafter backend follows the target.
+ATTN=R4D
+if [ "${R4D_ATTN:-1}" = "0" ]; then ATTN=ROCM_AITER_UNIFIED_ATTN; fi
+echo "[run] attention backend: $ATTN (R4D_ATTN=${R4D_ATTN:-1})"
 
 # Speculative config. mtp needs no drafter checkpoint; dflash does; none disables it.
 if [ "$SMETHOD" = none ]; then
@@ -174,7 +198,7 @@ elif [ "$SMETHOD" = mtp ]; then
   if [ -n "$SPEC_SCHEDULE" ]; then
     SPEC_SCHED_ARG=",\"num_speculative_tokens_per_batch_size\":$SPEC_SCHEDULE"
   fi
-  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"R4D\",\"disable_padded_drafter_batch\":$UNPAD$SPEC_SCHED_ARG}"
+  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":$UNPAD$SPEC_SCHED_ARG}"
 else
   SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$SPEC_DRAFTER\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":$UNPAD,\"draft_sample_method\":\"greedy\"}"
 fi
@@ -257,11 +281,23 @@ if [ -n "$SPEC_SCHEDULE" ]; then
 fi
 if [ "${RADIANCE_DYNAMIC_DEPTH:-0}" = "1" ]; then
   python3 patch_dynamic_depth.py || { echo "[run] FATAL: patch_dynamic_depth failed"; exit 1; }
+  # MTP confidence early-exit (port of tcclaviger dev patches/mtp_confidence_exit): shrinks
+  # proposer depth adaptively from the in-graph top-1 draft confidence. Inert unless
+  # RADIANCE_MTP_CONF_EXIT=1; depends on patch_dynamic_depth's loop/runner anchors.
+  python3 aijuus/kv-offload/patches/patch_mtp_conf_exit.py \
+    || echo "[run] WARN: patch_mtp_conf_exit failed (inert)"
 fi
 python3 patch_ar_geometry.py
 python3 patch_ar_qbits.py
 python3 patch_ar_3rank.py
 python3 patch_gdn_glue.py
+# Mamba conv spec-scratch zeroing (port of tcclaviger dev v1/worker/mamba_utils.py): zero the
+# align state-copy destination tail so a verify at accepted offset > 0 cannot convolve the
+# destination page's previous owner. Correctness; gated, default off.
+if [ "${RADIANCE_MAMBA_ZERO_SCRATCH:-0}" = "1" ]; then
+  python3 aijuus/kv-offload/patches/patch_mamba_scratch_zero.py \
+    || { echo "[run] FATAL: patch_mamba_scratch_zero failed"; exit 1; }
+fi
 if [ "${RADIANCE_GDN_LAZY:-0}" = 1 ]; then python3 patch_gdn_lazy.py; fi
 python3 patch_qwen3_thinkoff.py || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
 
@@ -364,7 +400,7 @@ exec /opt/radiance_entrypoint.sh \
   --kv-cache-dtype "$KV_CACHE_DTYPE" --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.98 $KV_ARG $OFF_ARG \
   --max-model-len "$MLEN" --max-num-seqs "$SEQS" --max-num-batched-tokens "$CHUNK" \
-  --attention-backend R4D \
+  --attention-backend "$ATTN" \
   $SPEC_ARG \
   $DRY_ARG \
   $ASYNC_ARG \

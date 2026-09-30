@@ -93,3 +93,21 @@ aijuus/apply.sh                        # re-apply the overlay for build/run
 The deployment bind-mounts the repo root at `/patches` and reads personal files
 via the `aijuus/` prefix (see `aijuus/coolify-compose-2gpu.yml`); the registry is
 at `/patches/aijuus/model-registry.json` inside the container.
+
+## Deployment-default reality (2026-09-30)
+
+The upstream `README.md`/`DOCKERHUB.md` describe the radiance default tree; our served MTP runs the
+vLLM 0.29 **V2** runner, where some of those knobs are inert or superseded:
+
+- **`RADIANCE_DRAFT_TAU` / `RADIANCE_DRAFT_SCHEDULE` / n-gram controller:** the `radiance_draft.py`
+  controller hooks are V1 (`gpu_model_runner`/`SpecDecodeBaseProposer`). On V2 they are inert; the
+  taugate-equivalent is `patch_mtp_conf_exit.py` (dormant, A/B negative). Live draft-depth control is
+  `patch_dynamic_depth.py` + `spec_schedule` (batch-size K = 5 at bs1-2, 4 at bs3-8).
+- **N-gram tail (`RADIANCE_DRAFT_NGRAM`):** kept `0`; standalone matcher repro passes but the in-engine
+  bs≥2 HSA fault is an integration issue (WORKLOG cont.34). Matcher `NSPEC` must be a power of two.
+- **`RADIANCE_DRAFT_HEAD_TOP1`:** dropped (neutral and mutually exclusive with the vocab prune; the
+  fused top-1 head crashes on reload). Leave `0`.
+- **Attention backend:** `--attention-backend R4D` (entrypoint honours `R4D_ATTN`, default 1).
+  AITER unified attention is rejected with the KV offload connector (`KV connector not supported`).
+- **Test method:** the compile cache (`~/.radiance-cache-…-tp1s`) is performance-critical; clear it,
+  boot once to rebuild, then `docker restart` and measure the warm boot only (WORKLOG cont.32).

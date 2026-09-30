@@ -1148,3 +1148,211 @@ Proper fix: run `./calibrate-kv.sh SPEC_METHOD=mtp SPEC=8` and replace the inter
   checkout.
 - Continue: redeploy -> confirm `[aot-envkey] applied` and `DRAFT_VOCAB: 49160 of 248320 rows` ->
   smoke acceptance -> Phase 1.1 (W4 reduced head) or the `FUSED` draft-head kernel.
+
+---
+
+## 2026-09-30 (cont. 30) — tcclaviger dev MTP ragged-verify port: A/B on vllm-0 (negative)
+
+Ported the two "portable" items from `tcclaviger/vllm:dev` (29.06.18) and A/B-tested on vllm-0
+(`mtp-27B-MXFP4-blend`, conc 8 / single-stream, `aijuus/bench-conc.py` + `aijuus/bench-quick.py`).
+
+### A/B mechanism
+Container env is fixed at `docker create`; `docker kill && docker start` only re-runs the
+entrypoint. Added `aijuus/kv-offload/ops/entrypoint.sh` hook: sources `/patches/aijuus/ab.env`
+on every start (after the registry server_env), so a RADIANCE_* A/B arm is a file edit + restart,
+no recreate. Remove the file to restore the baseline.
+
+### Experiment 1 — fork's existing ragged verify (`patch_dynwidth.py`, was off in compose)
+Enabled `RADIANCE_DYNAMIC_WIDTH=1` (per-request EMA(accepted)+margin cap on verify width).
+conc 8 aggregate **361.9 -> 368.8 tok/s (+1.9%, within run spread)**. No effect single-stream
+(gated off below 3 running). Confirms cont.26: verify width is not the lever.
+
+### Experiment 2 — ported tcclaviger confidence early-exit (`patch_mtp_conf_exit.py`)
+New overlay: captures the top-1 draft probability in-graph, keeps a per-request survival product,
+stops each request's serial MTP draft at the first step below tau, and carries per-request
+`draft_lens` through `DraftTokensHandler` (placeholder-length path) so the target verifies ragged
+widths. Tau 0.5 (raw top-1 is ~0.9, so tcclaviger's calibrated 0.28 never fires here).
+- Diagnostic: bs8 all rows drop at step 2 -> width 4 -> **2**; bs2 keeps 5; bs1 prose -> 1.
+- conc 8 aggregate **361.9 -> 351.6 tok/s (-2.8%)**, single-stream **103.9 -> 95.1 (-8.5%)**,
+  `ms/step` flat/up (weight-bound target). Acceptance rate rose (50% -> 58%) but tokens/step fell
+  more than time. At bs1, prose dropped 67 -> 57 tok/s.
+- Baseline re-confirmed after revert: **364.0 tok/s** (dormant patch is a no-op).
+
+### Conclusion
+The tcclaviger MTP update is **not profitable on this stack**: the batch-size schedule
+(`spec_schedule` k=5/4) already sits at the per-concurrency optimum, the target forward is
+weight-stream-bound at our concurrency (MAXSEQS=8), and proposer depth has a hard geometry cliff
+below k=3 (cont.26). Raw top-1 confidence is uncalibrated; a calibrated estimator would add a lot
+of machinery to chase a schedule that already wins. The PLE-fusion and QSA-ring items are
+Qwen4Exp/Flash-Next-only and do not apply to this model.
+
+Artifacts left **dormant** (env-gated, default off): `aijuus/kv-offload/patches/patch_mtp_conf_exit.py`,
+the entrypoint `ab.env` hook, `aijuus/bench-conc.py`, bench-quick API-key support.
+Track B (mamba conv spec-scratch zeroing) remains **unimplemented**; the Triton align-copy tail
+hazard is structurally present and is the next correctness item if pursued.
+
+### Restart reminder
+`docker kill $(docker ps --format '{{.Names}}' | grep -m1 '^vllm-0') && \
+ docker start $(docker ps -a --format '{{.Names}}' | grep -m1 '^vllm-0')` — the **start** must
+use `docker ps -a` (a killed container is not in `docker ps`). Poll health every 20 s.
+
+## 2026-09-30 (cont. 31) — tcclaviger mamba spec-scratch zeroing port: A/B negative (-55%)
+
+Implemented `aijuus/kv-offload/patches/patch_mamba_scratch_zero.py` (gated
+`RADIANCE_MAMBA_ZERO_SCRATCH=1`), porting the dev's `v1/worker/mamba_utils.py` change: zero the
+align state-copy destination tail (columns `[num_dst_tokens, conv_width)`) in both conv layouts so
+a verify at accepted offset > 0 cannot convolve the destination page's previous owner.
+
+- Layout check: `get_conv_state_layout()` = **SD** (no `VLLM_SSM_CONV_STATE_LAYOUT` env), so only
+  the SD branch executes; the DS branch is dead code here.
+- Boot clean, `[mamba-zero] applied`, acceptance/output unchanged (acc/draft 1.98).
+- **conc 8 aggregate 361.9 -> 161.8 tok/s (-55%)**. A single masked u8 tail store per copy cannot
+  explain that volume (tail ~= token_bias*inner_size*elem = KBs); it is a Triton kernel
+  occupancy/recompile side effect of the added dynamic-range loop, not store bandwidth.
+- Reverted (reset `mamba_utils.py` from the image, removed `ab.env`); baseline re-confirmed
+  **363.9 tok/s**.
+
+Conclusion: the align state-copy is on the hot path, so this correctness fix must be a cheap
+vectorized store (or the conv-write side `ZERO_SPARE`) and only after reachability of the stale
+scratch is proven on our R4D GDN path. Not landed; `patch_mamba_scratch_zero.py` left dormant.
+
+Both tcclaviger dev items selected as "portable" (conf-exit/ragged-verify and conv scratch
+zeroing) are now A/B-closed as not profitable on this stack.
+
+## 2026-09-30 (cont. 32) — Corrected A/B method: compile cache is performance-critical; tcclaviger retests
+
+Advice taken: clear the compile cache on restart. Verified the caches and the effect.
+
+### Cache layout (vllm-0)
+- Host `<cache> = ~/.radiance-cache-w4a8-093-gdnm-nqft-fp8s-gnq-tp1s` -> container `/cache`
+  (`vllm`, `inductor`, `triton`, `aiter`, `tunableop`). vllm-1 uses a separate `...-b` dir, so
+  clearing vllm-0's cache does not disturb vllm-1. Container `/root/.cache/comgr` (ROCm compiler
+  cache) also persists across `docker restart`; `/root/.cache/huggingface` holds weights (never clear).
+- **Clearing the cache collapses throughput on the next boot** — baseline c1 **20.5** (vs 67),
+  c8 **157.6** (vs 364) — and a **warm restart restores it** (c1 67.2; artifacts rebuilt on the
+  cleared boot are reused). So the correct method is: clear -> boot1 (rebuild) -> `docker restart`
+  -> boot2 (warm) -> measure. Measuring boot1 is invalid.
+
+### Retests under clear+boot1+boot2 (vllm-0, mtp-27B-MXFP4-blend, conc-1/8, gen 256)
+| Arm | c1 agg | c8 agg | notes |
+|---|--:|--:|---|
+| baseline (R4D) | 71.0 | 369.1 | c1 per-rep deterministic and identical across arms |
+| `patch_mamba_scratch_zero` | 71.0 | 387.5 | **neutral** (c1 byte-identical run) |
+| `patch_mtp_conf_exit` tau 0.5 | 66.8 | 348.7 | **negative ~-5.5%**; acc rate up 50%->57%, ttft up |
+
+**Corrections vs cont.30/31:** the mamba arm's earlier **-55% was a stale-cache artifact** — the
+align-copy tail zeroing is perf-neutral and is a viable correctness hardening. The conf-exit
+result stands: negative at matched (fresh) cache. Both patches remain in the overlay; conf-exit
+is env-gated off.
+
+### P4 (R4D vs AITER attention) — BLOCKED
+`R4D_ATTN=0` -> `ROCM_AITER_UNIFIED_ATTN` boots fail: `ValueError: Selected backend
+...ROCM_AITER_UNIFIED_ATTN is not valid for this configuration. Reason: ['KV connector not
+supported']` (our OffloadingConnector). A/B needs `KV_OFFLOAD_GIB=0`; entrypoint now honours
+`R4D_ATTN` (default 1) for that future arm.
+
+### Cache-clear procedure
+```
+docker kill <vllm-0>; docker run --rm --user root -v <cache>:/cache --entrypoint bash \
+  stilldeadcode/vllm-radiance:0.9.3 -c 'rm -rf /cache/*'
+docker start <vllm-0>   # boot1, rebuild
+# wait health, then
+docker kill <vllm-0>; docker start <vllm-0>   # boot2 warm, then measure
+```
+
+## 2026-09-30 (cont. 33) — X2 closed N/A, K3 neutral
+
+### X2 reorder-threshold fix — N/A for our runner
+`calculate_reorder_batch_threshold` exists only in the **V1** runner
+(`v1/worker/gpu_model_runner.py:7325`); the served **V2** runner
+(`v1/worker/gpu/model_runner.py`) has no reorder-threshold path at all (no `reorder_batch_threshold`
+reference; builders set it but nothing aggregates it). The upstream #55894/#55898 bug and its fix
+therefore do not apply to the MTP V2 path. Closed; no patch written. Keep the backend invariant as a
+monitoring note only.
+
+### K3 capture-ladder trim — neutral
+Added `RADIANCE_CAPTURE_SIZES` (comma-separated override of the derived union) to the entrypoint and
+tested a coarse ladder `1,4,8,16,24,32,40,48,56,64,72` (11 buckets vs ~40), clear+boot1+boot2:
+- conc-8 **370.9** vs baseline 369.1 (neutral).
+- `GPU KV cache size` unchanged at 171,320 tokens → capture memory was not the binding constraint.
+No runtime benefit; knob left in (default off). K3 closed.
+
+## 2026-09-30 (cont. 34) — M1 n-gram fault: standalone repro PASSES; fault is in-engine integration
+
+Stopped vllm-0 to free card 0 and ran the new `aijuus/match_gpu_repro.py` off-server.
+
+| Variant (card 0, isolated) | Result |
+|---|---|
+| B=1, ctx 512, nspec 8, iters 60 | PASS |
+| B=2, ctx 512, nspec 8, iters 60 | PASS |
+| B=2, cross=1 | PASS |
+| B=2, maxl=64, ctx 4096 | PASS |
+| B=2, invalid ids (-1/-2) / out-of-vocab | PASS |
+| B=2, invalid + no per-iter sync | PASS |
+| B=1, invalid | PASS |
+| nspec=5 (any B) | **Triton compile error** `arange's range must be a power of 2` |
+
+Conclusions:
+- The matcher kernel is **not** faulty in isolation at B=2 — the in-engine `HSA_STATUS_ERROR_EXCEPTION`
+  is an **integration/aliasing** effect (engine buffers/views, memory pool, or launch context), not the
+  match_gpu arithmetic. Repro must move in-engine (NGRAM=1 boot with targeted instrumentation of the
+  `ctx` view, buffer pool, and launch context), accepting a possible wedge per attempt.
+- Latent constraint found: the matcher's `tl.arange(0, NSPEC)` requires **NSPEC a power of two**.
+  The engine passes `cap = num_speculative_steps = 8` (po2) so it is safe today, but any future
+  non-po2 n-gram tail width would hard-fail at compile.
+- vllm-0 restarted to baseline (healthy).
+
+## 2026-09-30 (cont. 35) — index refresh, M1 narrowed, static items closed
+
+- **M1 narrowed** (cont.34): standalone matcher passes B=1/B=2 and variants; fault is in-engine
+  integration. Recorded. Latent rule: matcher `NSPEC` must be power-of-two.
+- **H2 closed**: keep the n-gram code inert (`NGRAM=0`); retained safety changes stay.
+- **H4 partial**: root README/DOCKERHUB are upstream-owned → deployment-reality corrections added to
+  `aijuus/README.md` (V2 inertness of TAU/SCHEDULE/NGRAM, HEAD_TOP1 dropped, R4D/AITER, cache method).
+- **New harness**: `aijuus/bench-prefill-ttft.py` (long-prompt TTFT/prompt-eval t/s) for PF1/P2/P3;
+  smoke-tested on vllm-0 (2048 tok → ~472 ms warm TTFT, ~4.2k prompt tok/s).
+- Still-open GPU items queued: PF1 profile, K1 calibrate, V1 per-row fallback, PF5 AR A/B, M1 in-engine.
+- Background: tcclaviger HIP kernel package analysis (TF1/TF3/ST7) running.
+
+## 2026-09-30 (cont. 36) — tcclaviger HIP package analysis (TF1/TF3/ST7)
+
+Background analysis of `/tmp/kilo/tccla-dev-root/app` + `site-packages` vs our stack:
+- All tcclaviger HIP packages are **py3.14/torch2.11+rocm10** vs our **py3.12/rocm7.14** → ABI-bound,
+  not drop-in; source shipped only for libr4d/gdn_hip-ish, not fp8hip/parohip.
+- **TF1 `gdn_verify_r`: not an upgrade** — tcclaviger's own libr4d chain beats it 1.2-1.5×; we run libr4d.
+  Only the interface idea (single dispatch, raw int32 spec metadata, in-kernel per-token snapshots) ports.
+- **TF3 `clav_ar`/`clav_ag`: N/A** — TP collectives; we are DP; x1 card defeats BAR P2P.
+- **TF2 `clav_attn`: optional A/B** after rebuilding `clav_attn_C` for py3.12/rocm7.14 (direct d256/fp8-KV/MTP alternative to R4D).
+- **KB1 libr4d bump** would inherit generic `r4d_pq_*` + dense `r4d_gemm_w4a8_nt_m64`; must rebase
+  `r4d_radiance_extras*.patch` and re-validate GDN (their r4d GDN NaNs on our model).
+- `q4hc`/`plehip`/`r4d_qsa|ple|mhc|dsfp|dflash2` are Qwen4Exp/Flash-Next/DSV4-only → N/A.
+
+## 2026-09-30 (cont. 37) — PF1 prefill chunk-size result + cache-method refinement
+
+### PF1: prefill throughput is chunk-independent at 8k tokens
+`aijuus/bench-prefill-ttft.py`, 7974-token prompt, gen 8, warm reps:
+- chunk **16384**: TTFT 452.0 ms, prompt **17.64k tok/s** (single chunk), decode 93.5 tok/s.
+- chunk **4096**: TTFT 453.9 ms, prompt **17.57k tok/s** (two chunks), decode 37.2 tok/s.
+So splitting an 8k prefill into 2×4k chunks costs nothing measurable; the 16k-chunk **decode**
+difference is a compile-key artifact, not a chunk effect. Prefill work (PF2 GDN scan, PF3 R4D
+scheduling) must be measured at larger prompts/context — the 8k case is already at parity.
+
+### Cache-method refinement (important)
+Clearing `~/.radiance-cache-…-tp1s` then boot1+boot2 did **not** always restore throughput: after the
+PF1 clears the server sat at ~21/161 t/s even after a "warm" restart, then recovered to **67.8 / 369.1**
+on the *next* restart (seeded the Triton cache from the intact vllm-1 dir `…-tp1s-b`, arch-keyed, plus
+another reboot). Lesson: after a cache clear, **verify c1 ≈ 68 t/s before trusting any measurement**,
+and treat a cleared cache as multi-boot until warm. vllm-1's cache is separate and was never cleared.
+
+Baseline restored: conc1 67.8, conc8 369.1 (R4D, chunk 16384, no ab.env).
+
+## 2026-09-30 (cont. 38) — V1 static-verified; backlog triage
+
+- **V1 statically verified**: `radiance_draft.py:758-780` per-row windowed fallback is correct
+  (miss rows re-scan with `base=0`, non-miss rows get an empty window, `pk[sel]` copies back only
+  miss rows). It only executes under `NGRAM=1`+window, so it is gated by M1.
+- **Backlog triage** (`aijuus/OPEN-TASKS-INDEX.md`): the quick/config/A-B items are done
+  (M2, X2, K2, K3, K4/P4, PF1, T1, T2, V1); what remains is large or blocked —
+  kernel projects (PF2/PF3, S4/KB2-KB4), image/ABI rebuilds (KB1, X1, TF2), offload code (OS1-3),
+  the private fork (TF5), the in-engine M1 repro (risky), GPU-gated validations (K1, V3, ST1/ST2/ST6),
+  open research questions (§15), and the H1 commit (awaiting explicit go).
