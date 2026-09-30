@@ -1,0 +1,5 @@
+# Runtime state for model-router / model-controller, moved here from
+# /var/lib/radiance-model-state (2026-09-30) so it lives with the repo.
+# state.json / trigger.json / usage.json are recreated at boot from MODEL_DEFAULT
+# and are live mutable state -- never commit them.
+*.json

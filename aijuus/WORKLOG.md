@@ -4,6 +4,39 @@ A running, dated log of what was changed, why, and how it was verified. Newest e
 Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 `TCCLA-VLLM-MTP-IMPLEMENTATION-PLAN.md`, which hold the analysis and the plan.
 
+## 2026-09-30 (cont. 31) — model-controller: new `POST /load` (load a model onto cards that don't have it)
+
+The controller previously had no way to *change* which model an instance serves over
+HTTP: `POST /reload` keeps `state["model"]` and only re-reads registry settings, and the
+only swap path was the router-written `trigger.json` (`handle_trigger`, no HTTP surface,
+and it no-ops when the model is already ready anywhere). Added a direct admin route:
+
+- `POST /load  {"model": <key>, "instance": <name|"auto"|"all">, "force": bool}`
+  (query-string equivalents also accepted). Loads `model` onto instances that are not
+  already serving it.
+  - `instance` omitted / `"auto"` -> one instance NOT already serving the model, idle-first
+    with the same rotation/MRU preference as `pick_target`.
+  - `instance="all"` -> both cards (each skipped if already serving it).
+  - `instance=<service>` -> just that card.
+  - `force=true` -> restart even an instance already serving the model (settings refresh,
+    same effect as `/reload` for that card).
+  - Response: `{"ok", "model", "targets":[{"instance","ok"[, "already_loaded"|"error"]}]}`;
+    `{"ok":true,"already_loaded":true}` when nothing needed a restart. Unknown model ->
+    `registry` list; unknown instance -> `instances` list.
+
+Implementation reuses the swap machinery: `_resolve_load_targets()` (target choice with
+`_actual_key()` reading the live `/v1/models` via `served_to_key`), then per target
+`state={model,ready:false}` -> drain (`wait_until_idle`) -> `docker restart` -> poll
+`/health` -> `ready:true`. Serialized under the existing `_op_lock` (same as `/reload`).
+`do_reload` unchanged; `do_POST` now routes `/load` and `/reload` (trailing slash tolerated).
+
+Verified offline: `py_compile`; unit-tested `_resolve_load_targets` (explicit / unknown /
+all / auto-with-both-free / auto-one-serving / auto-all-serving) and `do_load`
+(unknown model/instance errors; `all` with both already serving -> 0 restarts; `auto`/`all`/
+`force` restart counts and ready flips correct). Live use needs a controller restart (user-owned):
+`curl -sS -X POST -H "Authorization: Bearer $VLLM_API_KEY" -H 'Content-Type: application/json' \
+ -d '{"model":"<key>"}' http://172.18.0.10:8101/load`.
+
 ## 2026-09-29 (cont. 30) — model-router load balancing: RR tie-break, metrics-aware load, prefix-affinity (flagged), shared-tier finding
 
 Plan: ROUTER-LB. Implemented in `aijuus/model-router.py` (bind-mounted to the router

@@ -58,9 +58,17 @@ FAIL_COOLDOWN = int(os.environ.get("FAIL_COOLDOWN_SECONDS", "120"))
 # work. 0 disables the wait (swap immediately).
 IDLE_WAIT = int(os.environ.get("IDLE_WAIT_SECONDS", "300"))
 IDLE_POLL = int(os.environ.get("IDLE_POLL_SECONDS", "5"))
-# Admin HTTP endpoint (no auth beyond the API key): POST /reload restarts the
-# matching instance(s) so their entrypoint re-reads model-registry.json with FRESH
-# settings (env/args) -- no full redeploy. GET /status / GET /health.
+# Admin HTTP endpoint (no auth beyond the API key):
+#   POST /load  {"model": <key>, "instance": <name|"auto"|"all">, "force": bool}
+#               -> load a DIFFERENT model onto instance(s) that are not already
+#                  serving it (auto picks one idle such instance; "all" does
+#                  both). Skips an instance already serving the model unless
+#                  force:true. This CHANGES which model an instance serves.
+#   POST /reload {"model": <key>, "instance": <name|"all">}
+#               -> restart matching instance(s) so their entrypoint re-reads
+#                  model-registry.json with FRESH settings (env/args) but keeps
+#                  the SAME model -- no full redeploy.
+#   GET /status / GET /health.
 RELOAD_PORT = int(os.environ.get("RELOAD_PORT", "8101"))
 
 # compose service name -> in-network base URL (+ tensor-parallel rank)
@@ -396,6 +404,101 @@ def handle_trigger(reg):
     clear_trigger(model)
 
 
+def _actual_key(svc, reg):
+    """Registry key an instance is actually serving right now (None if down)."""
+    name = instance_model(INSTANCES[svc])
+    return served_to_key(reg).get(name, name) if name else None
+
+
+def _resolve_load_targets(model, instance, st, reg):
+    """Which instances should receive `model` for a POST /load.
+
+    `instance` may be an explicit service name, "all" (both cards), or
+    "auto"/empty (default): one instance that is NOT already serving `model`,
+    chosen idle-first with the same rotation/MRU preference as pick_target.
+    """
+    global _rr
+    if instance and instance not in ("auto", "all"):
+        return [instance] if instance in INSTANCES else []
+    if instance == "all":
+        return list(INSTANCES)
+    pool = [s for s in INSTANCES if _actual_key(s, reg) != model]
+    if not pool:
+        return []
+    loads = {s: running_requests(INSTANCES[s]) for s in pool}
+    usage = read_usage()
+    if usage:
+        mru = max(usage, key=usage.get)
+        keep = [s for s in pool if st.get(s, {}).get("model") != mru]
+        if keep:
+            pool = keep
+    idle = [s for s in pool if loads[s] <= 0]
+    if idle:
+        svc = idle[_rr % len(idle)]
+        _rr += 1
+        return [svc]
+    return [min(pool, key=lambda s: loads[s])]
+
+
+def do_load(model=None, instance=None, force=False):
+    """Load `model` onto instance(s) that are not already serving it.
+
+    Unlike do_reload this CHANGES the served model: for each target it records
+    state {model, ready:false} (so the router stops routing to it), drains
+    in-flight work, restarts the container, polls /health, then flips
+    ready:true. An instance already serving `model` is skipped unless
+    force=true (which reloads it to pick up fresh registry settings).
+    """
+    reg = load_registry()
+    if not model:
+        return {"ok": False, "error": "model required", "registry": sorted(reg)}
+    if model not in reg:
+        return {"ok": False, "error": "model %r not in registry" % model,
+                "registry": sorted(reg)}
+    if instance and instance not in ("auto", "all") and instance not in INSTANCES:
+        return {"ok": False, "error": "unknown instance %r" % instance,
+                "instances": sorted(INSTANCES)}
+    st = read_state()
+    targets = _resolve_load_targets(model, instance, st, reg)
+    if not targets:
+        return {"ok": True, "model": model, "already_loaded": True,
+                "targets": [], "message": "model already loaded on matching instance(s)"}
+    results = []
+    for svc in targets:
+        if _actual_key(svc, reg) == model and health_ok(INSTANCES[svc]) and not force:
+            results.append({"instance": svc, "ok": True, "already_loaded": True})
+            continue
+        st = read_state()
+        st[svc] = entry(svc, model, False)
+        write_state(st)
+        log("load start: %s -> %s%s" % (svc, model, " (force)" if force else ""))
+        if not wait_until_idle(svc):
+            log("WARNING: %s still busy after %ss; proceeding" % (svc, IDLE_WAIT))
+        cid = find_container(svc)
+        if cid is None:
+            log("ERROR: container for %s not found via docker socket" % svc)
+            results.append({"instance": svc, "ok": False, "error": "container not found"})
+            continue
+        status, _ = sock_request("POST", "/containers/%s/restart" % cid)
+        if status not in (200, 204, 304):
+            log("ERROR: docker restart of %s failed (status %s)" % (svc, status))
+            results.append({"instance": svc, "ok": False, "error": "restart status %s" % status})
+            continue
+        deadline = time.time() + SWAP_TIMEOUT
+        ok = False
+        while time.time() < deadline:
+            time.sleep(POLL)
+            if health_ok(INSTANCES[svc]):
+                st = read_state()
+                st[svc] = entry(svc, model, True)
+                write_state(st)
+                ok = True
+                break
+        log("load %s: %s" % (svc, "done" if ok else "TIMEOUT"))
+        results.append({"instance": svc, "ok": ok})
+    return {"ok": all(r.get("ok") for r in results), "model": model, "targets": results}
+
+
 def do_reload(model=None, instance=None):
     """Restart matching instance(s) so their entrypoint re-reads the registry.
 
@@ -489,7 +592,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._auth():
             return self._send(401, {"ok": False, "error": "unauthorized"})
-        if not self.path.startswith("/reload"):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path not in ("/reload", "/load"):
             return self._send(404, {"ok": False, "error": "not found"})
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
@@ -501,12 +605,16 @@ class _Handler(BaseHTTPRequestHandler):
                 params = {}
         if "?" in self.path:
             q = parse_qs(urlparse(self.path).query)
-            if not params.get("model") and q.get("model"):
-                params["model"] = q["model"][0]
-            if not params.get("instance") and q.get("instance"):
-                params["instance"] = q["instance"][0]
+            for k in ("model", "instance", "force"):
+                if params.get(k) in (None, "") and q.get(k):
+                    params[k] = q[k][0]
+        force = str(params.get("force", "")).lower() in ("1", "true", "yes", "on")
         with _op_lock:
-            res = do_reload(model=params.get("model"), instance=params.get("instance"))
+            if path == "/load":
+                res = do_load(model=params.get("model"),
+                              instance=params.get("instance"), force=force)
+            else:
+                res = do_reload(model=params.get("model"), instance=params.get("instance"))
         return self._send(200 if res.get("ok") else 500, res)
 
 
@@ -522,7 +630,7 @@ def main():
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", RELOAD_PORT), _Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        log("reload endpoint on :%d  (POST /reload [?model=&instance=], GET /status, GET /health)"
+        log("admin endpoint on :%d  (POST /load, POST /reload, GET /status, GET /health)"
             % RELOAD_PORT)
     except Exception as e:
         log("WARNING: reload endpoint failed to start on :%d: %r" % (RELOAD_PORT, e))

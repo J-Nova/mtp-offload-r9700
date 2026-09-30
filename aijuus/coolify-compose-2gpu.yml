@@ -272,7 +272,7 @@ services:
       - /home/juup/.cache/huggingface:/root/.cache/huggingface
       # Shared model-swap state (READ-ONLY here): the entrypoint picks its model from
       # state.json at boot; model-controller is the sole writer. See model-registry.json.
-      - ${MODEL_STATE_HOST_DIR:-/var/lib/radiance-model-state}:/model-state:ro
+      - ${MODEL_STATE_HOST_DIR:-/home/juup/radiance-vllm-mxfp4/aijuus/model-state}:/model-state:ro
       - serve-shape:/tmp/serve-shape
     entrypoint:
       - bash
@@ -490,7 +490,7 @@ services:
       - /home/juup/.cache/huggingface:/root/.cache/huggingface
       # Shared model-swap state (READ-ONLY here): the entrypoint picks its model from
       # state.json at boot; model-controller is the sole writer. See model-registry.json.
-      - ${MODEL_STATE_HOST_DIR:-/var/lib/radiance-model-state}:/model-state:ro
+      - ${MODEL_STATE_HOST_DIR:-/home/juup/radiance-vllm-mxfp4/aijuus/model-state}:/model-state:ro
       - serve-shape:/tmp/serve-shape
     entrypoint:
       - bash
@@ -548,7 +548,7 @@ services:
     volumes:
       # state.json is read per request; trigger.json is written here (so the dir
       # is mounted rw even though only trigger.json is new).
-      - ${MODEL_STATE_HOST_DIR:-/var/lib/radiance-model-state}:/model-state
+      - ${MODEL_STATE_HOST_DIR:-/home/juup/radiance-vllm-mxfp4/aijuus/model-state}:/model-state
       # NOTE: Coolify mangles "${VAR:-default}/suffix" in bind specs into
       # "<default>:" (empty target -> "empty section between colons"), so the
       # full host file path must be the variable's own default, with no suffix.
@@ -591,7 +591,7 @@ services:
       - IDLE_WAIT_SECONDS=${IDLE_WAIT_SECONDS:-300}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${MODEL_STATE_HOST_DIR:-/var/lib/radiance-model-state}:/model-state
+      - ${MODEL_STATE_HOST_DIR:-/home/juup/radiance-vllm-mxfp4/aijuus/model-state}:/model-state
       # See model-router: full host path is the variable default (no /suffix).
       - ${MODEL_REGISTRY_FILE:-/home/juup/radiance-vllm-mxfp4/aijuus/model-registry.json}:/model-registry.json:ro
       - ${MODEL_CONTROLLER_FILE:-/home/juup/radiance-vllm-mxfp4/aijuus/model-controller.py}:/code/model-controller.py:ro
