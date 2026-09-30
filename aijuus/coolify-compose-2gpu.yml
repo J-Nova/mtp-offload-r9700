@@ -117,7 +117,7 @@ services:
       # so a reduced-vocab draft_keep_file can be built for this model. Writes to a
       # per-instance file under the repo bind (/patches == repo root on the host),
       # flushed periodically + on shutdown. Set RADIANCE_COLLECT_TOKENS=0 to disable.
-      - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-1}
+      - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-0}
       - RADIANCE_COLLECT_TOKENS_FILE=/patches/aijuus/draft_keep/rank0.json
       - RADIANCE_COLLECT_TOKENS_INTERVAL=20
       # Model to boot when /model-state/state.json has no entry for this instance yet
@@ -164,9 +164,10 @@ services:
       - RADIANCE_OFFLOAD_EAGLE_GROUPS=${RADIANCE_OFFLOAD_EAGLE_GROUPS:-1}
       - RADIANCE_OFFLOAD_DEBUG=${RADIANCE_OFFLOAD_DEBUG:-0}
       - RADIANCE_OFFLOAD_TRACE=${RADIANCE_OFFLOAD_TRACE:-0}
-      # Phase 1 (FATAL): mixed-hit safety + instrumentation.
+      # Phase 1: mixed-hit safety (behavior, keep 1) + offload instrumentation (metrics-only;
+      # default 0 for the prefill A/B -- the debug JSON sink and counters cost CPU on the hot path).
       - RADIANCE_OFFLOAD_MIXED_HIT=${RADIANCE_OFFLOAD_MIXED_HIT:-1}
-      - RADIANCE_OFFLOAD_INSTRUMENTATION=${RADIANCE_OFFLOAD_INSTRUMENTATION:-1}
+      - RADIANCE_OFFLOAD_INSTRUMENTATION=${RADIANCE_OFFLOAD_INSTRUMENTATION:-0}
       # Phase 2 (behavioral): reconcile re-ask + prompt last-block alignment.
       - RADIANCE_RECONCILE_REASK=${RADIANCE_RECONCILE_REASK:-1}
       - RADIANCE_ALIGN_PROMPT_LAST_BLOCK=${RADIANCE_ALIGN_PROMPT_LAST_BLOCK:-1}
@@ -177,11 +178,11 @@ services:
       # (a prefix shorter than N chunks gets no external hit). Matches serve-mxfp4.sh:919.
       - RADIANCE_MAMBA_STORE_STRIDE=${RADIANCE_MAMBA_STORE_STRIDE:-4}
       # Phase 5 (optional metrics): lookup counters, debug instrument, tier report, promotion wallclock, miss deferral.
-      - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-1}
-      - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-1}
-      - RADIANCE_OFFLOAD_TIER_REPORT=${RADIANCE_OFFLOAD_TIER_REPORT:-1}
-      - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-1}
-      - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-1}
+      - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-0}
+      - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-0}
+      - RADIANCE_OFFLOAD_TIER_REPORT=${RADIANCE_OFFLOAD_TIER_REPORT:-0}
+      - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-0}
+      - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-0}
       # Optional fs-tier host bind; set KV_OFFLOAD_DISK_HOST_DIR to put the shared disk store elsewhere.
       # SHARED fs secondary tier (Mode B, DEFAULT): both instances point at the same directory,
       # so a prefix cached by one is loadable by the other (and it survives restarts). This is
@@ -210,7 +211,12 @@ services:
       - RADIANCE_USE_R4D=1
       - RADIANCE_USE_R4D_AR=1
       - RADIANCE_USE_R4D_AR_QUANT=1
-      - RADIANCE_R4D_REPORT=1
+      - RADIANCE_R4D_REPORT=0
+      # Diagnostics off for the throughput A/B (DRAFT_STATS prints controller counters to stderr
+      # every 200 steps; RUN_BWTEST is a startup bandwidth sweep; both cost nothing at steady state
+      # but are not needed to serve). COLLECT_TOKENS stays 0 unless rebuilding the draft vocab.
+      - RADIANCE_DRAFT_STATS=0
+      - RADIANCE_RUN_BWTEST=0
       - RADIANCE_AR_QBITS=6
       - RADIANCE_TP_PAD=0
       - RADIANCE_TP_PAD_DRAFTER=0
@@ -329,7 +335,7 @@ services:
       # so a reduced-vocab draft_keep_file can be built for this model. Writes to a
       # per-instance file under the repo bind (/patches == repo root on the host),
       # flushed periodically + on shutdown. Set RADIANCE_COLLECT_TOKENS=0 to disable.
-      - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-1}
+      - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-0}
       - RADIANCE_COLLECT_TOKENS_FILE=/patches/aijuus/draft_keep/rank1.json
       - RADIANCE_COLLECT_TOKENS_INTERVAL=20
       # Model to boot when /model-state/state.json has no entry for this instance yet
@@ -376,9 +382,10 @@ services:
       - RADIANCE_OFFLOAD_EAGLE_GROUPS=${RADIANCE_OFFLOAD_EAGLE_GROUPS:-1}
       - RADIANCE_OFFLOAD_DEBUG=${RADIANCE_OFFLOAD_DEBUG:-0}
       - RADIANCE_OFFLOAD_TRACE=${RADIANCE_OFFLOAD_TRACE:-0}
-      # Phase 1 (FATAL): mixed-hit safety + instrumentation.
+      # Phase 1: mixed-hit safety (behavior, keep 1) + offload instrumentation (metrics-only;
+      # default 0 for the prefill A/B -- the debug JSON sink and counters cost CPU on the hot path).
       - RADIANCE_OFFLOAD_MIXED_HIT=${RADIANCE_OFFLOAD_MIXED_HIT:-1}
-      - RADIANCE_OFFLOAD_INSTRUMENTATION=${RADIANCE_OFFLOAD_INSTRUMENTATION:-1}
+      - RADIANCE_OFFLOAD_INSTRUMENTATION=${RADIANCE_OFFLOAD_INSTRUMENTATION:-0}
       # Phase 2 (behavioral): reconcile re-ask + prompt last-block alignment.
       - RADIANCE_RECONCILE_REASK=${RADIANCE_RECONCILE_REASK:-1}
       - RADIANCE_ALIGN_PROMPT_LAST_BLOCK=${RADIANCE_ALIGN_PROMPT_LAST_BLOCK:-1}
@@ -389,11 +396,11 @@ services:
       # (a prefix shorter than N chunks gets no external hit). Matches serve-mxfp4.sh:919.
       - RADIANCE_MAMBA_STORE_STRIDE=${RADIANCE_MAMBA_STORE_STRIDE:-4}
       # Phase 5 (optional metrics): lookup counters, debug instrument, tier report, promotion wallclock, miss deferral.
-      - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-1}
-      - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-1}
-      - RADIANCE_OFFLOAD_TIER_REPORT=${RADIANCE_OFFLOAD_TIER_REPORT:-1}
-      - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-1}
-      - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-1}
+      - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-0}
+      - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-0}
+      - RADIANCE_OFFLOAD_TIER_REPORT=${RADIANCE_OFFLOAD_TIER_REPORT:-0}
+      - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-0}
+      - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-0}
       # Optional fs-tier host bind; set KV_OFFLOAD_DISK_HOST_DIR to put the shared disk store elsewhere.
       # SHARED fs secondary tier (Mode B, DEFAULT): both instances point at the same directory,
       # so a prefix cached by one is loadable by the other (and it survives restarts). This is
@@ -422,7 +429,12 @@ services:
       - RADIANCE_USE_R4D=1
       - RADIANCE_USE_R4D_AR=1
       - RADIANCE_USE_R4D_AR_QUANT=1
-      - RADIANCE_R4D_REPORT=1
+      - RADIANCE_R4D_REPORT=0
+      # Diagnostics off for the throughput A/B (DRAFT_STATS prints controller counters to stderr
+      # every 200 steps; RUN_BWTEST is a startup bandwidth sweep; both cost nothing at steady state
+      # but are not needed to serve). COLLECT_TOKENS stays 0 unless rebuilding the draft vocab.
+      - RADIANCE_DRAFT_STATS=0
+      - RADIANCE_RUN_BWTEST=0
       - RADIANCE_AR_QBITS=6
       - RADIANCE_TP_PAD=0
       - RADIANCE_TP_PAD_DRAFTER=0

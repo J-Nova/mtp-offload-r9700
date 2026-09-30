@@ -40,6 +40,7 @@ needs no change -- only model-controller gains multi-rank swap logic later.
 Stdlib only (no pip): ThreadingHTTPServer + http.client keep the image
 (python:3.13-alpine) dependency-free.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -71,6 +72,25 @@ USAGE_MIN_INTERVAL = float(os.environ.get("USAGE_MIN_INTERVAL_SECONDS", "2"))
 HEALTH_INTERVAL = int(os.environ.get("HEALTH_INTERVAL_SECONDS", "5"))
 HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT_SECONDS", "2"))
 
+# --- Load-balancing tuning (see ROUTER-LB-PLAN / WORKLOG) -------------------
+def _on(name, default="0"):
+    return os.environ.get(name, default) not in ("0", "false", "False", "")
+
+# W1: rotate equally-loaded targets round-robin. Off restores the old
+# lexicographic tie-break (which sent all non-overlapping traffic to vllm-0).
+LB_RR = _on("RADIANCE_LB_RR", "1")
+# W2: use each instance's live vLLM load (`/metrics`: running/waiting/kv) as the
+# primary routing signal instead of the router's open-connection count.
+LB_METRICS = _on("RADIANCE_LB_METRICS", "1")
+LB_METRICS_INTERVAL = float(os.environ.get("RADIANCE_LB_METRICS_INTERVAL", "1"))
+LB_METRICS_STALE = float(os.environ.get("RADIANCE_LB_METRICS_STALE", "3"))
+# W3: prefix-hash session affinity (stable-prefix rendezvous), gated on whether
+# the shared fs KV tier already gives cross-instance reuse (see WORKLOG W4).
+LB_AFFINITY = _on("RADIANCE_LB_AFFINITY", "0")
+LB_AFFINITY_SLACK = int(os.environ.get("RADIANCE_LB_AFFINITY_SLACK", "1"))
+# Verbose per-request routing decision.
+LB_DEBUG = _on("RADIANCE_LB_DEBUG", "0")
+
 # Endpoints are read ONLY from state.json (written by model-controller); the
 # router keeps no second copy of the instance->endpoint map so the two services
 # cannot drift.
@@ -85,6 +105,9 @@ _lock = threading.Lock()
 _inflight = {}      # endpoint -> in-flight requests (for least-connections)
 _rr = 0             # rotating cursor, breaks ties between equally-loaded targets
 _alive = {}         # endpoint -> bool, independent /health view (default True)
+_metrics = {}       # endpoint -> {"running","waiting","kv","ts"} live vLLM load
+_metrics_lock = threading.Lock()
+_dispatched = {}    # endpoint -> requests this router actually committed
 _holds = threading.Semaphore(MAX_HOLDS)
 _reg_cache = {"mtime": object(), "reg": {}}
 _usage = {}          # model -> last-request epoch (MRU, for eviction protection)
@@ -178,11 +201,170 @@ def inflight_add(endpoint, delta):
         _inflight[endpoint] = _inflight.get(endpoint, 0) + delta
 
 
-def ordered(targets):
-    """Ready, independently-alive targets, least in-flight first (retry order)."""
-    r = [t for t in targets if t["ready"] and _alive.get(t["endpoint"], True)]
-    r.sort(key=lambda t: (_inflight.get(t["endpoint"], 0), t["endpoint"]))
-    return r
+def dispatched_add(endpoint):
+    with _lock:
+        _dispatched[endpoint] = _dispatched.get(endpoint, 0) + 1
+
+
+def load_key(endpoint):
+    """Ordering key for one endpoint; lower sorts first.
+
+    W2: when live metrics are available (and fresh) the key is the engine's own
+    load -- (running, waiting, kv%) -- so a long generation counts the same as
+    any other in-flight request is no longer true. Otherwise it degrades to the
+    router's open-connection count (`_inflight`), the original behaviour.
+    """
+    infl = _inflight.get(endpoint, 0)
+    if LB_METRICS:
+        m = _metrics.get(endpoint)
+        if m and time.time() - m.get("ts", 0.0) <= LB_METRICS_STALE:
+            return (m.get("running", 0.0), m.get("waiting", 0.0),
+                    m.get("kv", 0.0), infl)
+    return (float(infl), 0.0, 0.0, infl)
+
+
+def order_targets(targets):
+    """Ready, independently-alive targets, least-loaded first.
+
+    Retry/failover order for `_forward`. With LB_RR the equally-loaded head
+    group rotates round-robin (`_rr`) so sequential / non-overlapping traffic
+    spreads across cards instead of always hitting vllm-0.
+    """
+    ready = [t for t in targets
+             if t["ready"] and _alive.get(t["endpoint"], True)]
+    if not ready:
+        return []
+    ready.sort(key=lambda t: (load_key(t["endpoint"]), t["endpoint"]))
+    if not LB_RR:
+        return ready
+    global _rr
+    with _lock:
+        head = load_key(ready[0]["endpoint"])
+        n = 0
+        for t in ready:
+            if load_key(t["endpoint"]) == head:
+                n += 1
+            else:
+                break
+        i = _rr % n
+        _rr += 1
+    group = ready[:n]
+    return group[i:] + group[:i] + ready[n:]
+
+
+def _affinity_key(body):
+    """Stable conversation prefix hash (W3): system + first user turn.
+
+    Deliberately NOT the whole prompt and NOT the shared system prompt alone:
+    the prefix must be identical across a conversation's turns but distinct
+    across sessions. Returns None when there is nothing to hash.
+    """
+    try:
+        o = json.loads(body) if body else None
+    except Exception:
+        return None
+    msgs = o.get("messages") if isinstance(o, dict) else None
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    parts = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role") or ""
+        c = m.get("content")
+        if isinstance(c, list):     # multimodal: join the text parts
+            c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+        elif not isinstance(c, str):
+            c = json.dumps(c, sort_keys=True) if c is not None else ""
+        parts.append(role + "\x1f" + c)
+        if role == "user":
+            break
+    if not parts:
+        return None
+    return hashlib.sha1("\x1e".join(parts).encode("utf-8")).hexdigest()
+
+
+def _affinity_target(key, candidates):
+    """Rendezvous (highest-random-weight) endpoint for a prefix key.
+
+    Consistent: adding/removing an endpoint remaps only its own share of keys.
+    """
+    return max(candidates,
+               key=lambda t: int(hashlib.sha1(
+                   (key + "|" + t["endpoint"]).encode("utf-8")).hexdigest(), 16))
+
+
+def apply_affinity(cands, body):
+    """Promote the prefix's endpoint when it is not materially hotter than the
+    least-loaded one (bounded by LB_AFFINITY_SLACK), else keep least-loaded."""
+    if not LB_AFFINITY or len(cands) < 2:
+        return cands
+    key = _affinity_key(body)
+    if not key:
+        return cands
+    aff = _affinity_target(key, cands)
+    if aff["endpoint"] == cands[0]["endpoint"]:
+        return cands
+    if load_key(aff["endpoint"])[0] <= load_key(cands[0]["endpoint"])[0] + LB_AFFINITY_SLACK:
+        return [aff] + [t for t in cands if t["endpoint"] != aff["endpoint"]]
+    return cands
+
+
+def scrape_endpoint_metrics(endpoint):
+    """GET one instance's /metrics and extract the routing load signal."""
+    u = urllib.parse.urlsplit(endpoint)
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=HEALTH_TIMEOUT)
+        conn.request("GET", "/metrics")
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return None
+        data = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    want = {"vllm:num_requests_running": "running",
+            "vllm:num_requests_waiting": "waiting",
+            "vllm:kv_cache_usage_perc": "kv"}
+    out = {"running": 0.0, "waiting": 0.0, "kv": 0.0}
+    seen = set()
+    for line in data.splitlines():
+        if line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name in want and name not in seen:
+            try:
+                out[want[name]] = float(line.rsplit(" ", 1)[1])
+                seen.add(name)
+            except Exception:
+                pass
+    if not seen:
+        return None
+    out["ts"] = time.time()
+    return out
+
+
+def metrics_loop():
+    """W2: keep a fresh per-endpoint live-load snapshot for `load_key`."""
+    while True:
+        try:
+            endpoints = {t["endpoint"] for t in all_targets(read_state())}
+            for ep in endpoints:
+                snap = scrape_endpoint_metrics(ep)
+                if snap is not None:
+                    with _metrics_lock:
+                        _metrics[ep] = snap
+                else:
+                    log("metrics scrape failed: %s" % ep)
+        except Exception as e:
+            log("metrics loop error: %r" % (e,))
+        time.sleep(LB_METRICS_INTERVAL)
 
 
 def record_usage(models):
@@ -391,6 +573,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not already_started:
                     self._begin_response(resp.status, resp.getheaders())
                 committed = True
+                dispatched_add(ep)
                 if first:
                     self.wfile.write(first)
                     self.wfile.flush()
@@ -456,7 +639,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/v1/models":
                 return self._models()
             state = read_state()
-            cands = ordered(all_targets(state))
+            cands = order_targets(all_targets(state))
             if not cands:
                 return self._error(503, "no instance available")
             return self._forward(cands, "GET", self.path, None)
@@ -479,14 +662,19 @@ class Handler(BaseHTTPRequestHandler):
         reg = load_registry()
 
         if not model:
-            cands = ordered(all_targets(state))
+            cands = order_targets(all_targets(state))
             if not cands:
                 return self._error(503, "no instance available")
             return self._forward(cands, "POST", self.path, body)
 
-        cands = ordered(targets_for_model(model, state))
+        cands = order_targets(targets_for_model(model, state))
         if cands:
             record_usage([model])
+            cands = apply_affinity(cands, body)
+            if LB_DEBUG:
+                log("route %r -> %s (load=%s%s)"
+                    % (model, cands[0]["endpoint"], load_key(cands[0]["endpoint"]),
+                       " affinity" if LB_AFFINITY and _affinity_key(body) else ""))
             return self._forward(cands, "POST", self.path, body)
 
         # Requested model is not ready anywhere.
@@ -499,7 +687,7 @@ class Handler(BaseHTTPRequestHandler):
         if fb:
             log("fallback: %r not ready -> serving with %r" % (model, fb["model"]))
             record_usage([fb["model"]])
-            return self._forward(ordered(all_targets(state)), "POST", self.path, body,
+            return self._forward(order_targets(all_targets(state)), "POST", self.path, body,
                                  use_target_model=True)
         log("hold: %r not ready and nothing else is; holding request" % model)
         return self._hold(model, body, stream)
@@ -541,7 +729,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 return
-            return self._forward(ordered(targets_for_model(model, read_state())),
+            return self._forward(order_targets(targets_for_model(model, read_state())),
                                  "POST", self.path, body, already_started=True)
         # Non-streaming: block until ready (bounded), then forward.
         while time.time() < deadline:
@@ -552,7 +740,7 @@ class Handler(BaseHTTPRequestHandler):
         if not t:
             return self._error(503, "The model `%s` is still loading; try again "
                                "shortly." % model)
-        return self._forward(ordered(targets_for_model(model, read_state())),
+        return self._forward(order_targets(targets_for_model(model, read_state())),
                              "POST", self.path, body)
 
     # ---- metadata endpoints ---------------------------------------------
@@ -596,16 +784,33 @@ class Handler(BaseHTTPRequestHandler):
         for ep, ok in alive:
             lines.append('radiance_router_endpoint_alive{endpoint="%s"} %d'
                          % (ep, 1 if ok else 0))
+        lines.append("# HELP radiance_router_load primary load signal per endpoint")
+        lines.append("# TYPE radiance_router_load gauge")
+        for ep in sorted({t["endpoint"] for t in all_targets(state)}):
+            lines.append('radiance_router_load{endpoint="%s"} %g'
+                         % (ep, load_key(ep)[0]))
+        lines.append("# HELP radiance_router_dispatched_total requests committed per endpoint")
+        lines.append("# TYPE radiance_router_dispatched_total counter")
+        with _lock:
+            dispatched = sorted(_dispatched.items())
+        for ep, n in dispatched:
+            lines.append('radiance_router_dispatched_total{endpoint="%s"} %d' % (ep, n))
         self._send(200, "\n".join(lines) + "\n", "text/plain; version=0.0.4")
 
 
 def main():
     reg = load_registry()
     threading.Thread(target=health_loop, daemon=True).start()
+    if LB_METRICS:
+        threading.Thread(target=metrics_loop, daemon=True).start()
     log("model-router up on :%d (registry: %s)"
         % (PORT, ", ".join(sorted(reg)) or "<none>"))
+    log("lb: rr=%d metrics=%d affinity=%d slack=%d debug=%d"
+        % (int(LB_RR), int(LB_METRICS), int(LB_AFFINITY), LB_AFFINITY_SLACK, int(LB_DEBUG)))
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
+    # Default backlog is 5, which drops connections under a high-concurrency burst.
+    srv.request_queue_size = int(os.environ.get("LISTEN_BACKLOG", "128"))
     srv.serve_forever()
 
 

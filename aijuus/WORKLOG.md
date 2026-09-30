@@ -4,6 +4,66 @@ A running, dated log of what was changed, why, and how it was verified. Newest e
 Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 `TCCLA-VLLM-MTP-IMPLEMENTATION-PLAN.md`, which hold the analysis and the plan.
 
+## 2026-09-29 (cont. 30) — model-router load balancing: RR tie-break, metrics-aware load, prefix-affinity (flagged), shared-tier finding
+
+Plan: ROUTER-LB. Implemented in `aijuus/model-router.py` (bind-mounted to the router
+`/code/model-router.py`, so a **router restart** activates it; no redeploy).
+
+### W1 round-robin tie-break (ON by default, `RADIANCE_LB_RR=1`)
+- New `order_targets()` replaces `ordered()` on every routing path. It least-load-sorts,
+  then rotates the equally-loaded head group with `_rr` under `_lock`.
+- Fixes the old lexicographic tie-break (`ordered()` sorted `(inflight, endpoint)`), which
+  sent **all** non-overlapping/sequential traffic to vllm-0 while vllm-1 idled.
+
+### W2 metrics-aware load (ON by default, `RADIANCE_LB_METRICS=1`)
+- New `metrics_loop` scrapes each endpoint `/metrics` every `RADIANCE_LB_METRICS_INTERVAL`
+  (1 s) and stores `{running, waiting, kv, ts}`. `load_key()` orders by
+  `(running, waiting, kv_cache_usage_perc, inflight)` when fresh
+  (`RADIANCE_LB_METRICS_STALE` 3 s), else falls back to the connection count `_inflight`.
+- Metrics are unauthenticated; scrape failure degrades gracefully to connection counts.
+- `/metrics` also now exposes `radiance_router_load{endpoint}` and
+  `radiance_router_dispatched_total{endpoint}` (actual commits per card) for validation.
+
+### W3 prefix-hash affinity (OFF by default, `RADIANCE_LB_AFFINITY=0`)
+- Implemented (`_affinity_key` = sha1 of system + first user turn; `_affinity_target` =
+  rendezvous/highest-random-weight over ready endpoints; `apply_affinity` promotes the
+  affinity endpoint only when within `RADIANCE_LB_AFFINITY_SLACK` of the least-loaded).
+- Left **off**: see W4 — the shared fs tier already gives cross-card reuse, so affinity
+  only saves a disk read, not a recompute. Enable if local-HBM TTFT matters more than balance.
+
+### W4 shared fs KV tier gives cross-instance prefix reuse (verified)
+- Same 3619-token prefix: sent to vllm-0 (cold), then to vllm-1 (which had never seen it).
+  vllm-1 delta: `external_prefix_cache_hits_total +2640`, `prefix_cache_hits_total +2640`
+  on the **first** card-1 request → the fs tier (`root_dir=/kvcache/blocks`) served the
+  prefix from disk. So prefix caching **is live under MTP spec-decode here** (contradicts the
+  earlier "inert under spec-decode #54360" note for this build).
+- Implications: LB affinity is optional; a cross-card miss is a disk load, not a recompute.
+
+### W5 harness
+- `aijuus/tools/mtp-conc-bench.py`: added `--no-metrics` (LB endpoints don't proxy
+  `/metrics`; accept% prints `n/a`) and `--instances url0,url1` to print the per-card split
+  (from each instance's `vllm:prompt_tokens_total` delta).
+
+### Status / validation (2026-09-29)
+- Activated: router restarted twice (the first restart exposed a bug — `_rr += 1` without `global _rr`
+  in `order_targets` → `UnboundLocalError` on every POST; fixed, offline unit-tested).
+- **W1 verified**: LB `conc=1 × 20` sequential → `radiance_router_dispatched_total` = vllm-0 11 / vllm-1 10
+  (was 20/0 under the old lexicographic tie-break). Bench `--instances` split 50%/50%.
+- **W2 active**: `radiance_router_load` present; under a cold `conc=16` burst the router put **7–8**
+  concurrent requests on **each** card (sampled `num_requests_running`), i.e. correct balancing.
+- **Aggregate**: warm-cache burst reached **835 tok/s ≈ 1.95× one card** (single card ~428);
+  cold (`--unique`, no cache reuse) ~450–540, and single-card unique ~401–417. So the LB distributes
+  correctly and the aggregate ceiling is **host-side** (CPU/power/disk + prefill work), not the router.
+  Throughput is dominated by prefix-cache warmth, so warm vs cold runs must not be compared.
+- Router logs: all 200s, no tracebacks after the fix. Bench now tolerates per-request failures
+  (prints `[warn] n/m failed`) and has `--unique`.
+- Minor hardening added but **not yet live** (needs one more router restart): `LISTEN_BACKLOG=128`
+  (`ThreadingHTTPServer.request_queue_size` default 5 caused a couple of client resets at conc≥20).
+
+---
+
+
+
 ## 2026-09-29 (cont. 29) — TOP1 draft-head arm is BROKEN on vLLM 0.29 (MTP boot-fail); swap trigger traced; MTP re-homed to vllm-0
 
 ### `RADIANCE_DRAFT_HEAD_TOP1=1` crash-loops MTP at engine init
