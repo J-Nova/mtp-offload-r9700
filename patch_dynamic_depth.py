@@ -148,12 +148,23 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
     dev = base_tokens.device
     if R == 0 or K <= 0:
         return base_tokens
-    n_gpu = st.num_computed_tokens.gpu.index_select(0, idx).to(torch.int32)
-    n_np = n_gpu.cpu().numpy()
+    # M1 fix: read the pinned CPU sources of truth and stage with a host gather + H2D, instead of a
+    # torch gather over the UVA host-mapped `all_token_ids` (an engine-only op never exercised by the
+    # standalone repro; a torch gather over the 160k-column UVA host aperture is the prime suspect for
+    # the gfx1201 HSA fault). R is 1..8, so the H2D is small.
+    _idx_np = idx.cpu().numpy()
+    n_np = st.num_computed_tokens_np[_idx_np].astype(np.int32)
     nmax = int(n_np.max())
     if nmax < 3:
         return base_tokens
-    ctx = st.all_token_ids.gpu.index_select(0, idx)
+    _uva = getattr(st.all_token_ids, "_uva_buf", None)
+    if _uva is not None:
+        ctx = _uva.cpu.index_select(0, idx.cpu()).to(dev)
+    else:
+        ctx = st.all_token_ids.gpu.index_select(0, idx)
+    # M1 fix: never let n exceed the row width (the kernels' suffix/gather loads are unmasked above ML).
+    n_np = np.minimum(n_np, int(ctx.shape[1])).astype(np.int32)
+    n_gpu = torch.from_numpy(n_np).to(dev)
     if nmax > _RAD_NGRAM_WINDOW_FROM:
         base_np = np.maximum(0, n_np - _RAD_NGRAM_WINDOW).astype(np.int32)
     else:
@@ -162,7 +173,10 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
     # with HSA_STATUS_ERROR_EXCEPTION exactly at the bs=1->bs=2 transition, independent of the draft
     # row width (the fixed-width tail still faulted), so the bug is in match_gpu's B>=2 kernels, not
     # the width. B=1 is proven safe; loop rows and share one row-sized buffer. See WORKLOG cont.28.
-    nblks = [gpu._nblk(int(n_np[i]), int(base_np[i])) for i in range(R)]
+    # M1 fix: gpu._nblk expects the window SIZE, not the base. The engine passed base_np here, which
+    # inflated the scan grid ~9x (n/W blocks instead of W/512) and drove q far past ML.
+    _win = int(_RAD_NGRAM_WINDOW) if nmax > _RAD_NGRAM_WINDOW_FROM else 0
+    nblks = [gpu._nblk(int(n_np[i]), _win) for i in range(R)]
     ncmax = 2 * max(nblks)
     buf1 = getattr(runner, "_rad_ngram_bufs1", None)
     if (

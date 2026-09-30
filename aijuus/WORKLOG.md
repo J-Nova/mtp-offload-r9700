@@ -1793,3 +1793,26 @@ no further action.
 - **P10** — harness exists (`bench-conc.py`, `bench-prefill-ttft.py`, `hit_oracle.py`, BetterBench).
 - **P2/P6/P7** — P2 is a libr4d/R4D kernel-table item (rebuild); P6/P7 are conditional on the A1
   confirmation and currently low value; left parked.
+
+## 2026-09-30 (cont. 58) — M1 RESOLVED: n-gram bs>=2 fault fixed via overlay
+
+Deep research (cont.55 area) named the engine-only ops the standalone repro never exercised:
+`st.all_token_ids.gpu.index_select(0, idx)` (a torch gather over the 160k-column **UVA host-mapped**
+aperture — the prime suspect on gfx1201), plus a real `_nblk(base vs size)` bug that inflated the scan
+grid ~9x. Implemented the safe fixes in `patch_dynamic_depth.py` `_radiance_ngram_extend`:
+1. stage the context via the **pinned CPU source of truth** (`_uva_buf.cpu`) + H2D instead of the UVA
+   torch gather;
+2. read `num_computed_tokens` from its CPU mirror (`num_computed_tokens_np`);
+3. pass the window **size** to `gpu._nblk` (was the base);
+4. clamp `n` to the row width.
+
+Result: **`RADIANCE_DRAFT_NGRAM=1` now runs bs>=2 cleanly** — conc8 x3 reps, HEALTHY, no HSA, matcher
+active (`[ngram] rows/extended_rows/appended`). Off-server engine-exact repro (`aijuus/eng_ngram_repro.py`:
+UVA `index_select`, host gather, matcher, all under a global-pool graph replay) PASSES every mode, so the
+fault needs the real engine context; the fix works empirically.
+
+**Policy: NGRAM stays default-off** — warm A/B with the fix: conc1 62.7 vs 67.8, conc8 310.5 vs 369
+(-7.5% / -16%). The per-row matcher + host-staging syncs outweigh the ~8% extended-row draft gain on
+this mix. T3 measured: ~8% extended rows on the bench prompt (repetitive content would be higher).
+The fault no longer blocks enabling n-gram for repetitive/code workloads; a device-side gather (Triton)
+would remove the sync cost if we ever want it on.
