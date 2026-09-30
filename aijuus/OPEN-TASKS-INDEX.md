@@ -11,15 +11,22 @@ deferred) · **DORMANT** (implemented, env-gated off).
 verified** before measuring (a single warm restart was not always enough; seeding the Triton cache
 from the intact vllm-1 dir helped). Never measure an unverified boot.
 
-## 0. Recommended resume order
+## 0. Recommended resume order (updated cont.54)
 
-1. **M1 n-gram offline repro** (unblocks `RADIANCE_DRAFT_NGRAM` and VC1's n-gram tail).
-2. **M2** resolved (drop arm) · **X2 closed N/A** · **K3 closed neutral** · **K2 closed** · **P4 blocked**.
-3. **PF1 profile chunk 4096 vs 16384** (gates all prefill kernel work), then **PF2 GDN scan** / **PF3 R4D prefill scheduling**.
-4. **OS1 (E1 suffix-only invalidation) → OS2 (E2 store decouple) → OK3 (tierbench/kvwatch)**.
-5. **VC1 V2 tau-gate port** + **V1 radiance_draft per-row fallback GPU confirm**.
-6. **K1 KV calibrate** + the remaining MTP Thinkingcap pin; **H1 commit**.
-7. **PF5 AR-quant A/B**, **PF6 8k chunk decision**.
+**Closed this effort:** E1 (implemented, dormant), E2 (implemented, A/B negative, dormant),
+MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
+
+**Open, no-rebuild first:**
+1. **OS3** implement E3 route 3c (pure-Python host-ring fail-closed) + injected-stale-header test.
+2. **OS1** enable E1's two gates and A/B **acceptance + tier hit-rate** on the multi-turn workload
+   (bit-exactness is not a valid gate — MT1/MT2).
+3. **M1** in-engine (H3 pre-warm → H2 → H5) — may wedge; unblocks `RADIANCE_DRAFT_NGRAM` + VC1's tail.
+4. **K1** MTP KV calibrate (GPU) · **V2** watch acceptance after the vocab prune.
+5. **Prefill:** **P2** R4D h256 geometry · **P6** o_proj quant fold · **P7** A1 fusion confirmation ·
+   **P10** harness · **PF5** AR-quant A/B · **PF6** 8k-chunk decision · **PF7** co-schedule more seqs.
+6. **Offload:** **OK3** `tierbench`/`kvwatch` measurement · **OK4** verify the promotion queue-depth fix.
+7. **Structural/research:** ST1/ST2/ST3/ST4/ST6 · **TF4** TunableOp sweep · **VC2** battery re-run.
+8. **Rebuild/blocked/parked:** PF2/PF3/PF4, OS2 (dormant), OK2/OK5, KB1–KB4, TF2/TF5, S3–S8, X1, P3/P5/P8/P9.
 
 ---
 
