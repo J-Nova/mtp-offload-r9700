@@ -1734,3 +1734,19 @@ construction: fp8 KV sets a ~6 %/element noise floor, chunked prefill re-partiti
 R4D explicitly opts out of batch-invariance (`radiance_r4d_attn.py:260 supports_batch_invariance=False`,
 `backend.py:200,321`). Validate E1 on **acceptance / served semantics**, not bit equality. Route A is
 available as a gated overlay if bit-exactness ever becomes a hard requirement.
+
+## 2026-09-30 (cont. 55) — MT1/MT2 consolidated note (canonical)
+
+**MT1/MT2 = INHERENT, not a bug, not E1.** A partial GPU prefix-cache hit resumes by prefilling its
+suffix as one launch of `(total−hit)` tokens, while a cold twin prefills `total` in chunk-sized
+launches. The GDN fused chunk-scan/conv grid is launch-local (`radiance_gdn.py:40,55,201-263`,
+`CHUNK=64`) and the SSM state is narrowed to fp16 at cold's chunk ends (`:699-702,714`), so the two
+computations group the carry differently; fp8 KV (e4m3, 3-bit) amplifies sub-ulp differences into
+whole-ulp flips. Evidence: COLD-only turns EXACT; divergence persists with the align patch off AND with
+`SPEC_METHOD=none`; the `hit_oracle` (full-hit/partial/reply-reuse) is bit-identical, so the KV writer
+is faithful. **Consequence:** `turnbench --exact` is an unsound gate on this stack (fp8 KV noise floor
+~6 %/element; R4D opts out of batch-invariance `radiance_r4d_attn.py:260`). **Solve?** only (A) a
+pure-Python overlay quantizing hits to cold's 15840-token stride (forfeits up to ~15.8k tokens/hit;
+hit=0 for prompt≤chunk) or (B) a kernel absolute-offset arg (incremental `r4d.so`) + unsupported
+prefill-checkpoint-block work under spec decode. Neither pursued. Validate E1 by acceptance/served
+semantics.
