@@ -1556,3 +1556,46 @@ Conclusions:
 
 Open follow-up (new): the pre-existing multi-turn cached-path divergence (GPU partial-hit at fp16,
 and TIER) — recorded in `aijuus/OPEN-TASKS-INDEX.md` as a real correctness item, separate from E1.
+
+## 2026-09-30 (cont. 49) — E1 enablement rationale, MT1/MT2 definitions, rebuild-vs-overlay
+
+### Why E1 is currently dormant (decision: do NOT enable yet; do NOT sidestep MT1/MT2)
+Output correctness is NOT the blocker. The volatile trailing chunk is the **EAGLE/MTP draft attention
+group**; `is_eagle_group` is used only in KV-cache/offload bookkeeping, never by target attention or
+sampling, and every draft is target-verified with target KV. So a stale draft-KV reuse can only lower
+**draft acceptance**, never change a served token. E1 Stage 1 also deletes the stale keys and clamps
+`next_stored_chunk_idx`, so the chunk is recomputed/re-stored on the next opportunity — a stale hit is
+**self-healing via the normal miss/recompute path**, i.e. "prefill the bad parts normally" is already
+what happens. The cross-group hit is reconciled to the **min across groups**, and a group's hit is
+bounded by its own lookup, so including the MTP group cannot make the **target** skip recomputing a
+chunk it did not itself hit.
+
+Reasons to wait anyway:
+1. The only workload-level oracle (`turnbench --exact`) is **red on the untouched baseline** (MT1/MT2,
+   below), so E1's acceptance/benefit parity cannot be measured with a trusted gate. Do not sidestep
+   MT1/MT2: the same multi-turn reuse path is E1's operating regime and where the tier carries ~71%.
+2. Stage 1 invalidation is conservative (removes only ready, `ref_cnt==0` CPU-primary entries; skips
+   in-flight/in-use) — a store/load race can leave a stale draft block for one step. Bounded and
+   self-healing, but a known gap; tombstones are the clean fix.
+3. Benefit is narrow (+1 tier chunk/turn on multi-turn long-context), not decode throughput; needs a
+   real multi-turn A/B to justify.
+
+### MT1 / MT2 (short)
+- **MT1 — GPU partial-hit divergence.** Turn 2 hits ~23k of ~37k tokens in the prefix cache; the rest
+  is recomputed and the CACHED output then differs from the COLD twin of the identical messages
+  (first-div 15-111, max|dlogprob| 0.04-0.19). COLD-only turns are EXACT. The harness names it a known
+  open issue (`gpu-partial-hit-divergence.md`, missing from the repo). Likely: the un-cached tail is
+  prefilled under a different batching/chunk shape than a full cold prefill, so not bit-identical.
+- **MT2 — TIER divergence.** TIER-served turns also differ, though a TIER path "must be EXACT" (a byte
+  copy of an already-computed state). Open question: independent tier bug, or inherited from MT1 via
+  the diverged cached history (twins get identical text, so an independent cause is plausible).
+- Both mean **multi-turn long-context KV reuse is not numerically reproducible on the current stack**,
+  independent of E1.
+
+### Rebuild vs overlay (answer)
+- **E1 needs no rebuild at all** — pure runtime Python patches (`patch_offload_suffix_inv.py`,
+  `patch_offload_eagle_include.py`).
+- **E3 needs no *image* rebuild** either: edit `r4d_radiance_extras_rx10.patch` and rebuild **just
+  `r4d.so`** through the existing `AUTO_R4D`/`R4D_KEY=…-rx10` path (host-cached under
+  `~/.cache/radiance-libr4d/<key>/`, mounted into `/r4d`, copied over the image's at boot), or avoid
+  even that with a runtime Triton fail-closed validator.
