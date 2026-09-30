@@ -1682,3 +1682,27 @@ cached vs cold A2 and diff), or a `turnbench --exact` bisect with `RADIANCE_ALIG
 
 Status: MT1 root-cause narrowed to a specific flow; the fix (or the "inherent" verdict) needs the
 statecmp/bisect. MT2 unmeasured but expected to inherit the same mechanism through the tier.
+
+## 2026-09-30 (cont. 53) — MT1/MT2 RESOLVED: inherent resume-vs-cold prefill numerics
+
+Bisect (short single-session `turnbench --exact --t1 6000 --step 4000 --turns 4`), isolating the cause:
+| arm | A2 result |
+|---|---|
+| baseline (align=1, mtp) | DIFF (first-div 61) |
+| `RADIANCE_ALIGN_PROMPT_LAST_BLOCK=0` | DIFF (first-div 42) — align patch exonerated |
+| `SPEC_METHOD=none` (spec decode OFF) | **DIFF (first-div 53)** — not spec-decode-related |
+| writer oracle (`hit_oracle.py`) | full-hit / partial / reply-reuse all **bit-identical** |
+| COLD-only turns, always | EXACT |
+
+Conclusion: MT1 (and MT2) is **inherent**, not a bug and not E1. Cause: on a partial GPU prefix-cache
+hit the suffix is prefilled as one launch of `total-hit` tokens, while the cold twin prefills `total`
+in chunk-sized launches — different attention/GEMM split geometry and accumulation order — and fp8 KV
+(3 mantissa bits) turns the sub-ULP differences into whole-ulp flips. Spec-decode, the align-last-block
+patch, and the KV writer are all exonerated. The harness's premise "a TIER path must be EXACT" is false
+under chunked prefill + fp8 KV: byte-identical KV does not imply bit-identical output.
+
+Implications:
+- **turnbench --exact is not a valid gate for E1** (it is red on the untouched baseline by construction).
+  E1 correctness must be judged on **acceptance / served-token semantics**, not bit-exactness.
+- MT1/MT2 closed as inherent (documented). If bit-exactness across partial hits is ever required, it
+  needs a resume that reuses the cold chunk grid (a scheduler change), not a KV fix.

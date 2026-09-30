@@ -157,7 +157,7 @@ byte store with an O_DIRECT fixed-size round-trip contract, so a lossy tier cann
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
-| OS1 | **E1** suffix-only invalidation + eagle/MTP group inclusion. | **IMPLEMENTED (Stage 1+2), correctness-validated, DORMANT** | `patch_offload_suffix_inv.py` (hook + manager/tiering/fs `invalidate`) and `patch_offload_eagle_include.py` (remove store-drop + load-pop). Gates `RADIANCE_OFFLOAD_SUFFIX_INV` / `RADIANCE_OFFLOAD_EAGLE_INCLUDE`, default off. Byte-identical outputs + unchanged acceptance with both on; hit-rate benefit unmeasured (needs turnbench warm). Runtime-only, no rebuild. |
+| OS1 | **E1** suffix-only invalidation + eagle/MTP group inclusion. | **IMPLEMENTED (Stage 1+2), DORMANT** | `patch_offload_suffix_inv.py` (hook + manager/tiering/fs `invalidate`) and `patch_offload_eagle_include.py` (remove store-drop + load-pop). Gates `RADIANCE_OFFLOAD_SUFFIX_INV` / `RADIANCE_OFFLOAD_EAGLE_INCLUDE`, default off. Byte-identical outputs + unchanged acceptance with both on; hit-rate benefit unmeasured (needs turnbench warm). Runtime-only, no rebuild. |
 | OS2 | **E2** offload store decoupling (submit D2H at creation; stop the finished-req self-flush). | **IMPLEMENTED, A/B NEGATIVE, DORMANT** | `aijuus/kv-offload/patches/patch_offload_lazy_commit.py` (`RADIANCE_OFFLOAD_LAZY_COMMIT`, default off). Cold-18k TTFT **8031 vs 7560 ms (+5.6%)**: eager D2H contends with the 2nd prefill chunk. Corrected anchor: the real await is `pre_forward -> handle_preemptions -> worker.wait(jobs_to_flush)` (not `wait_for_save`, a no-op). |
 | OS3 | **E3** bounded host-snapshot GDN rollback (2-slot GPU stage) to re-enable lazy GDN snapshots. | **RESEARCHED, IMPLEMENTATION PENDING (medium)** | Root cause of lazy corruption: libr4d materialize **fails open** (`r=0` stores the base as checkpoint) when a prefix hit invalidates the stash. Design: 2-slot GPU stage + pinned host ring keyed by frontier, fail-closed gate; needs a small libr4d edit or a runtime Triton validator. |
 | OS4 | E4 phase arena / E5 cross-token prefetch+sparse feedback. | PARKED | excluded / decode-only single-digit |
@@ -233,8 +233,8 @@ turn 4+. COLD-only turns are EXACT. This is independent of E1 (both arms diverge
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
-| MT1 | Root-cause the GPU partial-hit divergence (fp16/bf16 state, MTP) — the harness documents it as a known open issue (`gpu-partial-hit-divergence.md`). | OPEN (high) | repro: `turnbench --exact`; starts at the first partial-hit turn and propagates. |
-| MT2 | Determine whether TIER divergence is independent or inherited from MT1 via the cached-history feedback; if independent, root-cause the tier byte-copy path. | OPEN (high) | TIER "must be EXACT -- a byte copy of an exact state cannot drift". |
+| MT1 | GPU partial-hit divergence. | **CLOSED (inherent)** cont.53 | Bisected: persists with align patch off and with `SPEC_METHOD=none`; writer oracle is bit-identical. Cause = partial-hit resume prefills its suffix in a different launch/chunk geometry than a cold full prefill (+fp8 KV ulp flips). No KV fix. |
+| MT2 | TIER divergence independent vs inherited. | **CLOSED (inherent)** cont.53 | Same mechanism: byte-identical KV does not imply bit-identical output when resume and cold use different prefill geometry. The harness's "TIER must be EXACT" premise is false under chunked prefill + fp8 KV. |
 
 This is a real correctness item the E1 work surfaced; it gates trusting MTP group inclusion at high
 hit rates, and may affect production multi-turn long-context quality today.
