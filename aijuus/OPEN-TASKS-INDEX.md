@@ -34,7 +34,7 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 
 | ID | Task | Status | Source | Blocker | Effort |
 |---|---|---|---|---|---|
-| M1 | **N-gram tail HSA fault** at bs≥2. **H1 (windowed `base>0`) and H4 (UVA/int32 ctx) ruled out off-server** (cont.44). Remaining: H3 scratch allocated during a FULL-graph replay (most likely, safe fix = pre-create/pre-compile before capture), H2 `_match_gather` OOB at ML=160k, H5 bad continuation. | READY (in-engine, may wedge) | WORKLOG cont.34/42/44; matcher `NSPEC` must be pow2 |
+| M1 | N-gram tail HSA fault at bs≥2. | **FIXED** cont.58 | Overlay fix in `patch_dynamic_depth.py` (host-staged ctx from the pinned CPU source instead of the UVA torch gather; `num_computed_tokens` from its CPU mirror; `_nblk` window **size** not base; clamp `n`). `NGRAM=1` now runs bs≥2 cleanly. **NGRAM stays default-off** (net -7.5%/-16% c1/c8 on our mix; ~8% extended rows). |
 | M2 | **`RADIANCE_DRAFT_HEAD_TOP1`** — drop the arm (neutral + mutually exclusive with the vocab prune; crashes on reload). Registry stays off. | **CLOSED (dropped)** | WORKLOG cont.28 3b, cont.29 | no code change |
 
 ## 2. Calibration / config debt
@@ -99,7 +99,7 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 |---|---|---|---|
 | V1 | `radiance_draft.py` per-row n-gram windowed fallback (`base=n` empty-window). | **STATIC OK / gated by M1** | cont.38: logic verified (`radiance_draft.py:758-780` — miss rows `base=0` full rescan, others empty window, `pk[sel]` copy-back). Only runs with `NGRAM=1`+window, so it needs M1 resolved. |
 | V2 | Watch acceptance after vocab prune. | **MONITOR** | no regression across runs. |
-| V3 | MTP combined depth + `[ngram]` tail validation (blocked by M1). | BLOCKED | WORKLOG cont.27/28 |
+| V3 | MTP combined depth + `[ngram]` tail validation. | **UNBLOCKED** (M1 fixed) | can now be run; NGRAM default-off pending a workload decision. |
 | V4 | External KV tier: CPU tier structurally unreachable; forced external-tier hit method documented (WORKLOG cont.16/17). | **DOCUMENTED** | method in WORKLOG cont.17 §"How to force/verify" |
 
 ## 9. Housekeeping
