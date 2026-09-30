@@ -44,4 +44,7 @@ if [ "${RADIANCE_OFFLOAD_TIER_REPORT:-1}" = 1 ]; then run_patch patch_offload_ti
 if [ "${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-1}" = 1 ]; then run_patch patch_offload_promotion_wallclock.py "promotion wallclock"; fi
 if [ "${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-1}" = 1 ]; then run_patch patch_offload_miss_deferral_metrics.py "miss deferral metrics"; fi
 
+# E2 lazy-commit: take the store D2H off the step path (inert unless RADIANCE_OFFLOAD_LAZY_COMMIT=1).
+run_patch patch_offload_lazy_commit.py "offload lazy commit (E2)"
+
 exit 0

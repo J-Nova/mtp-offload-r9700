@@ -1356,3 +1356,128 @@ Baseline restored: conc1 67.8, conc8 369.1 (R4D, chunk 16384, no ab.env).
   kernel projects (PF2/PF3, S4/KB2-KB4), image/ABI rebuilds (KB1, X1, TF2), offload code (OS1-3),
   the private fork (TF5), the in-engine M1 repro (risky), GPU-gated validations (K1, V3, ST1/ST2/ST6),
   open research questions (§15), and the H1 commit (awaiting explicit go).
+
+## 2026-09-30 (cont. 39) — ST6 acceptance-by-position (no restart)
+
+Per-position acceptance from `vllm:spec_decode_num_accepted_tokens_per_pos_total` (added to
+`bench-conc.py`). Conditional P(accept pos p | accept p-1):
+
+| arm | p0 | p1 | p2 | p3 | p4 | p5-7 |
+|---|--:|--:|--:|--:|--:|--:|
+| conc1 | 0.78 | 0.67 | 0.72 | 0.53 | 0.50-0.75 (n=1) | 0 (not scheduled; k=5) |
+| conc8 | 0.78 | 0.75 | 0.65 | 0.60 | 0.01 | 0 (not scheduled; k=4) |
+
+Finding: acceptance decays slowly to ~0.6 by position 3, so the current schedule (k=5 at bs1-2, k=4
+at bs3-8) is well matched; positions 5-7 are never *scheduled* (not merely never accepted), so
+"depth beyond 4-5" cannot be judged from these counters without raising K. p4 at conc1 (0.5-0.75,
+n=1) suggests depth 5 is justified there. Supports keeping SPEC=8 ceiling with the dynamic schedule.
+
+## 2026-09-30 (cont. 40) — offload E2 anchor found; ST1/VC2 already answered
+
+### E2 (OS2) anchor and why it is not a one-line flip
+`v1/worker/gpu/kv_connector.py:86 ActiveKVConnector.post_forward(finished_req_ids,
+wait_for_save=True)` calls `self.kv_connector.wait_for_save()` on the critical path, and
+`v1/worker/gpu/model_runner.py:1860/1994/2017` call it with the default `wait_for_save=True` every
+step (incl. the final prefill step — the measured ~18% cold-prefill stall). A naive
+`wait_for_save=False` would let freed/reused blocks race the D2H → KV corruption. The correct fix is
+the ADAPTIVE-KV E2 design: a reserved/device-ready/host-ready/committed frontier, advance durability
+only over contiguous K+V D2H completions, retire blocks only after the last referencing completion.
+Scoped but **not implemented** — medium-high effort on the live offload path, needs GPU correctness
+validation (cold prefill + multi-turn + block reuse). Deferred rather than risk the serving path.
+
+### ST1 / VC2 status
+- ST1 (T0 per-phase split): already answered by prior instrumentation — MTP is host-CPU-bound with a
+  ~28 ms/step `_bookkeeping_sync` (verify-forward wait) and ~16.5 ms propose; re-running step trace
+  on 0.29 would restate it. No new run.
+- VC2 (EXACTSET+FUSED re-run): prior R9700 evidence stands (EXACTSET renormalizes the V1 tau-gate
+  confidence; inert on V2 where the gate is not ported). No new run.
+
+## 2026-09-30 (cont. 41) — rebuild triage + design-item deep research launched
+
+Rebuild items triaged per directive (overlay if possible, else park):
+- **PARKED** (no runtime overlay possible / needs a libr4d or image rebuild to validate):
+  PF2 (GDN scan), PF3 (R4D prefill scheduling) — kernels live in the libr4d clone, not this repo;
+  KB1 (libr4d bump — possible as a build overlay but low value + GDN-NaN caveat); KB2-KB4 (cp314-only);
+  X1 (flash_attn, low value); TF2 (clav_attn — source not shipped, genuinely impossible).
+- Remaining actionable work is the design+validation set; launched deep research before implementing:
+  1. E2 (offload store decoupling / committed frontier) — the ~18% prefill store await.
+  2. E1 (suffix-only invalidation on draft rejection; MTP-draft-group offload inclusion).
+  3. E3 (staged host-snapshot GDN rollback) + M1 (in-engine n-gram fault cause/instrumentation).
+
+## 2026-09-30 (cont. 42) — E2 implemented + A/B NEGATIVE; E1/E3/M1 research in
+
+### E2 (offload lazy-commit) — implemented, measured, reverted
+`aijuus/kv-offload/patches/patch_offload_lazy_commit.py` (wired into `apply-kv-patches.sh`, gated
+`RADIANCE_OFFLOAD_LAZY_COMMIT`, default off): Hunk A submits the store D2H at creation in
+`post_forward` instead of deferring a step; Hunk B stops a finishing request's self-flush
+(`offloading/scheduler.py` `if req.is_finished()`), leaving the existing `_block_id_to_pending_jobs`
+fence to fire on first real reallocation. Applies cleanly + idempotent on our built image.
+
+A/B, cold 18k prefill (`bench-prefill-ttft.py`, unique salt per rep), warm c1≈68:
+| arm | TTFT | prompt t/s |
+|---|--:|--:|
+| gate off (baseline) | 7529 / 7602 ms | 2328 / 2306 |
+| gate on | **8031 ms** | 2181 |
+
+**+5.6% slower** — the eager submit puts the (large) first-chunk KV D2H in flight concurrently with
+the second prefill chunk's compute, so it contends for bandwidth rather than overlapping sampling.
+The earlier "18% finish-time store await" was mis-attributed: the real await is
+`pre_forward -> handle_preemptions -> worker.wait(jobs_to_flush)` and for a 2-chunk prefill the
+blocking await was already small. Reverted (ab.env removed, baseline restored 7602 ms). Patch left
+dormant.
+
+### Deep research completed (implement next)
+- **E1** (suffix-only invalidation): medium; rejection currently invalidates **nothing** (counter
+  rollback only); volatility is handled by withholding the trailing chunk, which caps the *target*
+  group's external hit by one chunk every turn. Needs a new `manager.invalidate` API + tombstones
+  (races with in-flight load/write) + tiering/fs cascade + a scheduler hook. Detailed change set in
+  the research (WORKLOG refs); not yet implemented.
+- **E3** (staged host-snapshot GDN rollback): medium runtime patch; root cause of the lazy-GDN
+  multi-turn corruption identified — the libr4d materialize kernel **fails open** (`r=0` branch
+  stores the base state as the checkpoint) whenever a prefix hit invalidates the stash. Design:
+  2-slot GPU stage + pinned host ring keyed by token frontier, fail-**closed** gate. Needs a small
+  libr4d edit or a runtime Triton validator. Not yet implemented.
+- **M1** (in-engine n-gram fault): ranked hypotheses H1 (untested windowed path `base>0`) / H2
+  (`_match_gather` OOB row read at ML=160k) / H3 (matcher scratch allocated during a FULL-graph
+  replay) / H4 (UVA/int32 context vs repro VRAM/int64) / H5 (bad continuation corrupts the next
+  step). Instrumentation plan (dump inputs, per-kernel sync split, pre-warm buffers, id range check)
+  ready.
+
+## 2026-09-30 (cont. 43) — E1/E3 implementation decisions (parked), backlog status
+
+- **E3 (lazy GDN rollback) — PARKED (rebuild-class).** Root cause is a libr4d materialize kernel that
+  fails open (`r=0` stores the base as the checkpoint) on stash invalidation. A correct fix is either
+  a libr4d edit (rebuild) or a new runtime Triton validator kernel. Per the overlay/rebuild rule this
+  is parked. Design captured in cont.42.
+- **E1 (suffix-only invalidation) — PARKED (needs extended validation).** Verified all anchors
+  (`scheduler.py:2048-2066` rejection rollback, `offloading_connector.py:144-150` delegate,
+  `base.py:262 touch`, `cpu/manager.py:96/124/181/244`, `tiering/manager.py:185-332`). Safe Stage-1
+  plumbing is inert (the volatile tail is not stored under the current drop, so invalidation is a
+  no-op); the benefit only exists with the Stage-2 include path, which changes the KV-consistency
+  contract and needs the multi-turn byte-identical oracle (turnbench --exact) before it can ship.
+  Not safely completable in-session; parked with the full change set recorded.
+- **M1 — PARKED (risky).** In-engine instrumentation requires an `NGRAM=1` boot that can wedge the
+  card per probe; hypotheses/plan recorded (cont.42).
+
+### Backlog status
+Actionable non-destructive items are complete: the tcclaviger ports A/B-closed (conf-exit/ragged
+negative, mamba neutral), E2 implemented+A/B-negative+dormant, PF1/ST6/V1 measured, M2/X2/K2/K3/P4/T1/T2
+closed, rebuild items parked. Remaining are parked (E1/E3/M1 + all rebuild/kernel items) or need
+user decisions. Baseline preserved: vllm-0 healthy (c1≈68, 18k TTFT≈7600 ms), no ab.env.
+
+## 2026-09-30 (cont. 44) — M1 hypotheses H1/H4 ruled out off-server
+
+Extended `aijuus/match_gpu_repro.py` with the engine's untested inputs (window `base>0`, UVA/pinned
+int32 context) and ran off-server on the freed card 0 (vllm-0 stopped, restarted after):
+
+| variant (B=2) | result |
+|---|---|
+| H1 windowed path: `--window 16384 --ctx-len 40000` | PASS |
+| H1+H2 invalid: `--window 16384 --ctx-len 40000 --invalid 3` | PASS |
+| H4 UVA/int32 ctx: `--uva 1 --window 16384 --ctx-len 40000` | PASS |
+
+Both H1 (untested `base>0` window) and H4 (UVA/int32 context source) are **ruled out** as the
+standalone cause. Remaining hypotheses need in-engine instrumentation (can wedge): **H3** matcher
+scratch allocated inside a FULL-graph replay, **H2** `_match_gather` OOB row read at ML=160k,
+**H5** bad continuation corrupting the next step. Next step is the cont.42 in-engine plan
+(pre-create/pre-compile buffers before capture first, as it is the most likely and is a safe change).

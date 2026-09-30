@@ -94,7 +94,10 @@ def main():
     rows = []
     for rep in range(a.reps):
         time.sleep(0.5)
-        r = one(a.base, a.model, prompt, a.gen, 1000 + rep, a.timeout)
+        # unique salt per rep so prefix caching cannot shortcut the prefill or the finish-time
+        # KV store (the E2 cold-prefill stall measurement).
+        salted = f"[salt {time.time_ns()}]\n" + prompt
+        r = one(a.base, a.model, salted, a.gen, 1000 + rep, a.timeout)
         rows.append(r)
         print(f"  rep {rep} | prompt {r['prompt_tokens']:>6} tok | ttft {r['ttft_ms']:8.1f} ms | "
               f"prompt {r['prompt_tps']:8.0f} tok/s | decode {r['decode_tps']:7.1f} tok/s", flush=True)

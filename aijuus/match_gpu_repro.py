@@ -37,6 +37,11 @@ def main():
                          "2 out-of-vocab (>= vocab*4), 3 both")
     ap.add_argument("--no-sync", type=int, default=0,
                     help="1 = do not torch.cuda.synchronize() each iter (mimic queued graph replay)")
+    ap.add_argument("--window", type=int, default=0,
+                    help="self-match window: base = max(0, n-window) (exercises the untested base>0 path)")
+    ap.add_argument("--uva", type=int, default=0,
+                    help="1 = build the context from a pinned-host int32 tensor via "
+                         "get_cuda_view_from_cpu_tensor + index_select (mimic the engine's UVA ctx)")
     a = ap.parse_args()
 
     import numpy as np
@@ -50,8 +55,17 @@ def main():
 
     # A repeat-heavy context so the matcher actually finds suffixes (else it early-exits and
     # never touches the gather path that is suspected).
-    ctx = torch.randint(0, a.vocab, (B, a.ctx_len), dtype=torch.int64, device=dev)
-    ctx[:, a.ctx_len // 2:] = ctx[:, : a.ctx_len // 2]  # second half repeats the first
+    if a.uva:
+        # H4: the engine's context is a zero-copy view of a pinned-host int32 tensor
+        # (StagedWriteTensor uva_instead_of_gpu) gathered with index_select. Reproduce the
+        # source/ dtype: pin a host int32 [B, ctx_len], map it, and pass the mapped view (int32).
+        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+        host = torch.randint(0, a.vocab, (B, a.ctx_len), dtype=torch.int32, pin_memory=True)
+        host[:, a.ctx_len // 2:] = host[:, : a.ctx_len // 2]
+        ctx = get_accelerator_view_from_cpu_tensor(host)
+    else:
+        ctx = torch.randint(0, a.vocab, (B, a.ctx_len), dtype=torch.int64, device=dev)
+        ctx[:, a.ctx_len // 2:] = ctx[:, : a.ctx_len // 2]  # second half repeats the first
     # patch_mamba_repro-style invalid-id injection: the engine's token history can carry -1
     # padding / out-of-range ids, which would make the matcher's gather read out of bounds.
     if a.invalid in (1, 3):
@@ -63,9 +77,12 @@ def main():
         if B > 1:
             ctx[1, 7::103] = a.vocab * 8 + 11
     n = torch.full((B,), a.ctx_len, dtype=torch.int32, device=dev)
-    base = torch.zeros(B, dtype=torch.int32, device=dev)
+    if a.window > 0:
+        base = torch.clamp(n - a.window, min=0).to(torch.int32)
+    else:
+        base = torch.zeros(B, dtype=torch.int32, device=dev)
 
-    nblk = gpu._nblk(a.ctx_len, 0)
+    nblk = gpu._nblk(a.ctx_len, a.window if a.window > 0 else 0)
     bufs = gpu.make_match_buffers(B, a.nspec, max(1, 2 * nblk), dev)
 
     print(f"[repro] B={B} nspec={a.nspec} cross={a.cross} maxl={a.maxl} nc={2 * nblk} iters={a.iters}",

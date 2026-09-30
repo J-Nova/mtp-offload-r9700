@@ -38,11 +38,21 @@ def metrics(base):
             "d": "vllm:spec_decode_num_draft_tokens_total",
             "a": "vllm:spec_decode_num_accepted_tokens_total"}
     out = {}
+    pos = {}
     for line in raw.splitlines():
         for k, m in want.items():
             if line.startswith(m):
                 out[k] = float(line.rsplit(" ", 1)[1])
-    return out if len(out) == 3 else None
+        if line.startswith("vllm:spec_decode_num_accepted_tokens_per_pos_total"):
+            try:
+                p = int(line.split('position="', 1)[1].split('"', 1)[0])
+                pos[p] = float(line.rsplit(" ", 1)[1])
+            except Exception:
+                pass
+    if len(out) != 3:
+        return None
+    out["pos"] = pos
+    return out
 
 
 def one(base, model, prompt, gen, seed, timeout, res, idx):
@@ -122,16 +132,31 @@ def main():
         ttfts = [r["ttft"] for r in good if r.get("ttft")]
         mean_ttft = (sum(ttfts) / len(ttfts) * 1000) if ttfts else float("nan")
         accd = maxd = None
+        posrate = None
         if before and after:
             dn, dd, da = (after[k] - before[k] for k in ("n", "d", "a"))
             accd = da / dn if dn else None
             maxd = da / max(dd, 1) if dd else None
+            # per-position conditional acceptance: accepted[pos] / accepted[pos-1]
+            bpos, apos = before.get("pos", {}), after.get("pos", {})
+            dp = {p: apos.get(p, 0.0) - bpos.get(p, 0.0) for p in set(bpos) | set(apos)}
+            posrate = []
+            prev = None
+            for p in sorted(dp):
+                if prev is None:
+                    posrate.append(dp[p] / dn if dn else 0.0)  # P(accept pos0 | draft)
+                else:
+                    posrate.append(dp[p] / prev if prev else 0.0)  # P(accept pos p | accept p-1)
+                prev = dp[p]
         rows.append({"rep": rep, "conc": a.conc, "gen": a.gen, "wall_s": wall,
                      "tokens": ct, "agg_tps": agg, "per_req_tps": per, "ttft_ms": mean_ttft,
-                     "acc_per_draft": accd, "accept_rate": maxd})
+                     "acc_per_draft": accd, "accept_rate": maxd, "pos_rate": posrate})
         print(f"  conc {a.conc:>2} r{rep} | {ct:6d} tok | {wall:5.2f} s | agg {agg:7.1f} tok/s | "
               f"per-req {per:6.1f} | ttft {mean_ttft:6.0f} ms | acc/draft {accd if accd is None else round(accd,3)} | "
               f"rate {None if maxd is None else round(100*maxd,2)}%", flush=True)
+        if posrate:
+            print("       acc by pos (cond): " + " ".join(f"p{i}={r:.2f}" for i, r in enumerate(posrate)),
+                  flush=True)
     agg = sum(r["agg_tps"] for r in rows) / len(rows)
     print(f"--- conc {a.conc}: mean aggregate {agg:.1f} tok/s over {len(rows)} reps ---")
     if a.out:

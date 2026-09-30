@@ -27,7 +27,7 @@ from the intact vllm-1 dir helped). Never measure an unverified boot.
 
 | ID | Task | Status | Source | Blocker | Effort |
 |---|---|---|---|---|---|
-| M1 | **N-gram tail HSA fault** at bs≥2. Standalone repro now PASSES every B=1/B=2 variant (cont.34) → the fault is **in-engine integration/aliasing**, not the matcher. Next: in-engine instrumentation of the `ctx` view / buffer pool / launch context with `NGRAM=1` (may wedge per attempt). | READY (in-engine) | WORKLOG cont.28/34 | latched constraint: matcher `NSPEC` must be a power of two (engine passes 8) |
+| M1 | **N-gram tail HSA fault** at bs≥2. **H1 (windowed `base>0`) and H4 (UVA/int32 ctx) ruled out off-server** (cont.44). Remaining: H3 scratch allocated during a FULL-graph replay (most likely, safe fix = pre-create/pre-compile before capture), H2 `_match_gather` OOB at ML=160k, H5 bad continuation. | READY (in-engine, may wedge) | WORKLOG cont.34/42/44; matcher `NSPEC` must be pow2 |
 | M2 | **`RADIANCE_DRAFT_HEAD_TOP1`** — drop the arm (neutral + mutually exclusive with the vocab prune; crashes on reload). Registry stays off. | **CLOSED (dropped)** | WORKLOG cont.28 3b, cont.29 | no code change |
 
 ## 2. Calibration / config debt
@@ -78,7 +78,7 @@ from the intact vllm-1 dir helped). Never measure an unverified boot.
 
 | ID | Task | Status | Source |
 |---|---|---|---|
-| X1 | Install `flash_attn 2.8.3` + A/B vs R4D/AITER attention. | **LOW VALUE / optional** | on gfx1201 the CK backend cannot build (Wave32 vs Wave64); only the Triton backend works and it mainly accelerates **ViT** attention. Our body uses purpose-built R4D → low expected value. |
+| X1 | flash_attn 2.8.3 | **PARKED (low value)** | Dockerfile pip-overlay possible, but CK cannot build on gfx1201 (Wave32/64) and the Triton path mainly helps ViT; our body uses R4D. |
 | X2 | Reorder-threshold fix script (see below). | PENDING | REORDER-THRESHOLD-FIX-PLAN |
 
 ## 7. Reorder-threshold fix (REORDER-THRESHOLD-FIX-PLAN.md)
@@ -131,8 +131,8 @@ spent — none makes 16k faster. 8k is the pragmatic compromise.
 | ID | Task | Status | Notes |
 |---|---|---|---|
 | PF1 | **Profile chunk 4096 vs 16384.** | **DONE (8k prompt)** | cont.37: prefill is chunk-independent at 7974 tok (452 vs 454 ms, ~17.6k tok/s); the 16k-chunk decode delta was a compile-key artifact. Needs **larger prompts/context** to exercise PF2/PF3. Harness `aijuus/bench-prefill-ttft.py`. |
-| PF2 | **GDN chunk-scan parallelization** (decoupled/parallel scan across WGs with a carry; more v-heads/tiles per WG; fuse `conv_prep`/`kkt_solve`). | READY (kernel, high) | directly attacks the N-collapse that is the chunk regression |
-| PF3 | **R4D prefill scheduling**: split-KV/stream-K over the causal prefix + persistent triangular-balanced schedule + larger `TILE`/`BLOCK_Q`. | OPEN (kernel) | long-context TTFT; attention is only ~7.4% at 16k, pays at 32k-260k |
+| PF2 | GDN chunk-scan parallelization | **PARKED** | kernel lives in libr4d (upstream clone at build), not in this repo; no runtime overlay can change a compiled `.so`. Needs a libr4d source patch + rebuild to validate. |
+| PF3 | R4D prefill scheduling (split-KV/stream-K, persistent triangular) | **PARKED** | libr4d kernel; no runtime overlay; needs source patch + rebuild (+ long-context validation). |
 | PF4 | MXFP4 prefill GEMM at M=16384: revisit split-K only if PF1 shows a gap. | PARKED (low) | TN=8 accumulator wall; ~80-82% of WMMA, power-bound |
 | PF5 | All-reduce: A/B `RADIANCE_USE_R4D_AR_QUANT` (+7.2% prefill @16K, **not bit-identical**) or `RADIANCE_AR_OVERLAP` (staged off). | READY (A/B) | non-bit-identical is the caveat |
 | PF6 | 8k chunk compromise (keeps N higher → better GDN occupancy, most deferral benefit, less memory tax). | DECISION | config, not code |
@@ -157,9 +157,9 @@ byte store with an O_DIRECT fixed-size round-trip contract, so a lossy tier cann
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
-| OS1 | **E1** suffix-only invalidation for draft rejection in the offload/prefix path, then reconsider including MTP/draft KV groups. | READY (highest) | enables MTP-KV offload |
-| OS2 | **E2** three-tier publication (reserved/device-ready/host-ready/committed): decouple store completion from the response path (targets the measured ~18% cold-prefill store await). | READY | |
-| OS3 | **E3** bounded host-snapshot GDN rollback (2-slot GPU stage) to re-enable `RADIANCE_GDN_LAZY=0` path. | READY (research) | |
+| OS1 | **E1** suffix-only invalidation for draft rejection; then include MTP draft KV groups. | **RESEARCHED, IMPLEMENTATION PENDING (medium)** | Rejection currently invalidates nothing (counter rollback only); withholding the trailing chunk caps the *target* group's external hit by one chunk/turn. Needs a new `manager.invalidate` API + tombstones (races in-flight load/write) + tiering/fs cascade + a scheduler `on_draft_rejected` hook. Full change set in WORKLOG cont.42. |
+| OS2 | **E2** offload store decoupling (submit D2H at creation; stop the finished-req self-flush). | **IMPLEMENTED, A/B NEGATIVE, DORMANT** | `aijuus/kv-offload/patches/patch_offload_lazy_commit.py` (`RADIANCE_OFFLOAD_LAZY_COMMIT`, default off). Cold-18k TTFT **8031 vs 7560 ms (+5.6%)**: eager D2H contends with the 2nd prefill chunk. Corrected anchor: the real await is `pre_forward -> handle_preemptions -> worker.wait(jobs_to_flush)` (not `wait_for_save`, a no-op). |
+| OS3 | **E3** bounded host-snapshot GDN rollback (2-slot GPU stage) to re-enable lazy GDN snapshots. | **RESEARCHED, IMPLEMENTATION PENDING (medium)** | Root cause of lazy corruption: libr4d materialize **fails open** (`r=0` stores the base as checkpoint) when a prefix hit invalidates the stash. Design: 2-slot GPU stage + pinned host ring keyed by frontier, fail-closed gate; needs a small libr4d edit or a runtime Triton validator. |
 | OS4 | E4 phase arena / E5 cross-token prefetch+sparse feedback. | PARKED | excluded / decode-only single-digit |
 | OS5 | E6 PDL fence-ordering principle. | N/A | CUDA-only |
 
@@ -216,11 +216,11 @@ rocm7.14** — the pybind/ctypes `.so`s (`r4d.so`, `clav_ar_ext`, `clav_ag_ext`,
 |---|---|---|---|
 | TF1 | `gdn_verify_r` fused MTP verify kernel | **CLOSED (not an upgrade)** | tcclaviger's own libr4d chain is 1.2-1.5× faster than `gdn_verify_r`; we already run libr4d + our `fused_update`. Only the interface idea (single dispatch, raw int32 metadata, in-kernel per-token snapshots) is transferable as a Python-overhead port. |
 | TF3 | `clav_ar`/`clav_ag` P2P-BAR collectives | **CLOSED (N/A)** | TP-group collectives only; we are DP (world_size 1, no collectives); the x1 card defeats BAR P2P anyway. |
-| TF2 | `clav_attn` unified attention A/B vs R4D | **OPTIONAL (needs rebuild)** | apples-to-apples (gfx1201 d256, bf16+fp8 KV, MTP-aware) but `clav_attn_C` must be rebuilt for py3.12/ROCm7.14; keep both backends selectable, not both registered to the CUSTOM enum. |
+| TF2 | `clav_attn` unified attention A/B vs R4D | **PARKED** | kernel source not shipped in the image (only the cp314 `.so`), so it genuinely cannot be overlaid/rebuilt by us. |
 | TF4 | TunableOp GEMM sweep (`CLAV_TUNABLEOP_SWEEP=1`) | OPEN | not covered by the image analysis |
 | TF5 | Fetch tcclaviger's vLLM fork | BLOCKED (private) | image-level analysis substitutes |
-| KB1 | **Bump libr4d pin** to inherit generic `r4d_pq_*` + dense `r4d_gemm_w4a8_nt_m64` | OPEN (build) | requires rebasing `r4d_radiance_extras*.patch` + version assertion; caveat: tcclaviger's r4d GDN NaNs on our model (`Dockerfile.ggz14:475-479`) — re-validate |
-| KB2 | `gdn_verify_r` interface port (single-dispatch spec verify, raw int32 metadata) | LOW | expected gain is Python-overhead only |
-| KB3 | RFI/RFA fused-prologue study (`add_rms_rotate_quant_int8`, `silu_mul_rotate_quant_int8`) | LOW (study) | same fusion class as `RADIANCE_FUSE_RMS_QUANT`; formats need requantizing |
-| KB4 | `fp8hip` block-scaled w8a8 | LOW | only if we serve an fp8 checkpoint; prod body is MXFP4 W4A8 |
+| KB1 | Bump libr4d pin (`r4d_pq_*`, dense w4a8) | **PARKED** | possible as a Dockerfile+extras build overlay, but needs a rebuild to validate and tcclaviger's r4d GDN NaNs on our model (`Dockerfile.ggz14:475-479`). Low value (we already run r4d). |
+| KB2 | `gdn_verify_r` interface port | **PARKED** | kernel is cp314-only; superseded by libr4d (1.2-1.5x faster); only a Python-shape idea. |
+| KB3 | RFI/RFA fused-prologue study | **PARKED (low)** | requires requantizing the model; same fusion class as `RADIANCE_FUSE_RMS_QUANT`. |
+| KB4 | `fp8hip` block-scaled w8a8 | **PARKED (low)** | cp314-only `.so`; only relevant to an fp8 checkpoint we do not serve. |
 | — | `q4hc`(HyperConnection), `plehip`(PLE), `r4d_qsa/ple/mhc/dsfp/dflash2` | **N/A** | Qwen4Exp/Flash-Next/DSV4-only |
