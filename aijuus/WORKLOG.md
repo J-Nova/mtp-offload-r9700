@@ -1658,3 +1658,27 @@ boundary is an exact multiple of `lcm(880, 64, chunk)` vs deliberately misaligne
 is EXACT and misaligned DIFFs. If aligned is exact → chunk-phase (inherent; E1 validation should be on
 acceptance, not bit-exactness). If misaligned-exact too and only specific lengths diverge → writer-side
 bug to bisect (`patch_sched_align_last_block` / reconcile / mamba stride).
+
+## 2026-09-30 (cont. 52) — MT1 reproduces at all scales; trigger is turnbench-flow-specific
+
+`turnbench --exact --sessions A --t1 6000 --step 4000 --turns 4` (all prompts <16k, one/two chunks,
+warm pool, gates off): COLD A1 EXACT, A2 GPU partial hit DIFF (first-div 61, max|dlp| 1.48e-01),
+A3/A4 DIFF, drift 61/56/82, HEALTH PASS. So the divergence:
+- is **single-session** and **independent of scale/chunk count** (appears at ~10.6k tokens),
+- is **not** the KV writer (the `hit_oracle` full-hit/partial/reply-reuse tests were all bit-identical),
+- but the minimal oracle does **not** reproduce it, so the trigger is in turnbench's specific flow.
+
+Narrowing: turnbench's distinguishing features vs the oracle are (a) a stdlib-file prompt (varied,
+unaligned content) rather than a repeated synthetic one, (b) `max_tokens=320` replies and
+`top_logprobs`, (c) reuse of the previous turn's **decode-written assistant reply** as a cached prefix
+next turn under the radiance MTP/align patches, (d) the cold twin runs later (cache warm).
+
+The two remaining classes are now: **inherent resume geometry** (a partial-hit suffix is prefilled with
+different attention/GEMM split shapes than cold, so not bit-identical; fp8 KV amplifies to token flips)
+vs a **radiance writer bug** in the align/reconcile/mamba-stride patches that only this flow exercises.
+Decisive next step: byte-level `statecmp` at the hit boundary (dump the reused KV/state bytes for the
+cached vs cold A2 and diff), or a `turnbench --exact` bisect with `RADIANCE_ALIGN_PROMPT_LAST_BLOCK=0`,
+`RADIANCE_RECONCILE_REASK=0`, `RADIANCE_MAMBA_STORE_STRIDE` variations.
+
+Status: MT1 root-cause narrowed to a specific flow; the fix (or the "inherent" verdict) needs the
+statecmp/bisect. MT2 unmeasured but expected to inherit the same mechanism through the tier.
