@@ -1706,3 +1706,31 @@ Implications:
   E1 correctness must be judged on **acceptance / served-token semantics**, not bit-exactness.
 - MT1/MT2 closed as inherent (documented). If bit-exactness across partial hits is ever required, it
   needs a resume that reuses the cold chunk grid (a scheduler change), not a KV fix.
+
+## 2026-09-30 (cont. 54) — Can resume be made bit-identical? (deep research verdict)
+
+**Yes, two routes — but making it default is not worth it.**
+
+Root gate refined: not attention/GEMM shape per se, but the **GDN recurrent path anchored to the launch
+start** (S1 `radiance_gdn.py:40,55,201-263` CHUNK=64 launch-local; S2 `conv_prep` per-chunk cumsum
+`:376`; S3 the SSM state narrowed to **fp16 at chunk ends** `:699-702,714` / `--mamba-ssm-cache-dtype
+float16` `serve-mxfp4.sh:700-702`). fp8 KV (e4m3, 3-bit) is only the **amplifier** (S8). Cold's actual
+chunk stride is **C = B·floor((CHUNK−draft_slots)/B) = 880·floor(16384/880) = 15840**, not 16384
+(`scheduler.py:550-557`; `mamba_has_prefill_checkpoint_blocks` is False under Eagle/MTP `:448-457`).
+
+- **Route A (runtime overlay, bit-identical):** quantize every prefix hit DOWN to C (raise
+  `cache_hit_alignment_tokens`, `single_type_kv_cache_manager.py:77,783`; `kv_cache_coordinator.py:666`)
+  and align the Mamba/offload store grid to C (`patch_mamba_stride.py`). **Cost:** forfeits up to
+  C−1 ≈ 15.8k tokens of reuse per hit; **`prompt ≤ CHUNK` forces hit = 0** (full recompute). Likely
+  destroys most partial-hit benefit and negates E1's tier inclusion.
+- **Route B (kernel, heavy):** absolute-phase-anchor the GDN scan (libr4d rebuild) **and** make cold
+  round/reload the recurrent state on a fixed absolute grid (runner/kernel change that *alters cold
+  numerics*). Preserves hit granularity; needs a `r4d.so` rebuild and touches the hot path.
+- **Cheap partial mitigations (not exact):** existing 3520 store grid (`RADIANCE_MAMBA_STORE_STRIDE=4`),
+  pin MXFP4 kernel selection across M (S4), bf16 KV (kills the fp8 amplifier, halves concurrency).
+
+**Recommendation (adopted):** do NOT pursue bit-exactness. It is over-strict on this stack by
+construction: fp8 KV sets a ~6 %/element noise floor, chunked prefill re-partitions reductions, and
+R4D explicitly opts out of batch-invariance (`radiance_r4d_attn.py:260 supports_batch_invariance=False`,
+`backend.py:200,321`). Validate E1 on **acceptance / served semantics**, not bit equality. Route A is
+available as a gated overlay if bit-exactness ever becomes a hard requirement.
