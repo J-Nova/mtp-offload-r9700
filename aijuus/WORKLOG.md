@@ -1599,3 +1599,37 @@ Reasons to wait anyway:
   `r4d.so`** through the existing `AUTO_R4D`/`R4D_KEY=…-rx10` path (host-cached under
   `~/.cache/radiance-libr4d/<key>/`, mounted into `/r4d`, copied over the image's at boot), or avoid
   even that with a runtime Triton fail-closed validator.
+
+## 2026-09-30 (cont. 50) — MT1 narrowed (writer faithful); E3 fix route chosen
+
+### MT1/MT2 oracle (`aijuus/kv-offload/ops/hit_oracle.py`, vllm-0 mtp-blend, 24k prompt, temp 0 + logprobs)
+| comparison | result |
+|---|---|
+| writer(cold) vs cold_twin | bit-identical |
+| full-hit vs cold_twin | bit-identical |
+| partial-hit (prefix + new suffix) vs cold | bit-identical |
+| multi-turn: turn2 reusing an **assistant reply written by MTP decode** vs cold | **bit-identical** (160 tokens, max|dlp| 0) |
+
+Conclusion: the KV **writer is cold-faithful** on the base path — full hit, hit-anchored suffix prefill,
+and decode-written reply reuse all reproduce a cold recompute exactly. So MT1 is **not** base
+prefill/KV or reply-reuse accumulation. The turnbench divergence must come from a condition the single
+-session oracle does not exercise: **cross-session shared prefixes / partial external (offload) hits**
+(turnbench's three sessions share the stdlib corpus), or scale (pool pressure/eviction). `patch_offload_mixed_hit.py`
+/ `patch_reconcile_reask.py` are the prime suspects for a wrong-prefix serve, not numerics. MT2 remains
+likely inherited.
+
+Next MT1 step: a cross-session partial-external-hit repro (two sessions sharing a prefix, cold twin
+for a later turn), then bisect the offload patches (`RADIANCE_OFFLOAD_MIXED_HIT=0`,
+`RADIANCE_RECONCILE_REASK=0`) against `turnbench --exact`.
+
+### E3 fix route (research)
+Fail-open confirmed at `r4d_radiance_extras_rx10.patch:1503-1509` (`r=0` on header mismatch) followed by
+an unconditional store at `:1529-1531`. `radiance_gdn_lazy.py` is **runtime-copied** from /patches each
+boot (`entrypoint.sh:227`), so a Python fix needs only a restart — **no rebuild**.
+Routes: (3a) Python header check → detect (raise/log) but does not repair; (3b) skip the store = a trap
+(`dst` then holds stale q/k/v bytes); (3c) **host-snapshot ring + 2-slot GPU stage keyed by token
+frontier, restore on mismatch** = the only variant that *fixes* it, pure Python, no rebuild; (K2)
+kernel `restore_ok` flag + fallback via the incremental `r4d.so` rebuild (higher moving parts: ABI bump,
+cache-key bump, must compile with the image's hipcc). Chosen route: **3c** (self-contained overlay),
+with 3a as an interim loud-failure if desired. Lazy is currently off (`RADIANCE_GDN_LAZY=0`), so E3 is a
+memory optimization (≈865 MB/req device → ≈260 MB), not a correctness emergency.
