@@ -21,9 +21,9 @@ SENT = "radiance lazy gdn"
 # ---- 1. spec blocks -------------------------------------------------------------------------
 apply(SP / "model_executor/layers/mamba/abstract.py",
 '''            num_speculative_blocks=(
-                vllm_config.speculative_config.num_speculative_tokens
-                if vllm_config.speculative_config
-                else 0
+                0
+                if vllm_config.cache_config.use_kda_recoverssm
+                else vllm_config.num_speculative_tokens
             ),
 ''',
 '''            num_speculative_blocks=_radiance_lazy_spec_blocks(self, vllm_config),  # radiance lazy gdn
@@ -34,8 +34,9 @@ apply(SP / "model_executor/layers/mamba/abstract.py",
     """radiance lazy gdn: a lazy cache keeps one stash block per request instead of one block per
     draft token (radiance_gdn_lazy.py). GDN layers only; everything else keeps the stock count."""
     import os as _os
-    n = (vllm_config.speculative_config.num_speculative_tokens
-         if vllm_config.speculative_config else 0)
+    if vllm_config.cache_config.use_kda_recoverssm:
+        return 0
+    n = vllm_config.num_speculative_tokens
     if n > 0 and _os.environ.get("RADIANCE_GDN_LAZY", "0") == "1" \\
             and "GDN" in str(getattr(layer.mamba_type, "name", layer.mamba_type)).upper():
         return 1
@@ -86,15 +87,19 @@ apply(G,
 # ---- 3. copies -------------------------------------------------------------------------------
 M = SP / "v1/worker/mamba_utils.py"
 apply(M,
-'''    # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
-    # the post-step new_num_computed value (V2 supplies the advanced count).
-    PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
+'''    # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
+    # TEMPORAL_TILES CTAs along the u64 inner range. Callers must launch a
+    # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
+    # the existing 2D-grid contract.
+    TEMPORAL_TILES: tl.constexpr = 1,
 ):
 ''',
-'''    # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
-    # the post-step new_num_computed value (V2 supplies the advanced count).
-    PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
-    LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn: temporal states are materialised elsewhere
+'''    # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
+    # TEMPORAL_TILES CTAs along the u64 inner range. Callers must launch a
+    # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
+    # the existing 2D-grid contract.
+    TEMPORAL_TILES: tl.constexpr = 1,
+    LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn: temporal states materialised elsewhere
 ):
 ''', SENT + " post-sig", "mamba_utils: LAZY_TEMPORAL on the postprocess kernel")
 apply(M,
@@ -108,16 +113,18 @@ apply(M,
     _copy_mamba_state_block(
 ''', SENT + " post-skip", "mamba_utils: postprocess skips temporal states under lazy")
 apply(M,
-'''    CONV_STATE_DIM_FIRST: tl.constexpr,
-    HAS_IDX_MAPPING: tl.constexpr = True,
+'''    HAS_IDX_MAPPING: tl.constexpr = True,
+    # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
+    # the 2D-grid contract; > 1 requires a 3D grid.
+    TEMPORAL_TILES: tl.constexpr = 1,
 ):
-    """Pre-copy mamba "align" state across block boundaries.
 ''',
-'''    CONV_STATE_DIM_FIRST: tl.constexpr,
-    HAS_IDX_MAPPING: tl.constexpr = True,
+'''    HAS_IDX_MAPPING: tl.constexpr = True,
+    # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
+    # the 2D-grid contract; > 1 requires a 3D grid.
+    TEMPORAL_TILES: tl.constexpr = 1,
     LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn
 ):
-    """Pre-copy mamba "align" state across block boundaries.
 ''', SENT + " pre-sig", "mamba_utils: LAZY_TEMPORAL on the precopy kernel")
 apply(M,
 '''    token_bias = tl.load(token_bias_ptr + req_idx)
@@ -141,19 +148,15 @@ apply(M,
 ''', SENT + " pre-skip", "mamba_utils: precopy skips temporal states under lazy")
 # remember what the tables need
 apply(M,
-'''        if self.is_initialized:
-            return
-
+'''    ) -> None:
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
 ''',
-'''        if self.is_initialized:
-            return
+'''    ) -> None:
         # radiance lazy gdn: the materialize tables are built from these on first use
         self._radiance_kv_cfg = kv_cache_config
         self._radiance_fwd_ctx = forward_context
         self._radiance_copy_funcs = mamba_state_copy_funcs
-
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
 ''', SENT + " tables", "mamba_utils: keep the forward context for the lazy tables")
@@ -178,6 +181,7 @@ apply(M,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
         )
 ''',
 '''            idx_mapping,
@@ -185,6 +189,7 @@ apply(M,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
             LAZY_TEMPORAL=_radiance_lazy(),
         )
         if _radiance_lazy():  # radiance lazy gdn: temporal migration = base + replay
@@ -193,40 +198,38 @@ apply(M,
                                           token_bias_gpu, idx_mapping)
 ''', SENT + " precopy", "mamba_utils: lazy materialize after the precopy")
 apply(M,
-'''        if num_reqs == 0 or not self.is_initialized:
-            return
-        total_states = self.num_layers * self.num_state_types
-        grid = (num_reqs, total_states)
+'''        num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
+
+        total_states = self.num_states
+        grid = (num_reqs, total_states, _TEMPORAL_TILES)
         postprocess_mamba_fused_kernel[grid](
-            num_accepted_tokens_gpu,
-            state_idx_gpu,
-            None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
+            num_accepted_tokens_snapshot,
 ''',
-'''        if num_reqs == 0 or not self.is_initialized:
-            return
+'''        num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
+
         if _radiance_lazy():  # radiance lazy gdn: checkpoint = base + replay, BEFORE the reset
             import radiance_gdn_lazy
             radiance_gdn_lazy.materialize(self, 1, num_reqs, num_accepted_tokens_gpu,
                                           state_idx_gpu, new_num_computed_tokens_gpu, idx_mapping)
-        total_states = self.num_layers * self.num_state_types
-        grid = (num_reqs, total_states)
+        total_states = self.num_states
+        grid = (num_reqs, total_states, _TEMPORAL_TILES)
         postprocess_mamba_fused_kernel[grid](
-            num_accepted_tokens_gpu,
-            state_idx_gpu,
-            None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
+            num_accepted_tokens_snapshot,
 ''', SENT + " postalign", "mamba_utils: lazy materialize before the align postprocess")
 apply(M,
 '''            HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
         )
 ''',
 '''            HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
             LAZY_TEMPORAL=_radiance_lazy(),
         )
 ''', SENT + " postalign-flag", "mamba_utils: LAZY_TEMPORAL on the align postprocess launch")
 apply(M,
-'''def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:''',
+'''def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int]]:''',
 '''def _radiance_lazy() -> bool:
     """radiance lazy gdn: RADIANCE_GDN_LAZY=1 (read once)."""
     import os as _os
@@ -236,5 +239,5 @@ apply(M,
     return v
 
 
-def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:''', SENT + " flag", "mamba_utils: lazy flag helper")
+def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int]]:''', SENT + " flag", "mamba_utils: lazy flag helper")
 print("patch_gdn_lazy: done")
