@@ -2244,3 +2244,15 @@ single step (bounded by `max_num_batched_tokens`) but not long-context fragmenta
 cont.71 failure mode — so a passing pin still needs a BetterBench long-context/concurrency run. KV past
 160k only helps concurrency/prefix reuse. Note `--pins` keeps the edge and applies no backoff; the sweep
 (`START=<bytes> MAX_STEPS=N`) backs off 2% for margin. Pin is provisional.
+
+## 2026-10-01 (cont. 77) — quick KV-pin OOM validator; 7.6 GiB pin validated
+
+Added `aijuus/bench-kv-validate.py`: the fast, purpose-built check for a `kv_cache_memory` pin --
+a cold long-prefill sweep (the transient activation peak) plus a concurrency sweep (KV pressure), with
+a PASS/FAIL verdict and OOM/500/refused detection. Unlike BetterBench it does no quality/plotting; it
+answers "did the engine survive".
+
+**Validated the applied 7.6 GiB pin (207,748 tokens):**
+- prefill 16k / 64k / **160k** (155,105 actual tok) -> OK, PP 2381 / 2137 / 1677 t/s
+- concurrency 8 x 4096-token prompts + 128 gen -> 8/8 OK, 33.9 agg t/s
+- **VERDICT: PASS -- no OOM.**
