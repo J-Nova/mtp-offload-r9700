@@ -27,7 +27,7 @@ apply(SP / "model_executor/layers/mamba/abstract.py",
             ),
 ''',
 '''            num_speculative_blocks=_radiance_lazy_spec_blocks(self, vllm_config),  # radiance lazy gdn
-''', SENT, "abstract.get_kv_cache_spec: one stash block under RADIANCE_GDN_LAZY")
+''', "num_speculative_blocks=_radiance_lazy_spec_blocks(self, vllm_config)", "abstract.get_kv_cache_spec: one stash block under RADIANCE_GDN_LAZY")
 apply(SP / "model_executor/layers/mamba/abstract.py",
 '''class MambaBase(AttentionLayerBase):''',
 '''def _radiance_lazy_spec_blocks(layer, vllm_config):
@@ -43,7 +43,7 @@ apply(SP / "model_executor/layers/mamba/abstract.py",
     return n
 
 
-class MambaBase(AttentionLayerBase):''', SENT + " helper", "abstract: lazy spec-block helper")
+class MambaBase(AttentionLayerBase):''', "def _radiance_lazy_spec_blocks(layer, vllm_config):", "abstract: lazy spec-block helper")
 
 # ---- 2. builder ------------------------------------------------------------------------------
 G = SP / "v1/attention/backends/gdn_attn.py"
@@ -54,7 +54,7 @@ apply(G,
     # radiance lazy gdn: the stash block of every batch row (window column 1), for prefill
     # invalidation. None unless RADIANCE_GDN_LAZY=1.
     radiance_stash_indices: torch.Tensor | None = None
-''', SENT + " field", "gdn_attn: stash-index metadata field")
+''', "radiance_stash_indices: torch.Tensor | None = None", "gdn_attn: stash-index metadata field")
 apply(G,
 '''        self.spec_state_indices_tensor: torch.Tensor = torch.empty(
             (self.decode_cudagraph_max_bs, self.num_spec + 1),
@@ -63,7 +63,7 @@ apply(G,
         self._rad_lazy = _rl_os.environ.get("RADIANCE_GDN_LAZY", "0") == "1"
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
             (self.decode_cudagraph_max_bs, 2 if self._rad_lazy else self.num_spec + 1),
-''', SENT + " width", "gdn_attn: 2-wide spec-state buffer under lazy")
+''', "2 if self._rad_lazy else self.num_spec + 1", "gdn_attn: 2-wide spec-state buffer under lazy")
 # shared-build fast path: the per-group block table is `bt`; attach its column 1
 apply(G,
 '''            self.num_accepted_tokens[:bs].copy_(sh["acc_src"], non_blocking=True)
@@ -74,7 +74,7 @@ apply(G,
             return _dc.replace(
                 sh["md"],
                 radiance_stash_indices=(bt[:bs, 1] if self._rad_lazy else None),  # radiance lazy gdn
-''', SENT + " fast", "gdn_attn: stash indices on the shared-build path")
+''', "radiance_stash_indices=(bt[:bs, 1] if self._rad_lazy else None)", "gdn_attn: stash indices on the shared-build path")
 apply(G,
 '''        attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
@@ -82,7 +82,7 @@ apply(G,
 '''        attn_metadata = GDNAttentionMetadata(
             radiance_stash_indices=(block_table_tensor[:, 1] if self._rad_lazy else None),  # radiance lazy gdn
             num_prefills=num_prefills,
-''', SENT + " full", "gdn_attn: stash indices on the full build path")
+''', "radiance_stash_indices=(block_table_tensor[:, 1] if self._rad_lazy else None)", "gdn_attn: stash indices on the full build path")
 
 # ---- 3. copies -------------------------------------------------------------------------------
 M = SP / "v1/worker/mamba_utils.py"
@@ -101,7 +101,7 @@ apply(M,
     TEMPORAL_TILES: tl.constexpr = 1,
     LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn: temporal states materialised elsewhere
 ):
-''', SENT + " post-sig", "mamba_utils: LAZY_TEMPORAL on the postprocess kernel")
+''', "temporal states materialised elsewhere", "mamba_utils: LAZY_TEMPORAL on the postprocess kernel")
 apply(M,
 '''    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     _copy_mamba_state_block(
@@ -111,7 +111,7 @@ apply(M,
             return
     bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     _copy_mamba_state_block(
-''', SENT + " post-skip", "mamba_utils: postprocess skips temporal states under lazy")
+''', "if LAZY_TEMPORAL:  # radiance lazy gdn\n        if tl.load(state_conv_widths_ptr + state_idx) == 0:\n            return\n    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx", "mamba_utils: postprocess skips temporal states under lazy")
 apply(M,
 '''    HAS_IDX_MAPPING: tl.constexpr = True,
     # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
@@ -125,7 +125,7 @@ apply(M,
     TEMPORAL_TILES: tl.constexpr = 1,
     LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn
 ):
-''', SENT + " pre-sig", "mamba_utils: LAZY_TEMPORAL on the precopy kernel")
+''', "LAZY_TEMPORAL: tl.constexpr = False,  # radiance lazy gdn\n):", "mamba_utils: LAZY_TEMPORAL on the precopy kernel")
 apply(M,
 '''    token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
@@ -145,7 +145,7 @@ apply(M,
         src_col,
         dst_col,
         token_bias,
-''', SENT + " pre-skip", "mamba_utils: precopy skips temporal states under lazy")
+''', "if LAZY_TEMPORAL:  # radiance lazy gdn\n        if tl.load(state_conv_widths_ptr + state_idx) == 0:\n            return\n    token_bias = tl.load(token_bias_ptr + req_idx)", "mamba_utils: precopy skips temporal states under lazy")
 # remember what the tables need
 apply(M,
 '''    ) -> None:
@@ -159,7 +159,7 @@ apply(M,
         self._radiance_copy_funcs = mamba_state_copy_funcs
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
-''', SENT + " tables", "mamba_utils: keep the forward context for the lazy tables")
+''', "self._radiance_copy_funcs = mamba_state_copy_funcs", "mamba_utils: keep the forward context for the lazy tables")
 # V1 postprocess: not supported under lazy
 apply(M,
 '''        if num_reqs == 0 or not self.is_initialized:
@@ -173,7 +173,7 @@ apply(M,
             raise RuntimeError("RADIANCE_GDN_LAZY needs the V2 model runner (align postprocess)")
 
         # Initialize output to current values (unchanged unless src==dst)
-''', SENT + " v1", "mamba_utils: V1 postprocess refuses lazy")
+''', "raise RuntimeError(\"RADIANCE_GDN_LAZY needs the V2 model runner (align postprocess)\")", "mamba_utils: V1 postprocess refuses lazy")
 # precopy: Triton (conv only) then materialize
 apply(M,
 '''            idx_mapping,
@@ -196,7 +196,7 @@ apply(M,
             import radiance_gdn_lazy
             radiance_gdn_lazy.materialize(self, 0, num_reqs, state_idx_gpu, src_col_gpu,
                                           token_bias_gpu, idx_mapping)
-''', SENT + " precopy", "mamba_utils: lazy materialize after the precopy")
+''', "radiance_gdn_lazy.materialize(self, 0, num_reqs, state_idx_gpu, src_col_gpu,", "mamba_utils: lazy materialize after the precopy")
 apply(M,
 '''        num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
 
@@ -215,7 +215,7 @@ apply(M,
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_snapshot,
-''', SENT + " postalign", "mamba_utils: lazy materialize before the align postprocess")
+''', "radiance_gdn_lazy.materialize(self, 1, num_reqs, num_accepted_tokens_gpu,", "mamba_utils: lazy materialize before the align postprocess")
 apply(M,
 '''            HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
@@ -227,7 +227,7 @@ apply(M,
             TEMPORAL_TILES=_TEMPORAL_TILES,
             LAZY_TEMPORAL=_radiance_lazy(),
         )
-''', SENT + " postalign-flag", "mamba_utils: LAZY_TEMPORAL on the align postprocess launch")
+''', "PRECOMPUTED_NEW_COMPUTED=True,\n            TEMPORAL_TILES=_TEMPORAL_TILES,\n            LAZY_TEMPORAL=_radiance_lazy(),", "mamba_utils: LAZY_TEMPORAL on the align postprocess launch")
 apply(M,
 '''def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int]]:''',
 '''def _radiance_lazy() -> bool:
@@ -239,5 +239,5 @@ apply(M,
     return v
 
 
-def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int]]:''', SENT + " flag", "mamba_utils: lazy flag helper")
+def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int]]:''', "def _radiance_lazy() -> bool:", "mamba_utils: lazy flag helper")
 print("patch_gdn_lazy: done")
