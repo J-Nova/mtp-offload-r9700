@@ -127,6 +127,12 @@ _RAD_NGRAM = _rad_os.environ.get("RADIANCE_DRAFT_NGRAM", "0") == "1"
 _RAD_NGRAM_STRONG = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_STRONG", "8"))
 _RAD_NGRAM_WINDOW_FROM = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_WINDOW_FROM", "32768"))
 _RAD_NGRAM_WINDOW = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_WINDOW", "16384"))
+# RADIANCE_DRAFT_NGRAM_ADAPT: per-request productivity gate (see ACTIONABLE-AB-PLAN A2/A3).
+_RAD_NGRAM_ADAPT = _rad_os.environ.get("RADIANCE_DRAFT_NGRAM_ADAPT", "0") == "1"
+_RAD_NGRAM_EMA_ALPHA = float(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_EMA_ALPHA", "0.10"))
+_RAD_NGRAM_EMA_MIN = float(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_EMA_MIN", "0.02"))
+_RAD_NGRAM_WARMUP = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_WARMUP", "2"))
+_RAD_NGRAM_PROBE = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_PROBE", "32"))
 
 
 def _radiance_ngram_extend(runner, input_batch, base_tokens):
@@ -148,6 +154,31 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
     dev = base_tokens.device
     if R == 0 or K <= 0:
         return base_tokens
+    # RADIANCE_DRAFT_NGRAM_ADAPT: skip the (costly) per-row matcher for rows that have not been
+    # productive recently; re-arm on warmup, a periodic probe, or after a hit. When the whole batch is
+    # cold, return early with no gather/launches/syncs. Lossless: cold rows keep their MTP draft.
+    _rids = list(input_batch.req_ids)
+    _nst = getattr(runner, "_rad_ngram_state", None)
+    if _nst is None:
+        _nst = {}
+        runner._rad_ngram_state = _nst
+    _run = [True] * R
+    if _RAD_NGRAM_ADAPT:
+        _keep = set(_rids)
+        for _k in [k for k in _nst if k not in _keep]:
+            del _nst[_k]
+        for _i in range(R):
+            _s = _nst.get(_rids[_i])
+            if _s is None:
+                _s = [0.0, 0, 0, False]  # ema, obs, probe, latch
+                _nst[_rids[_i]] = _s
+            _arm = (_s[1] < _RAD_NGRAM_WARMUP or _s[3]
+                    or _s[0] >= _RAD_NGRAM_EMA_MIN or _s[2] >= _RAD_NGRAM_PROBE)
+            _run[_i] = _arm
+            if not _arm:
+                _s[2] += 1
+        if not any(_run):
+            return base_tokens
     n_gpu = st.num_computed_tokens.gpu.index_select(0, idx).to(torch.int32)
     n_np = n_gpu.cpu().numpy()
     nmax = int(n_np.max())
@@ -177,6 +208,9 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
         runner._rad_ngram_bufs1 = buf1
     pks = []
     for _i in range(R):
+        if not _run[_i]:
+            pks.append(np.zeros((1, 2 * cap + gpu._META), dtype=np.int64))
+            continue
         buf1["base"].copy_(
             torch.from_numpy(np.asarray([base_np[_i]], dtype=np.int32)).to(dev)
         )
@@ -195,9 +229,11 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
     rows = []
     W = K
     ext_rows = ext_toks = 0
+    ext_flags = []
     for i in range(R):
         di = [int(x) for x in mtp[i, : min(K, cap)]]
         use = 0
+        _ext_i = False
         if _RAD_NGRAM_STRONG > 0 and mlen1[i] >= _RAD_NGRAM_STRONG and clen1[i] > 0:
             use = 1
         elif _RAD_NGRAM_STRONG > 0 and mlen2[i] >= _RAD_NGRAM_STRONG and clen2[i] > 0:
@@ -214,9 +250,11 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
                 di = [int(x) for x in c[:K]]
                 ext_rows += 1
                 ext_toks += K
+                _ext_i = True
         if not di and len(mtp[i]):
             di = [int(mtp[i, 0])]
         rows.append(di)
+        ext_flags.append(_ext_i)
     W = K
     cnt = getattr(runner, "_rad_ngram_rows", 0) + R
     runner._rad_ngram_rows = cnt
@@ -225,6 +263,16 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
               f"appended={getattr(runner, '_rad_ngram_ext_toks', 0) + ext_toks}", file=_rad_sys.stderr)
     runner._rad_ngram_ext_rows = getattr(runner, "_rad_ngram_ext_rows", 0) + ext_rows
     runner._rad_ngram_ext_toks = getattr(runner, "_rad_ngram_ext_toks", 0) + ext_toks
+    if _RAD_NGRAM_ADAPT:
+        for _i in range(R):
+            _s = _nst.get(_rids[_i])
+            if _s is None:
+                continue
+            _e = 1.0 if ext_flags[_i] else 0.0
+            _s[0] = (1.0 - _RAD_NGRAM_EMA_ALPHA) * _s[0] + _RAD_NGRAM_EMA_ALPHA * _e
+            _s[1] += 1
+            _s[2] = 0
+            _s[3] = bool(ext_flags[_i])
     out = torch.full((R, W), -1, dtype=base_tokens.dtype, device=dev)
     for i, di in enumerate(rows):
         if di:
