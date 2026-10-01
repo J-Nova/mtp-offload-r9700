@@ -1831,3 +1831,17 @@ Perf (warm, NGRAM=1 with the one-line fix): conc1 **62.8** vs 67.8, conc8 **313.
 -15%). The per-row matcher launches (not the syncs) outweigh the ~8% extended-row draft gain on our
 mix, so **NGRAM stays default-off**. The fault no longer blocks enabling n-gram for repetitive/code
 workloads (T3: ~8% here). The earlier host-staging variant is unnecessary and was reverted.
+
+## 2026-10-01 (cont. 60) — A1/A4/A5 executed
+
+**A1 — E1 ENABLED (registry).** `RADIANCE_OFFLOAD_SUFFIX_INV=1` + `RADIANCE_OFFLOAD_EAGLE_INCLUDE=1`
+added to both MTP entries' `server_env`; vllm-0 restarted, env confirmed, patches active. Warm E1-on
+baseline: **c1 71.3 / c8 371.6** vs E1-off 67.8/369 → neutral-to-slightly-positive, no regression.
+
+**A4 — EXACTSET/FUSED.** Warm A/B (FUSED=1): EXACTSET=0 → c1 67.3 / c8 370.4; EXACTSET=1 →
+c1 71.3 / c8 371.6, and higher acceptance. **Keep EXACTSET=1** (registry already correct); FUSED=1.
+
+**A5 — fusion confirmation (prefill, 15.6k prompt).** fusion on → **2230 tok/s** (TTFT 6979 ms);
+fusion off (`FUSE_RMS_QUANT=0`+`FP8_STREAM=0`) → 1949 tok/s (TTFT 7989 ms). **−12.6%** → the fusion
+earns its keep; **keep it on**. P6 (folding the attention-output→o_proj quant) would chase headroom the
+fusion already captures; deprioritised.
