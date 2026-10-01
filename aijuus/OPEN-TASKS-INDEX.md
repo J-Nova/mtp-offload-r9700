@@ -30,8 +30,8 @@ TTFT p50 83 ms) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60) �
    → `~5,873,000,000` (→~160k tokens, frees ~1.03 GiB). The 32k/64k prefill and the whole concurrency
    sweep (1/2/4/8) in `aijuus/bench/vllm0-lazy.betterbench.json` are INVALID. **`./calibrate-kv.sh` is
    BLOCKED for our image (cont.72):** stock image lacks the lazy anchor, our image lacks
-   `radiance_allreduce.py` (AR patch fatal under its `set -e`) — calibrate on the live model-controller
-   with a CHUNK-sized probe instead.
+   `radiance_allreduce.py` (AR patch fatal under its `set -e`) — use **`aijuus/calibrate-kv-live.py`**
+   (cont.73), which drives the real stack (registry + controller `/reload`) instead.
 1. **rx10 libr4d — BUILT and LIVE (cont.66): +6% c1/c8.** `b9e42ab-rx10/r4d.so` now serves; its
    rx9 narrow-state kernels fixed the declined fp16 GDN fused path. Remaining: repoint the compose
    mount to `b9e42ab-rx10` (done) and redeploy; validate numerics (acceptance moved 1.93→2.17).

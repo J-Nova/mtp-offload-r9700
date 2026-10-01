@@ -2166,3 +2166,24 @@ cannot measure our stack.** Viable paths: (A) analytic pin + one restart + a CHU
 on the live model-controller; (B) an aijuus live-stack calibration harness. Also: the calibration pin
 lands in `~/.cache/radiance-mxfp4/kv-profiles.local.tsv`, which our registry does not read — the bytes
 must be ported into `aijuus/model-registry.json` by hand.
+
+## 2026-10-01 (cont. 73) — our own calibration harness: aijuus/calibrate-kv-live.py
+
+Added **`aijuus/calibrate-kv-live.py`** to replace the upstream `calibrate-kv.sh` path (cont.72 showed
+that one cannot drive our image). It drives the **real deployment**:
+1. writes `kv_cache_memory` into `aijuus/model-registry.json` (the compose bind-mounts it at
+   `/model-registry.json`, `coolify-compose-2gpu.yml:565`);
+2. `POST /reload {"model":…,"instance":"vllm-0"}` to the model-controller (bearer auth) → it restarts
+   the instance so `entrypoint.sh` re-reads the registry — the same path a hot-swap uses;
+3. polls `/health`, then runs upstream's PASS test (one **CHUNK-sized prefill** + a short decode);
+4. reads the boot's `GPU KV cache size` / `Initial free memory` / OOM from container logs and writes
+   the best pin back to the registry (restores the original registry on abort).
+
+Modes: default sweep (profile → +2% × 6 → back off 1 step); `--quick` (profile only); `--dry-run`;
+`--no-reload` (probe the running server, change nothing); `--pins a,b,c` (explicit bytes). Env:
+`MODEL_KEY`, `INSTANCE` (vllm-0), `CONTROLLER` (172.18.0.5:8101), `CHUNK`, `STEP`/`MAX_STEPS`/
+`BACKOFF_STEPS`, `RELOAD_TIMEOUT`.
+
+It reloads (restarts) the target instance — a deployment op, so the user runs it. Verified compiling +
+`--dry-run` only so far (the compose was down at time of writing). Because we want the *minimum* pin
+that holds 160k tokens (not the max), an explicit `--pins 5.87e9,6.06e9,6.5e9` run is the most direct.
