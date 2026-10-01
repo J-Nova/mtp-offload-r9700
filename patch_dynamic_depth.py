@@ -133,6 +133,12 @@ _RAD_NGRAM_EMA_ALPHA = float(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_EMA_ALPHA
 _RAD_NGRAM_EMA_MIN = float(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_EMA_MIN", "0.02"))
 _RAD_NGRAM_WARMUP = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_WARMUP", "2"))
 _RAD_NGRAM_PROBE = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_PROBE", "32"))
+# Variant B: independent n-gram depth M (>K) at low concurrency, decoupled gate. RADIANCE_DRAFT_NGRAM_DEPTH=0
+# keeps today's fixed-width behavior; RADIANCE_DRAFT_NGRAM_BS_MAX bounds where M applies.
+_RAD_NGRAM_DEPTH = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_DEPTH", "0"))
+_RAD_NGRAM_BS_MAX = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_BS_MAX", "2"))
+_RAD_NGRAM_MIN = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_MIN", "3"))
+_RAD_NGRAM_HIST = _rad_os.environ.get("RADIANCE_DRAFT_NGRAM_HIST", "0") == "1"
 
 
 def _radiance_ngram_extend(runner, input_batch, base_tokens):
@@ -230,10 +236,19 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
     W = K
     ext_rows = ext_toks = 0
     ext_flags = []
+    # Variant B: independent n-gram depth M, applied only at low concurrency (R <= BS_MAX).
+    _M = _RAD_NGRAM_DEPTH if (_RAD_NGRAM_DEPTH > K and R <= _RAD_NGRAM_BS_MAX) else 0
+    _hist = getattr(runner, "_rad_ngram_hist", None)
+    if _hist is None:
+        _hist = {}
+        runner._rad_ngram_hist = _hist
     for i in range(R):
         di = [int(x) for x in mtp[i, : min(K, cap)]]
         use = 0
         _ext_i = False
+        _hist[("clen", int(clen1[i]))] = _hist.get(("clen", int(clen1[i])), 0) + 1
+        if clen1[i] > 0:
+            _hist[("mlen", int(mlen1[i]))] = _hist.get(("mlen", int(mlen1[i])), 0) + 1
         if _RAD_NGRAM_STRONG > 0 and mlen1[i] >= _RAD_NGRAM_STRONG and clen1[i] > 0:
             use = 1
         elif _RAD_NGRAM_STRONG > 0 and mlen2[i] >= _RAD_NGRAM_STRONG and clen2[i] > 0:
@@ -241,12 +256,16 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
         if use:
             c = cont1[i] if use == 1 else cont2[i]
             cl = int(clen1[i]) if use == 1 else int(clen2[i])
-            # patch_dynamic_depth: FIXED-WIDTH tail. The row width must equal the scheduled depth K.
-            # Appending the continuation past K (the old `di += c[kk:cl]`, up to num_speculative_steps)
-            # corrupts the bs>=2 verify/candidate path -> HSA_STATUS_ERROR_EXCEPTION (WORKLOG cont.28).
-            # So only take the n-gram when its recorded continuation can fill the whole depth K, and
-            # then replace the K MTP drafts with it. Width stays exactly K.
-            if cl >= K:
+            if _M > K:
+                # variant B: gate decoupled from width -- fire on a shorter match, emit min(cl, M).
+                if cl >= _RAD_NGRAM_MIN:
+                    _take = min(cl, _M)
+                    di = [int(x) for x in c[:_take]]
+                    ext_rows += 1
+                    ext_toks += _take
+                    _ext_i = True
+            elif cl >= K:
+                # current: fixed-width tail (== scheduled depth K).
                 di = [int(x) for x in c[:K]]
                 ext_rows += 1
                 ext_toks += K
@@ -255,12 +274,15 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
             di = [int(mtp[i, 0])]
         rows.append(di)
         ext_flags.append(_ext_i)
-    W = K
+    W = _M if (_M > K and ext_rows > 0) else K
     cnt = getattr(runner, "_rad_ngram_rows", 0) + R
     runner._rad_ngram_rows = cnt
     if cnt // 500 != (cnt - R) // 500:
         print(f"[ngram] rows={cnt} extended_rows={getattr(runner, '_rad_ngram_ext_rows', 0) + ext_rows} "
               f"appended={getattr(runner, '_rad_ngram_ext_toks', 0) + ext_toks}", file=_rad_sys.stderr)
+        if _hist is not None:
+            _hs = {f"{k[0]}{k[1]}": v for k, v in sorted(_hist.items(), key=lambda kv: (kv[0][0], kv[0][1]))}
+            print(f"[ngram-hist] {_hs}", file=_rad_sys.stderr)
     runner._rad_ngram_ext_rows = getattr(runner, "_rad_ngram_ext_rows", 0) + ext_rows
     runner._rad_ngram_ext_toks = getattr(runner, "_rad_ngram_ext_toks", 0) + ext_toks
     if _RAD_NGRAM_ADAPT:
