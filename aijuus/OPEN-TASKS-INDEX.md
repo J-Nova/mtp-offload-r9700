@@ -23,12 +23,12 @@ TTFT p50 83 ms) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60) �
 0. **vllm-0 OOM at ≥32k prefill (cont.71) — BLOCKER for long context.** BetterBench's 32k and 64k
    prefill depths OOM the engine in `radiance.mxfp4_linear_pq` (bf16 out 1.03 GiB, 0 free; container
    auto-restarted). Cause: the 6.5 GiB KV pin now yields **190,157 tokens** but `max_model_len` is
-   160,000 → **~30,157 tokens ≈ 1.03 GiB of KV is unusable** (exactly the failed alloc). Fixes (each
-   needs a restart, user-owned, in priority order): **(1)** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-   in `server_env` — reclaims the 2.45 GiB reserved-unallocated fragmentation (recommended first;
-   keeps chunk/KV); **(2)** `kv_cache_memory` → `~5,873,000,000` (→~160k tokens, frees ~1.03 GiB,
-   user-preferred axis but exact-fit); **(3)** `max_num_batched_tokens` 16384→12288. The 32k/64k prefill
-   and the whole concurrency sweep (1/2/4/8) in `aijuus/bench/vllm0-lazy.betterbench.json` are INVALID.
+   160,000 → **~30,157 tokens ≈ 1.03 GiB of KV is unusable** (exactly the failed alloc). **Fix CHOSEN
+   (user): `max_num_batched_tokens` 16384→12288 — STAGED in the registry, awaiting the user's restart
+   to verify.** Fallbacks if 32k still OOMs: **(1)** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+   in `server_env` (reclaims the 2.45 GiB reserved-unallocated fragmentation); **(2)** `kv_cache_memory`
+   → `~5,873,000,000` (→~160k tokens, frees ~1.03 GiB). The 32k/64k prefill and the whole concurrency
+   sweep (1/2/4/8) in `aijuus/bench/vllm0-lazy.betterbench.json` are INVALID.
 1. **rx10 libr4d — BUILT and LIVE (cont.66): +6% c1/c8.** `b9e42ab-rx10/r4d.so` now serves; its
    rx9 narrow-state kernels fixed the declined fp16 GDN fused path. Remaining: repoint the compose
    mount to `b9e42ab-rx10` (done) and redeploy; validate numerics (acceptance moved 1.93→2.17).

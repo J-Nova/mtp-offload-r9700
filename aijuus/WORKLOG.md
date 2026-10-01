@@ -2138,3 +2138,7 @@ chunk with the growing KV in flight) does not.
 2. Right-size KV: `kv_cache_memory` 6.5 GiB → **~5,873,000,000** (~160k tokens) frees the ~1.03 GiB
    over-provision (user-preferred axis) but is an exact-fit with no margin.
 3. Chunk 16384 → 12288 shrinks the peak activation (0.77 GiB) — a milder cut than the rejected 4k.
+
+**Decision (user).** Lever 3: `max_num_batched_tokens` **16384 → 12288** (KV pin unchanged) — staged in
+the registry. Pending the user's restart; re-run BetterBench (prefill at least) to confirm 32k/64k pass
+and to re-measure single-stream/concurrency.
