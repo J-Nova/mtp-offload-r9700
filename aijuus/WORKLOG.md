@@ -1968,3 +1968,44 @@ blocks drop 9 → 3. Worth the rx10 rebuild.
 **Ops hazard noted.** A single stale env-gated overlay aborts entrypoint under `set -e` and crash-loops
 the container. Consider making optional overlays loud-but-non-fatal, or validating anchors at apply
 time before the service is torn down.
+
+## 2026-10-01 (cont. 66) — libr4d rx10 built; A/B: b9e42ab-rx10 **+6%**; lazy still blocked (3 overlay defects)
+
+**Build.** Cloned `codeberg.org/StillDeadcode/libr4d.git`, `checkout b9e42ab`, applied
+`r4d_radiance_extras_rx10.patch` (clean), ran `./build.sh` (GFX_ARCH=gfx1201) inside
+`juupp/vllm-radiance:0.9.3-collect-tokens`. ~1 min. Published
+`~/.cache/radiance-libr4d/b9e42ab-rx10/r4d.so` (1,947,888 B, sha 2393c5d0); exports
+`gdn_lazy_update` + `gdn_lazy_materialize`. Recipe verified against `serve-mxfp4.sh:559-573`.
+
+**A/B.** Swapped `~/.cache/radiance-libr4d/v0.5.0-w4a16/r4d.so` (the mount source the entrypoint
+copies over site-packages on every start); stock saved to `/tmp/kilo/r4d_stock.so`. Warm arms
+(c1≈warm before measuring):
+
+| arm | libr4d | lazy | c1 | c8 | acc/draft |
+|---|---|:--:|--:|--:|--:|
+| B0 | stock v0.5.0 | off | 71.3 | 366.4 | 1.93 / 1.93 |
+| B1 | b9e42ab-rx10 | off | **75.9** | **386.4** | 2.17 / 2.01 |
+
+= **c1 +6.5%, c8 +5.5%**. The `no matching narrow-state kernel` warning is gone and the GDN fused
+update now resolves for fp32/bf16/fp16 state — the stock mount had been declining the fp16 GDN fused
+path to the FLA fallback. libr4d now reports **0.4.0, 22 kernels, 16/18 queries**. Quality sanity on
+rx10: `17*23=391`, correct Fibonacci. Caveat: acceptance ROSE (1.93→2.17), so the win is partly
+numerics-driven (rx9 fp32-accumulate/RTNE state) and outputs are **not** bit-identical to stock.
+
+**Lazy (B2) still cannot run — three independent overlay defects, only two fixed:**
+1. stale anchors in `patch_gdn_lazy.py` (fixed cont.65).
+2. **non-idempotent** `patch_gdn_lazy.py`: sentinels were `SENT + " word"` but replacements contain
+   only bare `SENT`, so a second apply re-inserted/consumed anchors → `FAIL` → crash-loop
+   (RestartCount reached 18; abstract.py had 19 stacked helper copies). **Fixed:** every sentinel is
+   now a stable substring of its own replacement; `abstract.py` reset to pristine and re-applied
+   (1 helper). Re-run confirms all-but-abstract NOOP.
+3. **`radiance_gdn_lazy.py` runtime API drift (NOT fixed):** with the kernel present, engine init
+   dies at `_Tables.__init__` (`radiance_gdn_lazy.py:49`) with
+   `IndexError: tuple index out of range` on `copy_funcs[st_idx]` — the mamba state-copy spec
+   structure changed since this module was written.
+Plus lazy is still **fail-open corrupt** (`r4d_radiance_extras_rx10.patch:1503-1509`) and needs
+route 3c. So lazy stays OFF; the rebuild's realized value is the rx9 narrow-state perf (+6%).
+
+**State now:** rx10 mounted (the `v0.5.0-w4a16` dir repurposed; rename/compose point pending), lazy
+off, health 200, warm c1 75.8. Compose still names `v0.5.0-w4a16` — should be repointed to
+`b9e42ab-rx10` for honesty.
