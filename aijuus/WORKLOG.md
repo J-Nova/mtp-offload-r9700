@@ -2224,3 +2224,23 @@ came back (health 200, KV 190,157).
 
 **Useful datum:** vLLM reports the minimum pin directly — **5.45 GiB for 160k**, i.e. the floor;
 6979321856 (6.5 GiB) gives 190,157 tokens, so there is headroom to raise.
+
+## 2026-10-01 (cont. 76) — calibrate-kv-live works; KV ceiling explored to 7.6 GiB
+
+After the `State.StartedAt` fix the harness drives the real stack correctly (registry write -> controller
+`/reload` -> wait for the new boot -> CHUNK-sized prefill probe -> apply). Explicit run:
+
+| pin | KV tokens | x for 160k |
+|---|--:|--:|
+| 6,979,321,856 (6.5 GiB, start) | 190,157 | 1.19 |
+| 7,000,000,000 | 190,994 | 1.19 |
+| 7,200,000,000 | 196,858 | 1.23 |
+| 7,400,000,000 | 201,884 | 1.26 |
+| **7,600,000,000 (applied)** | **207,748** | **1.30** |
+
+All four probes PASSed, so the **ceiling is still above 7.6 GiB** (not found). ~36.6 kB/token, so the
+160k floor is ~5.85e9 and each GiB buys ~27k tokens. **Caveats:** the CHUNK probe tests the worst-case
+single step (bounded by `max_num_batched_tokens`) but not long-context fragmentation/concurrency — the
+cont.71 failure mode — so a passing pin still needs a BetterBench long-context/concurrency run. KV past
+160k only helps concurrency/prefix reuse. Note `--pins` keeps the edge and applies no backoff; the sweep
+(`START=<bytes> MAX_STEPS=N`) backs off 2% for margin. Pin is provisional.
