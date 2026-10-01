@@ -240,4 +240,34 @@ apply(M,
 
 
 def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int]]:''', "def _radiance_lazy() -> bool:", "mamba_utils: lazy flag helper")
+# ---- 4. a prefill invalidates its stash -------------------------------------------------------
+# radiance lazy gdn: a request that (re)prefills may land on a physical base_slot an EARLIER context
+# already wrote a stash against; the update kernel does not run during prefill, so the stale header
+# survives and a later materialize would replay the wrong candidates. Zero the header for prefilling
+# rows (post-advance column + 1) so the kernel fails open to the base, which is correct here.
+H = SP / "v1/worker/gpu/model_states/mamba_hybrid.py"
+apply(H,
+'''        ctx.run_fused_precopy(
+            num_reqs,
+            self._mamba_state_idx_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_src_off_gpu,
+            input_batch.idx_mapping,
+        )
+''',
+'''        import radiance_gdn_lazy as _rlz  # radiance lazy gdn
+        if _rlz.ENABLED:
+            import torch as _t
+            _pf = _t.as_tensor(input_batch.is_prefilling_np, dtype=_t.int32,
+                               device=self._mamba_state_idx_gpu.device)
+            _rlz.invalidate(ctx, num_reqs, self._mamba_state_idx_gpu,
+                            input_batch.idx_mapping, _pf, block_tables[mamba_group_ids[0]])
+        ctx.run_fused_precopy(
+            num_reqs,
+            self._mamba_state_idx_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_src_off_gpu,
+            input_batch.idx_mapping,
+        )
+''', "invalidate prefilling rows' stash", "mamba_hybrid: invalidate prefilling rows' stash")
 print("patch_gdn_lazy: done")

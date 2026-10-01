@@ -24,6 +24,13 @@ import torch
 ENABLED = os.environ.get("RADIANCE_GDN_LAZY", "0") == "1"
 STASH_COL = 1                    # window column of the stash block (0 = running / base)
 
+try:
+    import triton
+    import triton.language as tl
+    _HAVE_TRITON = True
+except Exception:                # pragma: no cover
+    _HAVE_TRITON = False
+
 
 def _log(msg):
     sys.stderr.write(f"[radiance.gdn.lazy] {msg}\n")
@@ -97,3 +104,61 @@ def materialize(ctx, mode, num_reqs, a, b, c, idx_mapping):
           int(ctx.block_table_stride_req), im, int(mode), *args, int(ctx.block_size),
           int(num_reqs), tb.n, tb.H, tb.Hg, tb.K, tb.V, int(tb.st_head), tb.K ** -0.5, 20.0,
           torch.cuda.current_stream().cuda_stream)
+
+
+if _HAVE_TRITON:
+    @triton.jit
+    def _lz_invalidate_kernel(
+        state_ptrs, slot_strides, bt_ptr, bt_stride,
+        state_idx, idx_mapping, mask, num_reqs, H, st_head,
+        HBLK: tl.constexpr, HAS_IM: tl.constexpr,
+    ):
+        b = tl.program_id(0)
+        si = tl.program_id(1)
+        if b >= num_reqs:
+            return
+        if tl.load(mask + b) == 0:
+            return
+        if HAS_IM:
+            req = tl.load(idx_mapping + b)
+        else:
+            req = b
+        if req < 0:
+            return
+        col = tl.load(state_idx + req)
+        stash_slot = tl.load(bt_ptr + req * bt_stride + col + 1)
+        if stash_slot <= 0:
+            return
+        sbase = tl.load(state_ptrs + si)
+        sstr = tl.load(slot_strides + si)
+        base = sbase + stash_slot.to(tl.int64) * sstr
+        offs = tl.arange(0, HBLK)
+        m = offs < H
+        addrs = (base + offs.to(tl.int64) * st_head).to(tl.pointer_type(tl.uint32))
+        tl.store(addrs, tl.zeros((HBLK,), dtype=tl.uint32), mask=m)
+
+
+def invalidate(ctx, num_reqs, state_idx, idx_mapping, mask, block_table):
+    """radiance lazy gdn: zero the stash header of every masked (prefilling) row, so a stash written
+    against a physical base_slot in an EARLIER context (a reused prefix-cache block) can never be
+    replayed. Uses the request's post-advance window column (state_idx + 1). No-op unless enabled."""
+    if not ENABLED or not _HAVE_TRITON or num_reqs == 0:
+        return
+    tb = getattr(ctx, "_radiance_lazy_tables", None)
+    if tb is None:
+        try:
+            tb = _Tables(ctx, ctx._radiance_kv_cfg, ctx._radiance_fwd_ctx)
+            ctx._radiance_lazy_tables = tb
+        except Exception as e:                       # tables not ready yet: skip, not fatal
+            _log(f"invalidate skipped: {e}")
+            return
+    # NOTE: triton needs the *tensor* so it sees a pointer; a raw .data_ptr() int is a scalar.
+    im = idx_mapping if idx_mapping is not None else 0
+    hblk = max(1, triton.next_power_of_2(int(tb.H)))
+    # state_ptrs are raw byte addresses here, so every offset we add must be in bytes.
+    st_head_bytes = int(tb.st_head) * int(tb.dtype.itemsize)
+    _lz_invalidate_kernel[(int(num_reqs), int(tb.n))](
+        tb.state_ptrs, tb.slot_strides, block_table, int(ctx.block_table_stride_req),
+        state_idx, im, mask, int(num_reqs), int(tb.H), st_head_bytes,
+        HBLK=hblk, HAS_IM=idx_mapping is not None,
+    )
