@@ -139,6 +139,10 @@ _RAD_NGRAM_DEPTH = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_DEPTH", "0"))
 _RAD_NGRAM_BS_MAX = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_BS_MAX", "2"))
 _RAD_NGRAM_MIN = int(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_MIN", "3"))
 _RAD_NGRAM_HIST = _rad_os.environ.get("RADIANCE_DRAFT_NGRAM_HIST", "0") == "1"
+# C1/C2: match all armed rows in one batched match_gpu launch with a single D2H, instead of one
+# launch + one sync per row. Safe at B>=1 now that the _nblk (window size) grid bug is fixed; set
+# RADIANCE_DRAFT_NGRAM_BATCH=0 to fall back to the proven per-row path.
+_RAD_NGRAM_BATCH = _rad_os.environ.get("RADIANCE_DRAFT_NGRAM_BATCH", "1") == "1"
 
 
 def _radiance_ngram_extend(runner, input_batch, base_tokens):
@@ -195,37 +199,66 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
         base_np = np.maximum(0, n_np - _RAD_NGRAM_WINDOW).astype(np.int32)
     else:
         base_np = np.zeros(R, dtype=np.int32)
-    # patch_dynamic_depth: matcher is run PER ROW with B=1. The B>=2 launch path faults on gfx1201
-    # with HSA_STATUS_ERROR_EXCEPTION exactly at the bs=1->bs=2 transition, independent of the draft
-    # row width (the fixed-width tail still faulted), so the bug is in match_gpu's B>=2 kernels, not
-    # the width. B=1 is proven safe; loop rows and share one row-sized buffer. See WORKLOG cont.28.
     # M1 fix: gpu._nblk expects the window SIZE, not the base. The engine passed base_np here, which
-    # inflated the scan grid ~9x (n/W blocks instead of W/512) and drove q far past ML.
+    # inflated the scan grid ~9x (n/W blocks instead of W/512) and drove q far past ML. With the grid
+    # correct match_gpu is safe at B>=1, so the arm rows are matched in ONE batched launch with a
+    # single D2H (C1/C2), replacing R launches and R per-row syncs. The batch grid uses the max block
+    # count across rows; a shorter row's extra blocks are masked (alive = q < n-1) and emit no key.
     _win = int(_RAD_NGRAM_WINDOW) if nmax > _RAD_NGRAM_WINDOW_FROM else 0
     nblks = [gpu._nblk(int(n_np[i]), _win) for i in range(R)]
-    ncmax = 2 * max(nblks)
-    buf1 = getattr(runner, "_rad_ngram_bufs1", None)
-    if (
-        buf1 is None
-        or buf1.get("nc") != ncmax
-        or buf1["pack"].shape[1] != 2 * cap + gpu._META
-    ):
-        buf1 = gpu.make_match_buffers(1, cap, ncmax, dev)
-        runner._rad_ngram_bufs1 = buf1
-    pks = []
-    for _i in range(R):
-        if not _run[_i]:
-            pks.append(np.zeros((1, 2 * cap + gpu._META), dtype=np.int64))
-            continue
-        buf1["base"].copy_(
-            torch.from_numpy(np.asarray([base_np[_i]], dtype=np.int32)).to(dev)
-        )
-        pk_i = gpu.match_gpu(
-            ctx[_i : _i + 1], n_gpu[_i : _i + 1], cap, int(n_np[_i]),
-            buf1["base"], 2 * nblks[_i], False, buf1, gpu._MAXL,
-        )
-        pks.append(pk_i.cpu().numpy())
-    pk = np.concatenate(pks, axis=0)
+    pk = np.zeros((R, 2 * cap + gpu._META), dtype=np.int64)
+    if _RAD_NGRAM_BATCH:
+        _armed = [i for i in range(R) if _run[i]]
+        if _armed:
+            _bn = len(_armed)
+            _nc = 2 * max(nblks[i] for i in _armed)
+            bufN = getattr(runner, "_rad_ngram_bufN", None)
+            if (
+                bufN is None
+                or bufN.get("B") != _bn
+                or bufN.get("nc") != _nc
+                or bufN["pack"].shape[1] != 2 * cap + gpu._META
+            ):
+                bufN = gpu.make_match_buffers(_bn, cap, _nc, dev)
+                bufN["B"] = _bn
+                runner._rad_ngram_bufN = bufN
+            if _bn == R:
+                _ctx_s, _n_s = ctx, n_gpu
+            else:
+                _ai = torch.tensor(_armed, dtype=torch.int64, device=dev)
+                _ctx_s = ctx.index_select(0, _ai)
+                _n_s = n_gpu.index_select(0, _ai)
+            _base_s = torch.from_numpy(
+                np.asarray([base_np[i] for i in _armed], dtype=np.int32)
+            ).to(dev)
+            _pk_s = gpu.match_gpu(
+                _ctx_s, _n_s, cap, 0, _base_s, _nc, False, bufN, gpu._MAXL,
+            )
+            _pk_np = _pk_s.cpu().numpy()
+            for _r, _i in enumerate(_armed):
+                pk[_i] = _pk_np[_r]
+    else:
+        # Fallback: proven per-row B=1 path (RADIANCE_DRAFT_NGRAM_BATCH=0).
+        ncmax = 2 * max(nblks)
+        buf1 = getattr(runner, "_rad_ngram_bufs1", None)
+        if (
+            buf1 is None
+            or buf1.get("nc") != ncmax
+            or buf1["pack"].shape[1] != 2 * cap + gpu._META
+        ):
+            buf1 = gpu.make_match_buffers(1, cap, ncmax, dev)
+            runner._rad_ngram_bufs1 = buf1
+        for _i in range(R):
+            if not _run[_i]:
+                continue
+            buf1["base"].copy_(
+                torch.from_numpy(np.asarray([base_np[_i]], dtype=np.int32)).to(dev)
+            )
+            pk_i = gpu.match_gpu(
+                ctx[_i : _i + 1], n_gpu[_i : _i + 1], cap, int(n_np[_i]),
+                buf1["base"], 2 * nblks[_i], False, buf1, gpu._MAXL,
+            )
+            pk[_i] = pk_i.cpu().numpy()[0]
     cont1 = pk[:, :cap]
     cont2 = pk[:, cap : 2 * cap]
     meta = pk[:, 2 * cap :]
