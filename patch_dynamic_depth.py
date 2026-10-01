@@ -160,6 +160,9 @@ _RAD_NGRAM_MIN_PROB = float(_rad_os.environ.get("RADIANCE_DRAFT_NGRAM_MIN_PROB",
 # continuation only when it agrees with the FULL MTP prefix -- monotone-safe (can never override/replace
 # MTP, so it cannot regress accepted length). RADIANCE_DRAFT_NGRAM_EXT=1 to enable.
 _RAD_NGRAM_EXT = _rad_os.environ.get("RADIANCE_DRAFT_NGRAM_EXT", "0") == "1"
+# TR0 (cont.88): measurement-only probe -- log MTP drafts + suffix continuations + the tokens actually
+# committed, then return MTP unchanged (no adoption). Used for the offline tree-gain quantification.
+_RAD_NGRAM_PROBE = _rad_os.environ.get("RADIANCE_DRAFT_NGRAM_PROBE", "0") == "1"
 # Arctic SuffixDecoding backend (cont.82): "triton" = our GPU matcher + F1/F2/F6 gates (default);
 # "arctic" = per-request arctic_inference SuffixDecodingCache with a hybrid tau gate -- take the suffix
 # draft only when its expected accepted length (score) >= tau, else keep the MTP draft.
@@ -484,6 +487,38 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
     clen1, mlen1 = meta[:, 0], meta[:, 1]
     clen2, mlen2 = meta[:, 2], meta[:, 3]
     mtp = base_tokens.cpu().numpy()
+    if _RAD_NGRAM_PROBE:
+        # TR0: log per row the MTP draft, the suffix continuation, and (from the PREVIOUS step for the same
+        # request) the tokens that were actually committed -> offline we compute A_mtp, A_suffix, max().
+        import json as _json
+        _pp = getattr(runner, "_rad_probe", None)
+        if _pp is None:
+            _pp = {}
+            runner._rad_probe = _pp
+            try:
+                open("/tmp/rad_probe.jsonl", "w").close()
+            except Exception:
+                pass
+        _Kk = min(K, cap)
+        for _i in range(R):
+            _rid = _rids[_i]
+            _nn = int(n_np[_i])
+            _ent = _pp.get(_rid)
+            _m = [int(x) for x in mtp[_i, :_Kk]]
+            _c = [int(x) for x in cont1[_i, : min(int(clen1[_i]), cap)]]
+            _rec = {"rid": _rid, "n": _nn, "m": _m, "c": _c,
+                    "mlen": int(mlen1[_i]), "clen": int(clen1[_i])}
+            if _ent is not None and _nn > _ent[0]:
+                _rec["committed"] = [int(x) for x in ctx[_i, _ent[0]:_nn].cpu().numpy()]
+                _rec["prev_m"] = _ent[1]
+                _rec["prev_c"] = _ent[2]
+            try:
+                with open("/tmp/rad_probe.jsonl", "a") as _fh:
+                    _fh.write(_json.dumps(_rec) + chr(10))
+            except Exception:
+                pass
+            _pp[_rid] = (_nn, _m, _c)
+        return base_tokens
     rows = []
     W = K
     ext_rows = ext_toks = 0

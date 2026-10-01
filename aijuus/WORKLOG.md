@@ -2501,6 +2501,58 @@ Tree verification is NOT overlay-feasible in VLLM 0.29 (flat chain, no parent in
 - Registry left at `RADIANCE_DRAFT_NGRAM=0` (MTP-only). All prompt-lookup code (F1/F2/F6 gates, F7
   extension, Arctic backend) remains in the overlay for future use/A-B.
 
+## 2026-10-01 (cont. 87) -- TREE-VERIFICATION scope (planned; gated on an offline gain test)
+
+**Why:** the only route that can harvest the measured prompt-lookup ceiling (cont.85: cont[0] correct
+95%, ~6.6 accepted tokens) is to verify the MTP chain AND the suffix chain together, because single-chain
+verify forces a zero-sum override (regresses) or full-prefix agreement (~0.1% fire). DFlash is out of scope.
+
+**Scope (vLLM 0.29 V2 spec-decode path is chain-only everywhere):**
+1. **Proposer** -- emit a shallow tree: root prefix; branch A = MTP chain `m[0:K]`; branch B = suffix chain
+   `c[0:E]` (optionally the merged path). Generate parents[] + node token ids. (overlay-friendly)
+2. **Runner input layout** (`v1/worker/gpu/input_batch.py:449 combine_sampled_and_draft_tokens` +
+   `_combine_sampled_and_draft_tokens_kernel`) -- must lay out nodes with per-node parent/position and build
+   a tree attention mask instead of the contiguous linear chain. Core change (Triton).
+3. **Attention backend** (`attention_backend='R4D'`, custom gfx1201 decode kernel) -- must apply per-query
+   ancestor masking. New/changed kernel. **Biggest risk.**
+4. **Rejection sampler** (`v1/worker/gpu/spec_decode/rejection_sampler.py` `rejection_sample`) -- chain-indexed
+   today; needs a tree verify (longest accepted root->leaf path). New Triton kernel.
+5. **Metadata/commit** (`v1/spec_decode/metadata.py` `SpecDecodeMetadata`) -- add parent indices / tree
+   structure; update `combine_sampled_and_draft_tokens` + `get_num_sampled_and_rejected` + the slot/position
+   bookkeeping.
+6. **Cudagraph** (`FULL_DECODE_ONLY`) -- a variable tree breaks capture; must use a FIXED-shape shallow tree
+   (e.g. 2 branches, depth <= K) or fall back to eager for tree steps. Feasibility hinges on this.
+
+**Feasibility verdict:** rebuild-class reimplementation of EAGLE-3-style tree spec inside this fork; NOT a
+runtime overlay (contradicts the overlay-only workflow) and high engine risk. EAGLE-3/tree support was
+removed in this V2 rewrite (`grep -rn tree|parent|branch` in `v1/worker/gpu/spec_decode/` is empty;
+`medusa.py` has no tree code).
+
+**DECISION GATE:** before any of the above, run the bounded OFFLINE gain quantification (cont.88) -- if a
+tree cannot beat MTP-only by a meaningful margin in an oracle simulation, the rebuild is unjustified.
+
+## 2026-10-01 (cont. 88) -- TR0 tree-gain quantification: NEGATIVE (tree adds ~nothing); MTP-only confirmed
+
+- **Probe:** `RADIANCE_DRAFT_NGRAM_PROBE=1` (env-gated, measurement-only; returns MTP unchanged) logs, per
+  step, the MTP draft `m`, the suffix continuation `c`, and the tokens actually committed. Analyzer:
+  `aijuus/tree_gain_analysis.py` (3320 paired steps over repeat/agent/novel).
+- **Result (correct alignment, drafts = committed minus the first bonus token):**
+  - mean `A_mtp` (MTP-only accepted drafts) = **2.715**
+  - mean `A_suffix` (suffix accepted drafts) = **0.930**
+  - mean tree oracle `max(A_mtp, A_suffix)` = **2.715** -> **gain 0.000 tok/step (0%)**
+  - on `mlen>=8` steps (563): `A_mtp 4.806` vs `A_suffix 4.442` -> MTP already wins.
+- **Verdict:** the tree (MTP chain + suffix chain) would add **nothing** on this workload -- MTP already
+  matches or beats the suffix exactly where long matches exist (the anti-correlation the research flagged).
+  The earlier "high ceiling" (cont.85) was an artifact: it measured how well the suffix matches the target
+  WITHOUT comparing to MTP, which is just as good there. **The tree rebuild (TR2-TR5) is UNJUSTIFIED; do
+  NOT build it. MTP-only is confirmed optimal for this deployment.**
+- **Incidental real bug:** the matcher's continuation is **off-by-one** vs the MTP draft -- `c[0]` aligns to
+  the already-decided bonus token, `c[1:]` to `m`. This is why F1 (`c[0]==m[0]`) and F7 (`c[:K]==m[:K]`)
+  almost never fired. If prompt-lookup is ever revisited, compare `c[1:]` to `m`, or run the matcher on a
+  context one token longer.
+- Registry left at `RADIANCE_DRAFT_NGRAM=0` (MTP-only). Model-registry n-gram knobs trimmed to just
+  `RADIANCE_DRAFT_NGRAM=0` (the experimental knobs removed).
+
 **TODO:** bake the overlay so this can't recur -- either clear the injected tail at boot before patching,
 or make `edit()` replace an existing tail instead of skipping.
 

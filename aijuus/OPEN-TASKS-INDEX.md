@@ -324,3 +324,24 @@ policy is dead code (hooks the legacy proposer, not the V2 runner). Matcher kern
 
 Validation: offline policy test (boilerplate fixture) in `aijuus/patch_dynamic_depth_policy_test.py`;
 live via `bench-conc.py --conc 1` on an agent-like long context + a repeat/echo probe.
+
+## 22. Tree verification (planned; gated)
+
+Single-chain verify is why prompt-lookup cannot beat MTP (override regresses / full-prefix agreement ~0.1%).
+The only route to harvest the measured ceiling is tree verification (MTP chain + suffix chain, longest
+accepted root->leaf path). Scope in WORKLOG cont.87. vLLM 0.29 V2 is chain-only: `SpecDecodeMetadata`
+(`v1/spec_decode/metadata.py`), `combine_sampled_and_draft_tokens` (`v1/worker/gpu/input_batch.py:449`),
+`rejection_sample` (`v1/worker/gpu/spec_decode/rejection_sampler.py`), and the R4D attention backend all
+assume a linear chain; `FULL_DECODE_ONLY` cudagraph needs a FIXED-shape tree. Verdict: rebuild-class, not an
+overlay.
+
+| ID | Task | Status |
+|---|---|---|
+| TR0 | Offline tree gain quantification (decision gate) | **DONE -- NEGATIVE (cont.88)**: tree gain 0.0 tok/step; MTP >= suffix on match steps. **Do NOT build TR2-5.** |
+| TR1 | Scope doc: tree components + risks | DONE (WORKLOG cont.87) |
+| TR2 | Shallow fixed-shape tree proposer | BLOCKED on TR0 |
+| TR3 | Tree input layout + attention mask kernel (R4D) | BLOCKED on TR0 |
+| TR4 | Tree rejection sampler (longest accepted path) | BLOCKED on TR0 |
+| TR5 | Metadata/commit + cudagraph strategy | BLOCKED on TR0 |
+
+**Decision gate:** if TR0 shows the tree oracle cannot beat MTP-only by a meaningful margin, do NOT build TR2-5.
