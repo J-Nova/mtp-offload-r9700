@@ -2142,3 +2142,27 @@ chunk with the growing KV in flight) does not.
 **Decision (user).** Lever 3: `max_num_batched_tokens` **16384 → 12288** (KV pin unchanged) — staged in
 the registry. Pending the user's restart; re-run BetterBench (prefill at least) to confirm 32k/64k pass
 and to re-measure single-stream/concurrency.
+
+## 2026-10-01 (cont. 72) — calibrate-kv.sh is not aligned with our image (calibration path blocked)
+
+Tried the faithful calibration (`IMAGE=juupp/vllm-radiance:0.9.3-collect-tokens TP=1 SNAP=…blend…
+RADIANCE_GDN_LAZY=1 … ./calibrate-kv.sh`, chunks 2560/4096/12288). With our image the **lazy** patch
+now applies, but every run dies at `patch_ar_maxbytes.py`, which targets `radiance_allreduce.py` — a
+file our lineage **deleted** (`aijuus/patches/010-dockerfile.patch:67`). `serve-mxfp4.sh` runs that
+patch under `set -e` (`:1086-1092`) so the FAIL is fatal; `aijuus/kv-offload/ops/entrypoint.sh:258`
+runs the identical patch **without** `set -e`, so our real deployment tolerates it.
+
+Image comparison (checked directly with `docker run --entrypoint`):
+
+| image | `model_executor/layers/mamba/abstract.py` | `radiance_allreduce.py` |
+|---|---|---|
+| `stilldeadcode/vllm-radiance:0.9.3` | OLD: `num_speculative_blocks=(speculative_config.num_speculative_tokens if speculative_config else 0)` | present |
+| `juupp/vllm-radiance:0.9.3-collect-tokens` | NEW: `num_speculative_blocks=(0 if use_kda_recoverssm else num_speculative_tokens)` | **missing** |
+
+So neither image satisfies `serve-mxfp4.sh`'s repo-root patch stack for our config (lazy-on, TP=1,
+blend): stock can't enable lazy; ours dies at the AR patch. `serve-mxfp4.sh`'s default
+`IMAGE=stilldeadcode/vllm-radiance:0.9.3` (`:231`) is also stale for our lineage. **calibrate-kv.sh
+cannot measure our stack.** Viable paths: (A) analytic pin + one restart + a CHUNK-sized prefill probe
+on the live model-controller; (B) an aijuus live-stack calibration harness. Also: the calibration pin
+lands in `~/.cache/radiance-mxfp4/kv-profiles.local.tsv`, which our registry does not read — the bytes
+must be ported into `aijuus/model-registry.json` by hand.
