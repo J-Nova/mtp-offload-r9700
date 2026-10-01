@@ -2256,3 +2256,20 @@ answers "did the engine survive".
 - prefill 16k / 64k / **160k** (155,105 actual tok) -> OK, PP 2381 / 2137 / 1677 t/s
 - concurrency 8 x 4096-token prompts + 128 gen -> 8/8 OK, 33.9 agg t/s
 - **VERDICT: PASS -- no OOM.**
+
+## 2026-10-01 (cont. 78) — BetterBench @ chunk=4096, kv=7.6 GiB: 32k/64k prefill + concurrency VALID
+
+Loaded `chunk=4096` (was 12288) keeping `kv=7,600,000,000` (207,748 tokens) via registry + controller
+`/reload`; health 200. Full BetterBench 0.6.0 pass (~44 min), reports
+`aijuus/bench/vllm0-kv76-chunk4k.betterbench.{json,html}`.
+
+- **Single-stream** combined decode **89.1 t/s** (vs 90.3 at 12k/6.5G) -> decode unchanged; TTFT p50
+  **84 ms**, update p99 **55.0 ms**.
+- **Concurrency (valid this time):** level 1/2/4/8 = **37.2 / 70.0 / 135.3 / 199.5** agg t/s, **48/48 ok**
+  each (the cont.71 run showed 0/48 because the engine was already dead).
+- **Prefill (valid, no OOM):** 2k 1851 / 8k 2251 / 16k 5159 / 32k 3061 / 64k 7560 PP t/s. The 32k and
+  64k rows are the ones that OOM'd before. PP is non-monotonic (16k/64k sit above 8k/32k) -> treat the
+  prefill medians as noisy and repeat before drawing chunk-vs-throughput conclusions.
+
+**Net:** 4k chunk + 7.6 GiB is robust end-to-end (long prefill + concurrency + decode), confirming it is
+a safe operating point; decode is not affected by the chunk change.
