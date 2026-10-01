@@ -345,3 +345,20 @@ overlay.
 | TR5 | Metadata/commit + cudagraph strategy | BLOCKED on TR0 |
 
 **Decision gate:** if TR0 shows the tree oracle cannot beat MTP-only by a meaningful margin, do NOT build TR2-5.
+
+## 23. MTP improvement levers (open -- prompt-lookup/tree are dead, MTP itself is not)
+
+Prompt-lookup (Triton + Arctic) and tree verification are exhausted (cont.79-88: neutral-or-worse; tree gain
+0.0). But "improve MTP" is broader. Levers ranked by value/feasibility; none yet measured on the current build.
+
+| ID | Lever | Axis | Status | Notes |
+|---|---|---|---|---|
+| M1 | Draft-head precision/vocab | acceptance | **NEXT (overlay A/B)** | MTP head pruned to 65,327/248,320 rows INT2 (`DRAFT_VOCAB=keep-union-freq.txt`, `EXACTSET=1`); A/B full-vocab / higher-precision head vs pruned. Most direct acceptance lever; no output change. |
+| M2 | Adaptive verify depth (SpecDec++) | throughput | OPEN (needs kernel) | confidence-gated early stop; confidence blocked by `FULL_DECODE_ONLY` graph -> bake a small confidence kernel into the captured draft graph (F3 path). |
+| M3 | Draft sampling params sweep | acceptance/throughput | OPEN | `TAU`, `RERANK`, `EXACTSET`, `FUSED`, `verify_head` on the current build. |
+| M4 | Dynamic depth schedule | throughput | NEXT (overlay A/B) | retune `num_speculative_tokens_per_batch_size=[[1,2,5],[3,8,4]]` vs the current acceptance profile (draft ~8, accept ~2.7-3.5). |
+| M5 | Serving temp/top-p | acceptance | PRODUCT decision | lower temp raises acceptance but changes output semantics -- not a free speedup. |
+| M6 | Kernels (R4D decode / GEMM / GDN-lazy / offload) | throughput | partly done | rx10 libr4d +6.5/+5.5%, GDN lazy, offload E1 applied; R4D decode/GEMM further tuning possible. |
+
+**Highest-value bounded next step:** overlay A/B of **M1 (draft-head precision/vocab)** + **M4 (depth schedule)**,
+measuring per-position acceptance + tok/s (no output-semantics change).
