@@ -11,19 +11,21 @@ deferred) · **DORMANT** (implemented, env-gated off).
 verified** before measuring (a single warm restart was not always enough; seeding the Triton cache
 from the intact vllm-1 dir helped). Never measure an unverified boot.
 
-## 0. Remaining tasks — refreshed cont.64
+## 0. Remaining tasks — refreshed cont.69
 
 **Closed since the previous index:** M1 (n-gram HSA fix + enablement, cont.59–63) · **C1/C2** batched
-matcher (cont.64) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60) · A1–A5 · A10 · A11
+matcher (cont.64) · **rx10 libr4d** built + live (cont.66, +6%) · **lazy GDN (OS3/E3)** fixed + enabled
+(cont.67–69, KV +11%) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60) · A1–A5 · A10 · A11
 (dormant, kept) · OK3–OK7 · PF1/PF5/PF6/PF7 · K1–K3 · T1/T2 · MT1/MT2 · X2 (N/A for V2) · V1 (N/A, V1-only).
 
 **A. No-rebuild, actionable now (top):**
 1. **rx10 libr4d — BUILT and LIVE (cont.66): +6% c1/c8.** `b9e42ab-rx10/r4d.so` now serves; its
    rx9 narrow-state kernels fixed the declined fp16 GDN fused path. Remaining: repoint the compose
    mount to `b9e42ab-rx10` (done) and redeploy; validate numerics (acceptance moved 1.93→2.17).
-   **Lazy (OS3/E3)** now BOOTS (cont.67, `_Tables` drift fixed) with KV +11% (190,157), but multi-turn
-   is still fail-open corrupt. Route 3c as pure Python is infeasible; choose **3a** (kernel `stale`
-   flag → fail loud) or **K2** (backup stash page, 3→4 pages) — both need an `r4d.so` rebuild.
+   **Lazy (OS3/E3) — DONE + ENABLED (cont.68/69).** `_Tables` drift fixed; the prefill-invalidation is
+   wired (the dead `radiance_stash_indices`) → multi-turn CLEAN. `RADIANCE_GDN_LAZY=1` set in the
+   mtp-blend registry; KV **+11%** (190,157), c8 +3.2%, c1 −1.8%; outputs not bit-identical to eager
+   (fp32 replay). Revert = remove that one key.
 2. **H1** — commit this work (`patch_dynamic_depth.py`, `aijuus/batched_ngram_equiv.py`,
    WORKLOG/OPEN-TASKS-INDEX/ACTIONABLE-AB-PLAN).
 3. **Instrumentation/validation:** **ST6** acceptance-by-position per category (serving measurement) ·
@@ -38,8 +40,7 @@ matcher (cont.64) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60)
 7. **Docs/cleanup:** **H4** README overlay refresh · **K2** align `mtp-27B-MXFP4-Thinkingcap` kv pin
    (`8761733283`) only if/when it is piloted.
 
-**B. Rebuild-class / kernel (needs a build you own):** **lazy-GDN integration** (rx10 `r4d.so` now
-built; left: fix `radiance_gdn_lazy._Tables` + route 3c) · PF2 GDN chunk-scan parallelization · PF3 R4D
+**B. Rebuild-class / kernel (needs a build you own):** PF2 GDN chunk-scan parallelization · PF3 R4D
 prefill scheduling · PF4 MXFP4 split-K @16k · S4 shrink each draft forward (C5 contract repair precedes
 S5–S8) · B2 fused int2 draft-head top-1 · KB1 libr4d pin bump · TF2 `clav_attn`.
 
@@ -191,7 +192,7 @@ byte store with an O_DIRECT fixed-size round-trip contract, so a lossy tier cann
 |---|---|---|---|
 | OS1 | **E1** suffix-only invalidation + eagle/MTP group inclusion. | **ENABLED (cont.60)** | `patch_offload_suffix_inv.py` + `patch_offload_eagle_include.py`; gates `RADIANCE_OFFLOAD_SUFFIX_INV` / `RADIANCE_OFFLOAD_EAGLE_INCLUDE` set to 1 on both MTP registry entries. Warm E1-on c1 **71.3**/c8 **371.6** vs off 67.8/369; tier 67.3→71.0%, recompute 25→24%, HEALTH PASS. Byte-identical outputs + unchanged acceptance. |
 | OS2 | **E2** offload store decoupling (submit D2H at creation; stop the finished-req self-flush). | **IMPLEMENTED, A/B NEGATIVE, DORMANT** | `aijuus/kv-offload/patches/patch_offload_lazy_commit.py` (`RADIANCE_OFFLOAD_LAZY_COMMIT`, default off). Cold-18k TTFT **8031 vs 7560 ms (+5.6%)**: eager D2H contends with the 2nd prefill chunk. Corrected anchor: the real await is `pre_forward -> handle_preemptions -> worker.wait(jobs_to_flush)` (not `wait_for_save`, a no-op). |
-| OS3 | **E3** bounded host-snapshot GDN rollback to re-enable lazy GDN snapshots. | **fix implemented (cont.68), validation pending** | rx10 live (+6% from rx9). `_Tables` drift fixed → lazy boots, **KV +11%**. Prefill-invalidation wired (the dead `radiance_stash_indices`): `radiance_gdn_lazy.invalidate` + hook in `mamba_hybrid.preprocess_state`. Multi-turn 8 turns CLEAN; turnbench gate incomplete (harness reset). Not yet exactness-compared vs lazy-off; kept OFF. Perf when on: c1 −1.8%, c8 **+3.2%**, KV **+11%**. |
+| OS3 | **E3** lazy GDN state snapshots (one base + a stash of candidate inputs). | **DONE + ENABLED (cont.68/69)** | rx10 live (+6% from rx9). `_Tables` drift fixed; prefill-invalidation wired (the dead `radiance_stash_indices`): `radiance_gdn_lazy.invalidate` + hook in `mamba_hybrid.preprocess_state`. Multi-turn gate CLEAN (lazy off and on; 10-turn prefix-heavy). `RADIANCE_GDN_LAZY=1` in the mtp-blend registry. Perf: c1 −1.8%, c8 **+3.2%**, KV **+11%** (190,157). Outputs not bit-identical (fp32 replay). `turnbench` unusable in this build (wrong default endpoint + `/tokenize` 404). Revert = remove the key. |
 | OS4 | E4 phase arena / E5 cross-token prefetch+sparse feedback. | PARKED | excluded / decode-only single-digit |
 | OS5 | E6 PDL fence-ordering principle. | N/A | CUDA-only |
 

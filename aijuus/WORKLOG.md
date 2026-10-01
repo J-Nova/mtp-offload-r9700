@@ -2094,3 +2094,16 @@ pointed at the right base its token sizer hits `/tokenize` → HTTP 404. So the 
 **Enabled.** `RADIANCE_GDN_LAZY=1` added to `mtp-27B-MXFP4-blend.server_env` (commit `05288ea`);
 boots via the registry with no `ab.env`: KV **190,157 (+11%)**, sanity correct. Perf: c8 **+3.2%**,
 c1 −1.8%. Revert = remove that one key.
+
+## 2026-10-01 (cont. 70) — post-enable housekeeping
+
+- **lazy is live via the registry** (`RADIANCE_GDN_LAZY=1` on mtp-blend, commit `05288ea`); KV
+  **190,157 (+11%)**, sanity OK. Revert = remove that one key.
+- **BetterBench** (v0.4.0 at `~/betterbench/.venv/bin/betterbench`) command for the running vllm-0
+  recorded (all three phases, `config/default.json`, `--note lazy=on`). For a comparable A/B run it
+  once lazy-on and once eager (remove the key + reload). `turnbench` remains unusable in this build
+  (default endpoint `127.0.0.1:8080`; `/tokenize` → 404).
+- **Loose end — libr4d mount.** Compose now points at `b9e42ab-rx10`, but until the next redeploy the
+  running container still uses the repurposed `v0.5.0-w4a16` dir (which holds the rx10 `.so`). After
+  the redeploy, restore `~/.cache/radiance-libr4d/v0.5.0-w4a16/r4d.so` to the stock build
+  (`/tmp/kilo/r4d_stock.so`, sha `b83307c8`) so the dir is honest.
