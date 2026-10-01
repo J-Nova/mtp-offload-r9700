@@ -2009,3 +2009,37 @@ route 3c. So lazy stays OFF; the rebuild's realized value is the rx9 narrow-stat
 **State now:** rx10 mounted (the `v0.5.0-w4a16` dir repurposed; rename/compose point pending), lazy
 off, health 200, warm c1 75.8. Compose still names `v0.5.0-w4a16` — should be repointed to
 `b9e42ab-rx10` for honesty.
+
+## 2026-10-01 (cont. 67) — (c) fixed: lazy BOOTS (+11% KV); (3) route 3c premise is wrong
+
+**(c) `radiance_gdn_lazy._Tables` runtime drift — FIXED.** The module indexed
+`copy_funcs[st_idx]` on `tuple(ctx._radiance_copy_funcs)`, but `ctx._radiance_copy_funcs` is now the
+per-type `MambaStateCopyFuncsByType` dict, so `tuple(...)` gave its KEYS and indexing raised
+`IndexError`. Fix: per layer, `mamba_spec = _get_mamba_spec_for_layer(kv_cache_group, name)` (V2
+mamba_utils) then `copy_funcs = tuple(ctx._radiance_copy_funcs[mamba_spec.mamba_type])`, zipped
+positionally with `layer.kv_cache`. Runtime-copied from /patches, so no rebuild.
+
+With `RADIANCE_GDN_LAZY=1` the engine now **boots clean**:
+`[radiance.gdn.lazy] materialize tables: 48 temporal states, H 48 Hg 16 st_head 16384 state
+torch.float16`; `gdn_lazy_update` fp32/fp16 kernels resolve; **GPU KV cache 190,157 tokens (+11%
+vs 171,320)**; health 200; single-turn output coherent (17*23=391, correct Fibonacci). So (c) is
+done: lazy runs, the memory win is real.
+
+**(3) route 3c is NOT implementable as a pure-Python overlay — premise corrected.** The fail-open is
+decided *on-device* inside `r4d_gdn_lazy_materialize_kernel` (`r4d_radiance_extras_rx10.patch:1503-1509`:
+`r=0` on a stash-header mismatch, then the unconditional store). Python cannot observe that decision
+without a per-step readback, and it cannot *repair* it: the correct value is the state after `count`
+candidates of the previous step, whose only source is the candidate inputs in the stash block — the
+very thing that went invalid. A host ring holding that data is ~18 MB/req/step (infeasible). So the
+"host-snapshot ring + 2-slot GPU stage, restore from Python" plan does not hold.
+
+Two concrete paths from here (both need an `r4d.so` edit + the ~1 min rx10 rebuild):
+- **3a (safe, small):** kernel writes a per-request `stale` bit when it would fail open with
+  `count>0`; the V2 runner reads it (async) and raises/logs. Lazy then fails **loud**, never silently
+  corrupts — makes it safe to enable for the memory win even before the repair.
+- **K2 (repair):** dedicate ONE extra state page per request as a backup stash (3 -> 4 pages vs 9
+  stock) that survives block reuse; materialize reads it on mismatch. Real fix, needs multi-turn
+  validation via `turnbench`.
+
+**State:** rx10 live, lazy OFF, health 200. Until the compose redeploy, vllm-0 runs rx10 via the
+repurposed `v0.5.0-w4a16` dir.

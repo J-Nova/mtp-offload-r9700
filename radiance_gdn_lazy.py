@@ -36,17 +36,22 @@ class _Tables:
     def __init__(self, ctx, kv_cache_config, forward_context):
         import radiance_gdn
         from vllm.model_executor.layers.mamba.mamba_utils import get_temporal_copy_spec
-        copy_funcs = tuple(ctx._radiance_copy_funcs)
+        from vllm.v1.worker.mamba_utils import _get_mamba_spec_for_layer
         ptrs, strides, groups, alogs, dtbs = [], [], [], [], []
         self.keep = []                       # the fp32 gate copies must outlive the tables
         geom = None
         for g_local, gid in enumerate(ctx.mamba_group_ids):
-            for name in kv_cache_config.kv_cache_groups[gid].layer_names:
+            kv_cache_group = kv_cache_config.kv_cache_groups[gid]
+            for name in kv_cache_group.layer_names:
                 layer = forward_context[name]
+                # copy funcs are per MambaSpec type (MambaStateCopyFuncsByType), aligned
+                # positionally with layer.kv_cache (mamba_utils pairs them the same way).
+                mamba_spec = _get_mamba_spec_for_layer(kv_cache_group, name)
+                copy_funcs = tuple(ctx._radiance_copy_funcs[mamba_spec.mamba_type])
                 a_log, dt_bias = radiance_gdn._gate_params(layer)
                 self.keep.append((a_log, dt_bias))
-                for st_idx, state in enumerate(layer.kv_cache):
-                    if copy_funcs[st_idx] is not get_temporal_copy_spec:
+                for st_idx, (cf, state) in enumerate(zip(copy_funcs, layer.kv_cache)):
+                    if cf is not get_temporal_copy_spec:
                         continue
                     ptrs.append(state.data_ptr())
                     strides.append(state.stride(0) * state.element_size())

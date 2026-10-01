@@ -20,9 +20,10 @@ matcher (cont.64) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60)
 **A. No-rebuild, actionable now (top):**
 1. **rx10 libr4d — BUILT and LIVE (cont.66): +6% c1/c8.** `b9e42ab-rx10/r4d.so` now serves; its
    rx9 narrow-state kernels fixed the declined fp16 GDN fused path. Remaining: repoint the compose
-   mount from `v0.5.0-w4a16` to `b9e42ab-rx10` (naming) and validate numerics (acceptance moved
-   1.93→2.17). **Lazy (OS3/E3)** still off: needs (a) `radiance_gdn_lazy.py:49 _Tables` runtime fix,
-   (b) route 3c fail-closed, (c) it is fail-open corrupt. Payoff when done: KV pool +11%.
+   mount to `b9e42ab-rx10` (done) and redeploy; validate numerics (acceptance moved 1.93→2.17).
+   **Lazy (OS3/E3)** now BOOTS (cont.67, `_Tables` drift fixed) with KV +11% (190,157), but multi-turn
+   is still fail-open corrupt. Route 3c as pure Python is infeasible; choose **3a** (kernel `stale`
+   flag → fail loud) or **K2** (backup stash page, 3→4 pages) — both need an `r4d.so` rebuild.
 2. **H1** — commit this work (`patch_dynamic_depth.py`, `aijuus/batched_ngram_equiv.py`,
    WORKLOG/OPEN-TASKS-INDEX/ACTIONABLE-AB-PLAN).
 3. **Instrumentation/validation:** **ST6** acceptance-by-position per category (serving measurement) ·
@@ -190,7 +191,7 @@ byte store with an O_DIRECT fixed-size round-trip contract, so a lossy tier cann
 |---|---|---|---|
 | OS1 | **E1** suffix-only invalidation + eagle/MTP group inclusion. | **ENABLED (cont.60)** | `patch_offload_suffix_inv.py` + `patch_offload_eagle_include.py`; gates `RADIANCE_OFFLOAD_SUFFIX_INV` / `RADIANCE_OFFLOAD_EAGLE_INCLUDE` set to 1 on both MTP registry entries. Warm E1-on c1 **71.3**/c8 **371.6** vs off 67.8/369; tier 67.3→71.0%, recompute 25→24%, HEALTH PASS. Byte-identical outputs + unchanged acceptance. |
 | OS2 | **E2** offload store decoupling (submit D2H at creation; stop the finished-req self-flush). | **IMPLEMENTED, A/B NEGATIVE, DORMANT** | `aijuus/kv-offload/patches/patch_offload_lazy_commit.py` (`RADIANCE_OFFLOAD_LAZY_COMMIT`, default off). Cold-18k TTFT **8031 vs 7560 ms (+5.6%)**: eager D2H contends with the 2nd prefill chunk. Corrected anchor: the real await is `pre_forward -> handle_preemptions -> worker.wait(jobs_to_flush)` (not `wait_for_save`, a no-op). |
-| OS3 | **E3** bounded host-snapshot GDN rollback (2-slot GPU stage) to re-enable lazy GDN snapshots. | **rx10 BUILT (cont.66); still blocked** | `b9e42ab-rx10/r4d.so` built (has `gdn_lazy_update`/`_materialize`) and live: its rx9 narrow-state kernels gave **+6% c1/c8** (see OS1-adjacent note). Lazy itself still off: remaining blockers are (a) `radiance_gdn_lazy.py:49 _Tables` runtime API drift (`IndexError`), (b) route 3c fail-closed, (c) lazy is fail-open corrupt. Fix (a) then (b) before enabling. |
+| OS3 | **E3** bounded host-snapshot GDN rollback to re-enable lazy GDN snapshots. | **lazy BOOTS (cont.67); repair needs kernel work** | rx10 built + live (`gdn_lazy_update`/`_materialize`); its rx9 kernels gave **+6% c1/c8**. `radiance_gdn_lazy._Tables` drift fixed → lazy boots with `RADIANCE_GDN_LAZY=1`, **KV 190,157 (+11%)**, single-turn clean. Remaining: route 3c as pure Python is **infeasible** (fail-open decided on-device; the needed state is unrecoverable in Python). Next: **3a** kernel `stale` flag → runner raises (fail loud, safe to enable) or **K2** backup stash page (3→4 pages) for the real repair. Both need an `r4d.so` rebuild (~1 min). |
 | OS4 | E4 phase arena / E5 cross-token prefetch+sparse feedback. | PARKED | excluded / decode-only single-digit |
 | OS5 | E6 PDL fence-ordering principle. | N/A | CUDA-only |
 
