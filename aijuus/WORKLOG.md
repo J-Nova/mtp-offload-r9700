@@ -2043,3 +2043,31 @@ Two concrete paths from here (both need an `r4d.so` edit + the ~1 min rx10 rebui
 
 **State:** rx10 live, lazy OFF, health 200. Until the compose redeploy, vllm-0 runs rx10 via the
 repurposed `v0.5.0-w4a16` dir.
+
+## 2026-10-01 (cont. 68) — lazy prefill invalidation wired (overlay-only); multi-turn CLEAN
+
+**Fix (overlay, no rebuild).** The intended "prefill invalidates its stash" step was dead metadata
+(cont.67 §8). Wired it:
+- `radiance_gdn_lazy.invalidate()` + `_lz_invalidate_kernel` (Triton): per prefilling row, zero the
+  4-byte magic of every head region of the request's stash block (`bt[state_idx+1]`), so a stash
+  written against a reused physical base_slot in an earlier context can never replay.
+- `patch_gdn_lazy.py` patches `mamba_hybrid.preprocess_state` to call it (for `input_batch.is_prefilling_np`
+  rows) right before `run_fused_precopy`.
+
+**Bring-up bugs (all fixed):**
+1. Offsets: `state_ptrs` are raw BYTE addresses in the triton kernel, so `slot_strides` (bytes) and
+   `st_head * itemsize` are byte offsets — using elements wrote the wrong slots.
+2. `idx_mapping` must be passed as the **tensor**; a `.data_ptr()` int is a triton *scalar*, giving
+   `CompilationError: Unsupported ptr type triton.language.int64 in tl.load`.
+3. Patch idempotency skipped the updated 6-arg hook (sentinel already present) → reset
+   `mamba_hybrid.py` to pristine and re-applied.
+
+**Result.** lazy + fix boots clean: `materialize tables: 48 temporal states`, **KV 190,157 (+11%)**,
+health 200. **8-turn multi-turn CLEAN** (no empty replies, no repeat loops). A turn-5 empty reply in
+the first run was a reasoning token-cap artifact (`finish=length`, ct=600), not corruption.
+`turnbench --concurrent` could not complete (harness `ConnectionResetError`; the engine stayed
+healthy), so the canonical gate is still outstanding.
+
+**Status.** Not yet an exactness comparison vs lazy-off, and the canonical gate is incomplete; lazy
+kept **OFF** (rx10, no `ab.env`) pending stronger validation. Files: `radiance_gdn_lazy.py`,
+`patch_gdn_lazy.py`.
