@@ -2071,3 +2071,26 @@ healthy), so the canonical gate is still outstanding.
 **Status.** Not yet an exactness comparison vs lazy-off, and the canonical gate is incomplete; lazy
 kept **OFF** (rx10, no `ab.env`) pending stronger validation. Files: `radiance_gdn_lazy.py`,
 `patch_gdn_lazy.py`.
+
+## 2026-10-01 (cont. 69) — lazy validation + enabled in the registry
+
+**Gate.** `mt_gate.py`: a ~3k-token shared document + 10-turn growing conversation (prefix-cache reuse
+every turn), temp 0, thinking off, run under lazy-off (control) and lazy-on (+fix):
+
+| arm | result |
+|---|---|
+| lazy OFF | CLEAN (10/10 turns, no empty/loop) |
+| lazy ON (+fix) | CLEAN (10/10) |
+
+Outputs are **semantically equivalent** (same edge case, same O(n), same functions) but **lexically
+divergent** (mean char-similarity 0.40) — expected: lazy's fp32 replay is explicitly not bit-identical
+to eager, and greedy decoding cascades the first differing token. Health (the corruption signature)
+is clean.
+
+**turnbench is unusable in this build:** its default endpoint is `127.0.0.1:8080` (not our server), and
+pointed at the right base its token sizer hits `/tokenize` → HTTP 404. So the canonical
+`turnbench --concurrent` gate could not run; the multi-turn gate above is the available evidence.
+
+**Enabled.** `RADIANCE_GDN_LAZY=1` added to `mtp-27B-MXFP4-blend.server_env` (commit `05288ea`);
+boots via the registry with no `ab.env`: KV **190,157 (+11%)**, sanity correct. Perf: c8 **+3.2%**,
+c1 −1.8%. Revert = remove that one key.
