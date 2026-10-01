@@ -2201,3 +2201,26 @@ that holds 160k tokens (not the max), an explicit `--pins 5.87e9,6.06e9,6.5e9` r
 - Registry pin was restored by the `--no-reload` run (it changes nothing); the registry still carries
   `kv_cache_memory=6979321856` (190,157 tokens). Optional next: reclaim the ~1.03 GiB that 160k can
   never use via `calibrate-kv-live.py --pins 6.06e9` (≈165k tokens) — a reload, user-run.
+
+## 2026-10-01 (cont. 75) — calibrate-kv-live crash handling fixed; profiling is infeasible
+
+**Defect found the hard way.** The first `calibrate-kv-live.py` used vLLM **profiling** as pass 1
+(`kv_cache_memory=""`). On this model that cannot work: the profiler charges the transient/cudagraph
+peak and sizes **4.05 GiB**, below the **5.45 GiB** vLLM says is needed for `max_seq_len=160000`
+(`estimated maximum model length is 115280`), so the engine **refuses to boot**. The harness then sat
+in its 20-min health wait while the container **crash-looped**, leaving the registry at `""`. SIGINT ran
+the `finally`, restored `6979321856`, and the container re-read the registry on its next restart and
+came back (health 200, KV 190,157).
+
+**Fixes:**
+- **No profiling.** The sweep starts from a known-good pin — the current registry value, or `--start`.
+  Pass 1 now *verifies* that pin serves a CHUNK-sized prefill before raising.
+- **Fast-fail.** `attempt()` watches the new boot's logs for engine-start failures
+  (`Engine core initialization failed`, `larger than the available KV cache memory`, OOM, ...) and
+  bails immediately instead of waiting on the controller's 3600 s `SWAP_TIMEOUT`.
+- **Rescue.** On any failed pin it restores the last known-good pin and restarts, so the instance is
+  never left crash-looping. Also waits for the container's `RestartCount` to advance before scoring a
+  boot (the controller drains first, so the old pin keeps answering `/health` for a while).
+
+**Useful datum:** vLLM reports the minimum pin directly — **5.45 GiB for 160k**, i.e. the floor;
+6979321856 (6.5 GiB) gives 190,157 tokens, so there is headroom to raise.
