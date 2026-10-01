@@ -81,15 +81,20 @@ Tooling: `aijuus/bench-conc.py` (decode: agg t/s, ms/step proxy, acc/draft, per-
 - TF6 (tokens outside `draft_keep_file`) and TF7 (`CLAV_DRAFT_HEAD_REPLICATE` for 2-GPU DP) depend on
   tcclaviger-fork internals not shipped; no direct A/B without the private fork. Park pending TF5.
 
-## A9 — OS3: E3 lazy-GDN fail-closed (route 3c) — **IMPLEMENT + validate (no A/B)**
+## A9 — OS3: E3 lazy-GDN fail-closed (route 3c) — **BLOCKED on `r4d.so` rx10 rebuild (cont.65)**
 
 - **Goal:** make `RADIANCE_GDN_LAZY=1` correct (currently fail-open → multi-turn corruption).
 - **Design:** in `radiance_gdn_lazy.py` (runtime-copied), keep a bounded per-request temporal-state
   snapshot (2-slot GPU stage + pinned host ring keyed by token frontier); on a header mismatch restore
-  from the ring instead of accepting the base. Pure Python, no rebuild.
+  from the ring instead of accepting the base.
 - **Validate:** injected-stale-header unit test (old code → base; new → restored/raise) + multi-turn
   health (no repeat-loop/empty replies from ~turn 5) + `turnbench --concurrent` HEALTH PASS. Lazy is
   off today, so this is a **memory** win (~865→260 MB/req), not a perf one.
+- **cont.65 result:** the Python overlay had drifted (8/16 anchors stale → applying lazy crash-looped
+  the container). **Repaired: 16/16 anchors now apply clean.** But the base image's `libr4d` has **no
+  `gdn_lazy_update` kernel** (needs the `r4d_radiance_extras_rx10.patch` build, `R4D_KEY=…-rx10`), so
+  enabling lazy HSA-faults during graph capture. **A9 is rebuild-class, not no-rebuild.** Measured
+  payoff: KV pool **+11%** (171,320 → 190,157 tokens) at SPEC=8 with lazy on.
 
 ## A10 — PF6: 8k chunk decision — **profile, then decision**
 
@@ -131,4 +136,17 @@ Tooling: `aijuus/bench-conc.py` (decode: agg t/s, ms/step proxy, acc/draft, per-
 | A8 | TF6/TF7 | need tcclaviger-fork internals | **Parked** (pending TF5) |
 | A10 | 8k chunk | short-prompt harness can't test long-context concurrency; PF1 showed prefill chunk-independent at 8k | **Keep 16384** |
 | A11 | dormant D1/D2 | D1 conf-exit A/B-negative; D2 mamba scratch-zero perf-neutral | **Keep dormant**; D2 available as hardening |
-| A9 | E3 host-ring | — | **Remaining** — the only substantive no-rebuild feature left (pure-Python; lazy is off today so it's a memory win) |
+| A9 | E3 lazy-GDN | Python overlay repaired (16/16 anchors) but base libr4d lacks the lazy kernel | **BLOCKED: r4d.so rx10 rebuild (user-owned)**; payoff +11% KV (190,157 vs 171,320 tok) |
+
+## cont.64 — A12: C1/C2 batched n-gram matcher — **DONE (neutral, kept)**
+
+- **Goal:** collapse the per-armed-row `match_gpu` launches + per-row D2H syncs into one batched call.
+- **Knob:** `RADIANCE_DRAFT_NGRAM_BATCH` (default **1**; `0` = proven per-row B=1 fallback).
+- **Safety:** standalone in-container `batched_ngram_equiv.py` (40 iters, B 1..8) — batched pack
+  bit-identical to per-row, no HSA fault.
+- **Result (warm A/B):** repetitive c1 61.8→**61.9**, c8 130.8→**132.1**; generic c1 67.9→**67.8**,
+  c8 357.2→**362.7** — all within run spread; acceptance/per-position identical.
+- **Decision:** **keep default on** (lossless, fewer per-step ops; no regression). No registry change.
+  Per-row matcher launches/syncs are not on the critical path at these context sizes.
+- **Ops caveat:** first boot after a reload can be ~3x slow (c1 **22**) until the next warm restart
+  (returned **71.0**); always verify c1≈68 before trusting a measurement.

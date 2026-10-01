@@ -11,22 +11,44 @@ deferred) · **DORMANT** (implemented, env-gated off).
 verified** before measuring (a single warm restart was not always enough; seeding the Triton cache
 from the intact vllm-1 dir helped). Never measure an unverified boot.
 
-## 0. Recommended resume order (updated cont.54)
+## 0. Remaining tasks — refreshed cont.64
 
-**Closed this effort:** E1 (implemented, dormant), E2 (implemented, A/B negative, dormant),
-MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
+**Closed since the previous index:** M1 (n-gram HSA fix + enablement, cont.59–63) · **C1/C2** batched
+matcher (cont.64) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60) · A1–A5 · A10 · A11
+(dormant, kept) · OK3–OK7 · PF1/PF5/PF6/PF7 · K1–K3 · T1/T2 · MT1/MT2 · X2 (N/A for V2) · V1 (N/A, V1-only).
 
-**Open, no-rebuild first:**
-1. **OS3** implement E3 route 3c (pure-Python host-ring fail-closed) + injected-stale-header test.
-2. **OS1** enable E1's two gates and A/B **acceptance + tier hit-rate** on the multi-turn workload
-   (bit-exactness is not a valid gate — MT1/MT2).
-3. **M1** in-engine (H3 pre-warm → H2 → H5) — may wedge; unblocks `RADIANCE_DRAFT_NGRAM` + VC1's tail.
-4. **K1** MTP KV calibrate (GPU) · **V2** watch acceptance after the vocab prune.
-5. **Prefill:** **P2** R4D h256 geometry · **P6** o_proj quant fold · **P7** A1 fusion confirmation ·
-   **P10** harness · **PF5** AR-quant A/B · **PF6** 8k-chunk decision · **PF7** co-schedule more seqs.
-6. **Offload:** **OK3** `tierbench`/`kvwatch` measurement · **OK4** verify the promotion queue-depth fix.
-7. **Structural/research:** ST1/ST2/ST3/ST4/ST6 · **TF4** TunableOp sweep · **VC2** battery re-run.
-8. **Rebuild/blocked/parked:** PF2/PF3/PF4, OS2 (dormant), OK2/OK5, KB1–KB4, TF2/TF5, S3–S8, X1, P3/P5/P8/P9.
+**A. No-rebuild, actionable now (top):**
+1. **A9 / OS3 lazy-GDN** — Python overlay **repaired (cont.65: 8 stale anchors, now 16/16 apply
+   clean)** but **blocked on an `r4d.so` rx10 rebuild** (base image libr4d has no `gdn_lazy_update`
+   kernel; enabling lazy HSA-faults / crash-loops). Payoff when unblocked: KV pool **+11%**
+   (171,320 → 190,157 tokens). See §13 and WORKLOG cont.65.
+2. **H1** — commit this work (`patch_dynamic_depth.py`, `aijuus/batched_ngram_equiv.py`,
+   WORKLOG/OPEN-TASKS-INDEX/ACTIONABLE-AB-PLAN).
+3. **Instrumentation/validation:** **ST6** acceptance-by-position per category (serving measurement) ·
+   **VC2** battery re-run (EXACTSET+FUSED on the frozen union-freq build) · **V2** keep watching
+   acceptance post vocab-prune.
+4. **Research (read-only):** **ST7** remaining HIP kernel packages · **TF4** TunableOp GEMM sweep ·
+   **TF6/TF7** reduced-vocab handling / `CLAV_DRAFT_HEAD_REPLICATE`.
+5. **Prefill:** **P6** o_proj quant fold (deprioritised by A5) · **P10** harness (BetterBench sweep +
+   18k probe + GSM8K) · **P2** R4D h256 geometry (needs a selection-table entry; check runtime feasibility).
+6. **Ops reliability:** the first boot after a reload can be ~3× slow (c1 **22**) until a warm restart
+   — decide whether to pre-warm / stabilise the AOT key so a single cold boot is trustworthy.
+7. **Docs/cleanup:** **H4** README overlay refresh · **K2** align `mtp-27B-MXFP4-Thinkingcap` kv pin
+   (`8761733283`) only if/when it is piloted.
+
+**B. Rebuild-class / kernel (needs a build you own):** **OS3/E3 lazy-GDN** (needs `r4d.so` rx10) ·
+PF2 GDN chunk-scan parallelization · PF3 R4D prefill scheduling · PF4 MXFP4 split-K @16k · S4 shrink each
+draft forward (C5 contract repair precedes S5–S8) · B2 fused int2 draft-head top-1 · KB1 libr4d pin bump ·
+TF2 `clav_attn`.
+
+**C. Blocked / parked / dormant:** P3/P5 (on P4) · P4 AITER (needs `KV_OFFLOAD_GIB=0`; conflicts with
+offload) · S3/S6–S8 · P8/P9 · X1 · OS2 (A/B negative) · D1/D2 (dormant; D2 available as hardening) ·
+OS4/OS5 · TF5 (private fork) · VC1 tau gate (A/B negative).
+
+**D. Deferred / inherent:** resume bit-identity Route A (benefit-destroying; not recommended) ·
+MT1/MT2 (inherent resume-vs-cold numerics).
+
+**Do NOT redo:** the "Do NOT repeat (measured neutral/worse)" list below.
 
 ---
 
@@ -34,7 +56,7 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 
 | ID | Task | Status | Source | Blocker | Effort |
 |---|---|---|---|---|---|
-| M1 | N-gram tail HSA fault at bs≥2. | **FIXED (one line)** cont.59 | Cause = `_nblk` passed the window *base* not *size* → scan grid ~9x too big → `q` past `ML` → unmasked suffix load OOB (gfx1201 HSA). Fix: `gpu._nblk(n, window_size)` in `patch_dynamic_depth.py`. Not the UVA gather / not syncs. **NGRAM default-off** (net -7.4%/-15% c1/c8; ~8% extended rows). |
+| M1 | N-gram tail HSA fault at bs≥2. | **FIXED (one line)** cont.59 | Cause = `_nblk` passed the window *base* not *size* → scan grid ~9x too big → `q` past `ML` → unmasked suffix load OOB (gfx1201 HSA). Fix: `gpu._nblk(n, window_size)` in `patch_dynamic_depth.py`. Not the UVA gather / not syncs. **NGRAM now ON**: adaptive per-request gate + variant B depth (cont.62/63); **C1/C2** batched matcher (cont.64) is bit-identical and perf-neutral (fewer launches/syncs, no regression). |
 | M2 | **`RADIANCE_DRAFT_HEAD_TOP1`** — drop the arm (neutral + mutually exclusive with the vocab prune; crashes on reload). Registry stays off. | **CLOSED (dropped)** | WORKLOG cont.28 3b, cont.29 | no code change |
 
 ## 2. Calibration / config debt
@@ -51,7 +73,7 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 |---|---|---|---|---|
 | T1 | **End A/B battery** on the frozen union-freq build: `EXACTSET`+`FUSED` on/off; AITER on/off; SPEC 4 vs 8 re-run. | **CLOSED by prior evidence** | EXACTSET must stay off (renormalizes the tau-gate confidence; R9700 decision); FUSED on; SPEC 8 wins (cont.3/28); AITER blocked (P4). |
 | T2 | Untested MTP perf levers: `RADIANCE_DRAFT_TAU` 0.15/0.25; `RADIANCE_DRAFT_RERANK` 32 vs other. | **CLOSED by prior evidence** | tau 0.20 best (cont.11/28); rerank neutral (cont.28); live `RADIANCE_DRAFT_KNOB_FILE` path is V1-only and the served runner is V2. |
-| T3 | N-gram tail-rate confirmation. | BLOCKED (by M1) | NGRAM off until the in-engine fault is fixed. |
+| T3 | N-gram tail-rate confirmation. | **DONE (cont.61/64)** | repetitive ~+9% c1 / +33% c8 vs NGRAM=0; extended rows ~3-8% (workload-dependent). |
 
 ## 4. MTP prefill / TTFT (MTP-PREFILL-PLAN)
 
@@ -61,8 +83,8 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 | P3 | MXFP4 prefill GEMM TN4/split-K sweep per M (~+10% @M8192 documented). | BLOCKED (reload/arm) | diminishing |
 | P4 | rDNA h256 backend: A/B R4D vs AITER attention. | **BLOCKED** (cont.32) | `ROCM_AITER_UNIFIED_ATTN` invalid with the OffloadingConnector (`['KV connector not supported']`); needs `KV_OFFLOAD_GIB=0`. Entrypoint now honours `R4D_ATTN` (default 1). |
 | P5 | `long_prefill_token_threshold` policy; `#57951` scheduler overlay only if threshold≠0. | BLOCKED on P4/C | |
-| P6 | Fold attention-output → o_proj quant (only if A1 confirmation A/B shows headroom). | READY | |
-| P7 | Confirmation A/B: `FUSE_RMS_QUANT=0`+`FP8_STREAM=0` vs on (A1) — if ≫2% prefill, fusion already earns its keep. | READY | optional |
+| P6 | Fold attention-output → o_proj quant (only if A1 confirmation A/B shows headroom). | **DEPRIORITISED (A5)** | A5 measured fusion on **2230** vs off 1949 tok/s (−12.6%); the fusion already captures this headroom |
+| P7 | Confirmation A/B: `FUSE_RMS_QUANT=0`+`FP8_STREAM=0` vs on (A1). | **DONE (A5)** | fusion on **2230 tok/s** (TTFT 6979 ms) vs off 1949 (−12.6%); **keep fusion on** |
 | P8 | Speculative/sparse prefill (#39060). | PARKED | biggest TTFT, high cost |
 | P9 | GDN prefill; phase arena; cross-token prefetch. | PARKED | low / excluded |
 | P10 | Measurement harness (BetterBench sweep + 18k probe + GSM8K). | READY | D |
@@ -97,17 +119,17 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 
 | ID | Task | Status | Source |
 |---|---|---|---|
-| V1 | `radiance_draft.py` per-row n-gram windowed fallback (`base=n` empty-window). | **STATIC OK / gated by M1** | cont.38: logic verified (`radiance_draft.py:758-780` — miss rows `base=0` full rescan, others empty window, `pk[sel]` copy-back). Only runs with `NGRAM=1`+window, so it needs M1 resolved. |
+| V1 | `radiance_draft.py` per-row n-gram windowed fallback (`base=n` empty-window). | **N/A (V1-only)** | cont.38 logic verified, but the served runner is V2; the path is inert there. Superseded by the V2 n-gram tail (cont.62/63). |
 | V2 | Watch acceptance after vocab prune. | **MONITOR** | no regression across runs. |
-| V3 | MTP combined depth + `[ngram]` tail validation. | **UNBLOCKED** (M1 fixed) | can now be run; NGRAM default-off pending a workload decision. |
+| V3 | MTP combined depth + `[ngram]` tail validation. | **CLOSED (cont.63)** | variant B (`NGRAM_DEPTH=8` at bs≤2) + adaptive gate enabled; repetitive c1 +8.8%, generic c1 +9%, c8 neutral. |
 | V4 | External KV tier: CPU tier structurally unreachable; forced external-tier hit method documented (WORKLOG cont.16/17). | **DOCUMENTED** | method in WORKLOG cont.17 §"How to force/verify" |
 
 ## 9. Housekeeping
 
 | ID | Task | Status |
 |---|---|---|
-| H1 | Commit this session's changes: `aijuus/WORKLOG.md`, `bench-quick.py`, `entrypoint.sh`, `model-registry.json`; track `patch_mtp_conf_exit.py`, `patch_mamba_scratch_zero.py`, `bench-conc.py`, `MTP-RAGGED-VERIFY-AND-CONV-SCRATCH-PLAN.md`, `aijuus/bench/vllm1-mtp8.betterbench.*`. | READY |
-| H2 | Decide the n-gram code path (keep inert vs revert). | READY |
+| H1 | Commit work. Latest (cont.64): `patch_dynamic_depth.py` (C1/C2 batched matcher), `aijuus/batched_ngram_equiv.py`, `aijuus/WORKLOG.md`, `aijuus/OPEN-TASKS-INDEX.md`, `aijuus/ACTIONABLE-AB-PLAN.md`. Earlier: `bench-quick.py`, `entrypoint.sh`, `model-registry.json`, `patch_mtp_conf_exit.py`, `patch_mamba_scratch_zero.py`, `bench-conc.py`, `MTP-RAGGED-VERIFY-AND-CONV-SCRATCH-PLAN.md`. | READY |
+| H2 | Decide the n-gram code path (keep inert vs revert). | **CLOSED (enabled)** | see §14 |
 | H3 | ~~Track untracked modules~~ **DONE** (`patch_aot_envkey.py`, `collect_tokens.py`, `draft_keep/*` now tracked-clean). | CLOSED |
 | H4 | README/DOCKERHUB doc refresh. | **PARTIAL (overlay)** | root README/DOCKERHUB are upstream-owned; deployment-reality corrections added to `aijuus/README.md` (V2 inertness, NGRAM=0, HEAD_TOP1 dropped, R4D/cache method). |
 
@@ -123,8 +145,9 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 
 Lazy GDN snapshots; rotation stream 3; async scheduling for MTP; custom RMSNorm+quant op; prefill
 epilogue prefetch; `COMPILE_SIZES`; `RADIANCE_GDN_STRIDED_GATES`/`GDN_EMPTY_OUT`/`COOP_RED`;
-MTP Tier A A1-A8 (rejected in the progress log); B1 device gate; B3 defer-decide; n-gram tail under
-`NGRAM=1` until M1 proves the fault; tcclaviger conf-exit/ragged-verify and conv-scratch ports here.
+MTP Tier A A1-A8 (rejected in the progress log); B1 device gate; B3 defer-decide; **static** n-gram
+tail `NGRAM=1` *without* the adaptive gate (net-negative on generic — the adaptive gate + variant B is
+the shipped form); tcclaviger conf-exit/ragged-verify and conv-scratch ports here.
 
 ---
 
@@ -164,9 +187,9 @@ byte store with an O_DIRECT fixed-size round-trip contract, so a lossy tier cann
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
-| OS1 | **E1** suffix-only invalidation + eagle/MTP group inclusion. | **IMPLEMENTED (Stage 1+2), DORMANT** | `patch_offload_suffix_inv.py` (hook + manager/tiering/fs `invalidate`) and `patch_offload_eagle_include.py` (remove store-drop + load-pop). Gates `RADIANCE_OFFLOAD_SUFFIX_INV` / `RADIANCE_OFFLOAD_EAGLE_INCLUDE`, default off. Byte-identical outputs + unchanged acceptance with both on; hit-rate benefit unmeasured (needs turnbench warm). Runtime-only, no rebuild. |
+| OS1 | **E1** suffix-only invalidation + eagle/MTP group inclusion. | **ENABLED (cont.60)** | `patch_offload_suffix_inv.py` + `patch_offload_eagle_include.py`; gates `RADIANCE_OFFLOAD_SUFFIX_INV` / `RADIANCE_OFFLOAD_EAGLE_INCLUDE` set to 1 on both MTP registry entries. Warm E1-on c1 **71.3**/c8 **371.6** vs off 67.8/369; tier 67.3→71.0%, recompute 25→24%, HEALTH PASS. Byte-identical outputs + unchanged acceptance. |
 | OS2 | **E2** offload store decoupling (submit D2H at creation; stop the finished-req self-flush). | **IMPLEMENTED, A/B NEGATIVE, DORMANT** | `aijuus/kv-offload/patches/patch_offload_lazy_commit.py` (`RADIANCE_OFFLOAD_LAZY_COMMIT`, default off). Cold-18k TTFT **8031 vs 7560 ms (+5.6%)**: eager D2H contends with the 2nd prefill chunk. Corrected anchor: the real await is `pre_forward -> handle_preemptions -> worker.wait(jobs_to_flush)` (not `wait_for_save`, a no-op). |
-| OS3 | **E3** bounded host-snapshot GDN rollback (2-slot GPU stage) to re-enable lazy GDN snapshots. | **RESEARCHED, IMPLEMENTATION PENDING (medium)** | Root cause of lazy corruption: libr4d materialize **fails open** (`r=0` stores the base as checkpoint) when a prefix hit invalidates the stash. Design: 2-slot GPU stage + pinned host ring keyed by frontier, fail-closed gate; needs a small libr4d edit or a runtime Triton validator. |
+| OS3 | **E3** bounded host-snapshot GDN rollback (2-slot GPU stage) to re-enable lazy GDN snapshots. | **BLOCKED: r4d.so rx10 rebuild** (cont.65) | Root cause of lazy corruption: libr4d materialize **fails open** (`r=0` stores the base as checkpoint) when a prefix hit invalidates the stash. The pure-Python overlay is **repaired** (`patch_gdn_lazy.py`, 8 stale anchors fixed, 16/16 apply clean) and route 3c is still to implement, but the *kernel* `gdn_lazy_update`/`gdn_lazy_materialize` is **absent from the base image's libr4d** (needs `r4d_radiance_extras_rx10.patch` built, `R4D_KEY=…-rx10`). Enabling lazy today HSA-faults during graph capture. Payoff: KV pool **+11%** (171,320 → 190,157). |
 | OS4 | E4 phase arena / E5 cross-token prefetch+sparse feedback. | PARKED | excluded / decode-only single-digit |
 | OS5 | E6 PDL fence-ordering principle. | N/A | CUDA-only |
 
@@ -174,10 +197,10 @@ byte store with an O_DIRECT fixed-size round-trip contract, so a lossy tier cann
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
-| VC1 | Port the tau gate / n-gram tail from `radiance_draft.py` (V1) to V2. | **PARTIAL** | tau gate **done** via `patch_mtp_conf_exit.py` (in-graph confidence + per-request exit) — A/B negative, dormant; n-gram tail blocked by M1 |
+| VC1 | Port the tau gate / n-gram tail from `radiance_draft.py` (V1) to V2. | **CLOSED** | tau gate via `patch_mtp_conf_exit.py` (A/B negative, dormant); **n-gram tail done** in `patch_dynamic_depth.py` (adaptive gate + variant B, cont.62/63; batched matcher cont.64) |
 | VC2 | Battery re-run on the frozen union-freq build with/without `EXACTSET+FUSED`. | OPEN (deferred) | interactions may differ from the 49k-head measurements |
 | VC3 | B3 MXFP4+GPTQ drafter (paroquant plugin + GPTQ calibration `.pt`). | NOT PURSUED | overlaps the dropped W4 head |
-| H2 | Decide the n-gram code path (keep inert vs revert). | **CLOSED (keep inert)** | default `RADIANCE_DRAFT_NGRAM=0`; safe changes retained; revert only if M1 is abandoned |
+| H2 | Decide the n-gram code path (keep inert vs revert). | **CLOSED (enabled)** | cont.62/63: adaptive gate + variant B on by default in the registry; C1/C2 batched matcher (cont.64) validated bit-identical. Revert only if M1 is abandoned |
 
 ## 15. Open research questions (TCCLA plan §Open Questions)
 

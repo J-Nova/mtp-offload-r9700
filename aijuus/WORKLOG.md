@@ -1896,3 +1896,75 @@ now that `_nblk` is fixed. **Enabled by default** in the registry (`NGRAM_DEPTH=
 Note: the `cl/mlm` histogram print was finicky (the `RADIANCE_DRAFT_NGRAM_HIST` env didn't reach the
 EngineCore, so I made recording unconditional; the print still didn't surface in `docker logs` this
 session). Variant B's own gain demonstrates the headroom; the histogram can be revisited if needed.
+
+## 2026-10-01 (cont. 64) — C1/C2: batched n-gram matcher (bit-identical, perf-neutral, kept)
+
+**Motivation.** `_radiance_ngram_extend` ran `gpu.match_gpu` once per *armed* row (B=1) with one
+`.cpu()` sync per row, i.e. R launches + R D2H syncs per propose step on repetitive/code workloads.
+
+**Change** (`patch_dynamic_depth.py` `RUNNER_TAIL`). One batched `match_gpu` call over all armed rows,
+one max-block grid, one D2H -- gated `RADIANCE_DRAFT_NGRAM_BATCH` (default **1**). The grid uses
+`max(nblk_i)`; a shorter row's extra blocks are masked (`alive = q < n-1`) so they emit no key. The
+old per-row B=1 path is kept as the `=0` fallback.
+
+**Safety.** Standalone in-container test (`batched_ngram_equiv.py`: 40 iters, B 1..8, random
+n/window, seeded suffix repeats) -- batched pack is bit-identical to per-row and raises no gfx1201
+HSA fault. Acceptance/per-position rates identical in the live A/B.
+
+**Warm A/B** (each arm verified warm, c1 ≈ 68, before measuring; `ab.env` BATCH 0 vs 1):
+
+| workload | per-row | batched |
+|---|--:|--:|
+| repetitive c1 | 61.8 | 61.9 |
+| repetitive c8 | 130.8 | 132.1 |
+| generic c1 | 67.9 (base) | 67.8 |
+| generic c8 | 357.2 (base) | 362.7 |
+
+All within run spread. So the per-row launches/syncs are **not** on the critical path at these
+context sizes -- the target forward dominates, and the adaptive gate already skips the matcher
+entirely on generic content. Batching is a lossless reduction in per-step ops with **no regression**;
+kept as the default (expected to matter more at long context, where the window scan is larger). No
+registry change needed (default on); `ab.env` removed.
+
+**Ops note (re-confirmed).** After a reload the *first* boot can be ~3x slow (observed c1 **22 t/s**)
+while AOT/graph state settles; the next warm restart returned **71.0 t/s**. Always re-verify c1 ≈ 68
+before measuring, never trust the first post-reload boot.
+
+## 2026-10-01 (cont. 65) — A9/OS3 lazy-GDN: overlay repaired, but **blocked on an r4d.so rx10 rebuild**
+
+**What I set out to do.** Implement E3 route 3c (fail-closed lazy-GDN rollback). The empirical first
+step is to make `RADIANCE_GDN_LAZY=1` *boot*, then reproduce the multi-turn corruption.
+
+**Finding 1 — the overlay had drifted and was un-appliable (crash-loop risk).**
+Enabling lazy aborted entrypoint (`patch_gdn_lazy.py` `apply` raises) → the container **crash-looped
+(RestartCount 17)**. `_patchlib.apply` reported `anchor matched 0x` on `abstract.py`. Audit of all 16
+anchors: **8 mismatched**. Upstream had changed the source (`num_speculative_blocks` now guards
+`cache_config.use_kda_recoverssm` and uses `vllm_config.num_speculative_tokens`; kernel sigs gained
+`TEMPORAL_TILES`; `initialize_from_forward_context` now delegates to `_populate_metadata`;
+`get_mamba_groups` return annotation changed). I repaired all 8 anchors in `patch_gdn_lazy.py`; the
+audit is now **16/16 OK** and the patch applies (`patch_gdn_lazy: done`).
+
+**Finding 2 — the base image's libr4d has NO lazy kernels.** With the patch applying, the engine logged:
+`[radiance.gdnmerge] gdn fused counter init failed: RuntimeError('RADIANCE_GDN_LAZY=1 but this libr4d
+has no gdn_lazy_update kernel (needs rx10+)')`, then HSA-faulted during CUDA-graph capture. The mounted
+`/r4d/r4d.so` (v0.5.0-w4a16, 1.9 MiB) predates the `r4d_gdn_lazy_update_k128_v128` extras in
+`r4d_radiance_extras_rx10.patch`; the host cache has only `b9e42ab-rx6`, `b9e42ab-rx9`, `v0.5.0-w4a16`
+— **no `…-rx10`**.
+
+**Consequence.** OS3/A9 is **not** a no-rebuild item: the *Python* side is runtime-only (now repaired
+and ready), but the *kernel* side needs `libr4d` rebuilt with the rx10 extras (`AUTO_R4D` /
+`R4D_KEY=…-rx10`) and mounted at `/r4d`. The configured `vllm_config.num_speculative_tokens` plumbing
+means `abstract.py` must be patched for the kernel too. **Reclassified: rebuild-class (libr4d rx10),
+user-owned.**
+
+**Measured payoff (motivates the rebuild).** With lazy enabled the KV pool grew
+**171,320 → 190,157 tokens (+11%, 1.07× → 1.19× concurrency for 160k)** because the per-request spec
+blocks drop 9 → 3. Worth the rx10 rebuild.
+
+**Recovery.** lazy reverted (`ab.env` removed), warm restart: health 200, c1 **70.9** (cold boot was
+21.3 as usual). Site-packages keep the now-inert lazy patched code (all runtime-gated by
+`RADIANCE_GDN_LAZY`).
+
+**Ops hazard noted.** A single stale env-gated overlay aborts entrypoint under `set -e` and crash-loops
+the container. Consider making optional overlays loud-but-non-fatal, or validating anchors at apply
+time before the service is torn down.
