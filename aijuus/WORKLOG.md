@@ -2107,3 +2107,34 @@ c1 −1.8%. Revert = remove that one key.
   running container still uses the repurposed `v0.5.0-w4a16` dir (which holds the rx10 `.so`). After
   the redeploy, restore `~/.cache/radiance-libr4d/v0.5.0-w4a16/r4d.so` to the stock build
   (`/tmp/kilo/r4d_stock.so`, sha `b83307c8`) so the dir is honest.
+
+## 2026-10-01 (cont. 71) — vllm-0 crashed under BetterBench: prefill-chunk OOM (KV over-provision)
+
+First proper BetterBench run on vllm-0 (lazy on), `aijuus/bench/vllm0-lazy.betterbench.{json,html}`:
+
+- **single-stream** combined decode **90.3 t/s** median, update p99 **54.3 ms**, TTFT p50 **83 ms**
+  (chat 70.2 · code 91.9 · file_edit 104.0 · json 110.1 · math 103.7 · prose 64.1 · reasoning 81.3 ·
+  summarization 99.4).
+- **prefill** PP t/s median 1924 (2k) / 2388 (8k) / 2570 (16k) — then **32k and 64k FAILED**.
+
+**Failure.** At 12:16:47 (prefill depth ~32000) EngineCore hit
+`torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.03 GiB. GPU 0 has a total capacity of
+31.86 GiB of which 0 bytes is free ... 27.61 GiB allocated by PyTorch ... 2.45 GiB reserved but
+unallocated`. Stack: `radiance.mxfp4_linear_pq` (`radiance_mxfp4.py:610`) allocating the `(M, N)` bf16
+output of the W4A8 GEMM for the 16384-token chunk. The engine died → every 32k/64k prefill retried 500,
+then connection-refused; the concurrency sweep (1/2/4/8, all 0/48) is **invalid** (engine already gone).
+The container auto-restarted via its restart policy (Kilo did not restart it) and came back healthy.
+
+**Cause: KV pin is over-provisioned vs `max_model_len`.** Same 6.5 GiB pin now yields **190,157 tokens**
+(36,704 B/tok) but `max_model_len=160,000` → **30,157 tokens = ~1.03 GiB of KV is unusable** — exactly
+the failed allocation. (Lazy lowered per-token KV cost so the same bytes hold +11% more tokens; the
+device KV bytes are unchanged, so lazy is not the trigger, the pin is.) The 16k depth fits, 32k (2nd
+chunk with the growing KV in flight) does not.
+
+**Fix options (all need a restart, which the user owns):**
+1. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** (server_env) — reclaims the **2.45 GiB**
+   reserved-but-unallocated fragmentation the error itself flags; >1.03 GiB shortfall with margin,
+   leaves chunk 16384 and KV 6.5 GiB untouched. Lowest behavioural risk. **Recommended first.**
+2. Right-size KV: `kv_cache_memory` 6.5 GiB → **~5,873,000,000** (~160k tokens) frees the ~1.03 GiB
+   over-provision (user-preferred axis) but is an exact-fit with no margin.
+3. Chunk 16384 → 12288 shrinks the peak activation (0.77 GiB) — a milder cut than the rejected 4k.

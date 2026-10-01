@@ -11,14 +11,24 @@ deferred) · **DORMANT** (implemented, env-gated off).
 verified** before measuring (a single warm restart was not always enough; seeding the Triton cache
 from the intact vllm-1 dir helped). Never measure an unverified boot.
 
-## 0. Remaining tasks — refreshed cont.69
+## 0. Remaining tasks — refreshed cont.71
 
 **Closed since the previous index:** M1 (n-gram HSA fix + enablement, cont.59–63) · **C1/C2** batched
 matcher (cont.64) · **rx10 libr4d** built + live (cont.66, +6%) · **lazy GDN (OS3/E3)** fixed + enabled
-(cont.67–69, KV +11%) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60) · A1–A5 · A10 · A11
+(cont.67–69, KV +11%) · **first BetterBench on vllm-0** (cont.71; single-stream combined 90.3 t/s,
+TTFT p50 83 ms) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60) · A1–A5 · A10 · A11
 (dormant, kept) · OK3–OK7 · PF1/PF5/PF6/PF7 · K1–K3 · T1/T2 · MT1/MT2 · X2 (N/A for V2) · V1 (N/A, V1-only).
 
 **A. No-rebuild, actionable now (top):**
+0. **vllm-0 OOM at ≥32k prefill (cont.71) — BLOCKER for long context.** BetterBench's 32k and 64k
+   prefill depths OOM the engine in `radiance.mxfp4_linear_pq` (bf16 out 1.03 GiB, 0 free; container
+   auto-restarted). Cause: the 6.5 GiB KV pin now yields **190,157 tokens** but `max_model_len` is
+   160,000 → **~30,157 tokens ≈ 1.03 GiB of KV is unusable** (exactly the failed alloc). Fixes (each
+   needs a restart, user-owned, in priority order): **(1)** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+   in `server_env` — reclaims the 2.45 GiB reserved-unallocated fragmentation (recommended first;
+   keeps chunk/KV); **(2)** `kv_cache_memory` → `~5,873,000,000` (→~160k tokens, frees ~1.03 GiB,
+   user-preferred axis but exact-fit); **(3)** `max_num_batched_tokens` 16384→12288. The 32k/64k prefill
+   and the whole concurrency sweep (1/2/4/8) in `aijuus/bench/vllm0-lazy.betterbench.json` are INVALID.
 1. **rx10 libr4d — BUILT and LIVE (cont.66): +6% c1/c8.** `b9e42ab-rx10/r4d.so` now serves; its
    rx9 narrow-state kernels fixed the declined fp16 GDN fused path. Remaining: repoint the compose
    mount to `b9e42ab-rx10` (done) and redeploy; validate numerics (acceptance moved 1.93→2.17).
