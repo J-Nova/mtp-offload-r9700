@@ -2553,6 +2553,41 @@ tree cannot beat MTP-only by a meaningful margin in an oracle simulation, the re
 - Registry left at `RADIANCE_DRAFT_NGRAM=0` (MTP-only). Model-registry n-gram knobs trimmed to just
   `RADIANCE_DRAFT_NGRAM=0` (the experimental knobs removed).
 
+## 2026-10-01 (cont. 89) -- A/F/G/H: libr4d M=64 kernels (A) built+deployed; F N/A; G/H config-gated
+
+Boot-log review of vllm-1 surfaced four items.
+
+**A (done): small-M GEMM kernels.** The deployed r4d.so was the lean rx build (no m64/w4a16) -- but the
+BAKED image's r4d.so HAD `gemm_bf16_nt_m64` / `w4a16_nt_m64` / `w4a8_nt_m64`; mounting the lean build
+dropped them. Root: the rx10 host tree was based on an older libr4d commit (`b9e42ab`) that predates those
+kernels; upstream tag **v0.5.0** has them.
+- Built **rx11 = libr4d v0.5.0 + `r4d_radiance_extras_rx10.patch`** (merged 3 rejects: build.sh UNITS,
+  r4d_module.hip pybind defs, r4d_registry.hip `cAr3Exact`; kept the v0.5.0-only units quant_act_i8 +
+  dflash_conv). Source tree `/tmp/kilo/libr4d-v0.5.0`; artifact `~/.cache/radiance-libr4d/b9e42ab-rx11/r4d.so`
+  (sha 8d9b8096..., 2,629,000 B, `r4d.__version__=0.5.0`, exports all four gemm kernels + gdn lazy/fused +
+  ar_3rank).
+- **Deployed** to the LIVE mount dir `~/.cache/radiance-libr4d/v0.5.0-w4a16/r4d.so` (both instances mount
+  this, NOT b9e42ab-rx10 as the compose grep suggested); backup `r4d.so.lean-backup`. Restarted vllm-0:
+  **`libr4d 0.5.0, 27 kernels, 22/23 queries`; `gemm_nt M=64 bf16/w4a16/w4a8` now RESOLVE** (no fallback),
+  and the `[radiance.gemm] no gemm_nt kernel` + `[radiance.w4] no w4a16` disabled-lines are gone.
+- Throughput quick-check on v0 (rx11, MTP-only 5x1024): repeat 112.0 / agent 95.4 / novel 53.4 vs lean
+  123.1/100.5/53.6 -- within the ~+-5% GPU-throttle noise; **no resolvable gain** but the fallback is gone.
+- **vllm-1 must be restarted** to pick up rx11 (same mount). Revert = restore `v0.5.0-w4a16/r4d.so.lean-backup`.
+
+**F (parked): cuteDSL/CUTLASS.** `ll_bf16.is_available()` imports `cutlass` + `cutlass.cute`, and the tuned
+configs are SM100f (NVIDIA Blackwell). **Not applicable on gfx1201/ROCm** -- parked.
+
+**G (config-gated): fused CUDA GDN decode.** `_fused_gdn_decode_unsupported_reason` requires
+`recurrent_state_dtype in FUSED_GDN_STATE_DTYPES = (float32, bfloat16)`; we pass
+`--mamba-ssm-cache-dtype float16` -> blocked, so `gdn_decode_kernel` resolves to `triton`. Enabling needs
+`mamba_ssm_cache_dtype` -> bf16 or fp32 (conv cache is already bf16). Interacts with GDN-lazy (fp16 state)
+and doubles SSM-state memory for fp32. A/B needed (accuracy+throughput).
+
+**H (investigate): mamba dtype mismatch.** Model config says `mamba_ssm_dtype='float32'`; we override the
+SSM state to `float16` (kept for memory / GDN-lazy / possible stochastic-rounding). fp16 is NOT in
+FUSED_GDN_STATE_DTYPES (blocks G) and is the least accurate state dtype. No stochastic-rounding env is set
+(currently), so fp32/bf16 is switchable. A/B `fp16 vs bf16 vs fp32` (acceptance/quality + tok/s) needed.
+
 **TODO:** bake the overlay so this can't recur -- either clear the injected tail at boot before patching,
 or make `edit()` replace an existing tail instead of skipping.
 

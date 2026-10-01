@@ -359,6 +359,10 @@ Prompt-lookup (Triton + Arctic) and tree verification are exhausted (cont.79-88:
 | M4 | Dynamic depth schedule | throughput | NEXT (overlay A/B) | retune `num_speculative_tokens_per_batch_size=[[1,2,5],[3,8,4]]` vs the current acceptance profile (draft ~8, accept ~2.7-3.5). |
 | M5 | Serving temp/top-p | acceptance | PRODUCT decision | lower temp raises acceptance but changes output semantics -- not a free speedup. |
 | M6 | Kernels (R4D decode / GEMM / GDN-lazy / offload) | throughput | partly done | rx10 libr4d +6.5/+5.5%, GDN lazy, offload E1 applied; R4D decode/GEMM further tuning possible. |
+| M7 | libr4d small-M (M=64) GEMM kernels | throughput | **DONE (cont.89)** | rx11 = libr4d v0.5.0 + rx10 extras; `gemm_nt M=64 bf16/w4a16/w4a8` now resolve (was fallback). Deployed to live mount `~/.cache/radiance-libr4d/v0.5.0-w4a16` (backup `.lean-backup`); vllm-1 needs restart. Gain within noise. |
+| M8 | Fused CUDA GDN decode | throughput | OPEN (config-gated) | blocked by `mamba_ssm_cache_dtype=float16` (needs fp32/bf16 recurrent state, `FUSED_GDN_STATE_DTYPES`); interacts with GDN-lazy + SSM-state memory. A/B `mamba_ssm_cache_dtype` fp16 vs bf16 vs fp32. |
+| M9 | cuteDSL/CUTLASS `ll_bf16_gemm` | throughput | **N/A (cont.89)** | requires NVIDIA `cutlass.cute`, SM100f-tuned -> not usable on gfx1201/ROCm. Parked. |
+| M10 | mamba SSM state dtype (fp16 vs model's fp32) | accuracy/throughput | OPEN | fp16 state diverges from model config, blocks fused GDN, least accurate. A/B needed. |
 
 **Highest-value bounded next step:** overlay A/B of **M1 (draft-head precision/vocab)** + **M4 (depth schedule)**,
 measuring per-position acceptance + tok/s (no output-semantics change).
