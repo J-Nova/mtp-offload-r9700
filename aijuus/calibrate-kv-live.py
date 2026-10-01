@@ -356,7 +356,14 @@ def main():
         set_pin(reg, int(final))
         save_reg(reg)
         say("written to %s" % REGISTRY)
-        say("NOTE: restart %s (or POST /reload) so the live server picks it up." % INSTANCE)
+        # The sweep leaves the server on the last ATTEMPTED pin, which after a backoff is not the
+        # final value -- reload once so the live server really runs the chosen pin.
+        ra = attempt(final, chunk, reg, True, controller)
+        results.append(ra)
+        if ra["pass"]:
+            say("applied: %s now serves the final pin (%s tokens)" % (INSTANCE, ra["facts"]["tokens"]))
+        else:
+            say("WARNING: final pin failed on re-apply: %s" % ra.get("reason", ""))
     finally:
         if final is None:
             # abort -- leave the registry exactly as we found it
