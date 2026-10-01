@@ -138,15 +138,13 @@ def container_networks(cid):
     return out
 
 
-def restart_count(instance):
+def started_at(instance):
+    """Docker's .RestartCount does NOT move on a manual `docker restart`; the
+    container's StartedAt does, so it is the reliable 'has it rebooted?' signal."""
     cid = container_id(instance)
     if not cid:
-        return -1
-    r = sh("docker", "inspect", "-f", "{{.RestartCount}}", cid)
-    try:
-        return int(r.stdout.strip())
-    except ValueError:
-        return -1
+        return ""
+    return sh("docker", "inspect", "-f", "{{.State.StartedAt}}", cid).stdout.strip()
 
 
 def instance_base(instance):
@@ -292,7 +290,7 @@ def attempt(pin, chunk, reg, controller, base, good_pin):
     set_pin(reg, "" if pin is None else int(pin))
     save_reg(reg)
     since = time.strftime("%Y-%m-%dT%H:%M:%S")
-    rc0 = restart_count(INSTANCE)
+    st0 = started_at(INSTANCE)
     if controller:
         controller_reload_async(controller)
     else:
@@ -305,7 +303,7 @@ def attempt(pin, chunk, reg, controller, base, good_pin):
     while time.time() < deadline:
         if fatal_seen(INSTANCE, since):
             break
-        if restart_count(INSTANCE) > rc0:
+        if started_at(INSTANCE) != st0:
             restarted = True
             break
         time.sleep(2)
