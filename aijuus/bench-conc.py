@@ -18,8 +18,9 @@ import urllib.request
 
 API_KEY = os.environ.get("BENCH_API_KEY") or os.environ.get("VLLM_API_KEY") or ""
 
-PROMPT = ("Write a detailed technical explanation of how a B-tree index works, why node splits "
-          "happen, and how the fanout affects lookup cost. Be specific and do not repeat yourself.")
+PROMPT = os.environ.get("BENCH_PROMPT") or (
+    "Write a detailed technical explanation of how a B-tree index works, why node splits "
+    "happen, and how the fanout affects lookup cost. Be specific and do not repeat yourself.")
 
 
 def _req(url, body=None, headers=None):

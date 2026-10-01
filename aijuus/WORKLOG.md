@@ -1845,3 +1845,15 @@ c1 71.3 / c8 371.6, and higher acceptance. **Keep EXACTSET=1** (registry already
 fusion off (`FUSE_RMS_QUANT=0`+`FP8_STREAM=0`) → 1949 tok/s (TTFT 7989 ms). **−12.6%** → the fusion
 earns its keep; **keep it on**. P6 (folding the attention-output→o_proj quant) would chase headroom the
 fusion already captures; deprioritised.
+
+## 2026-10-01 (cont. 61) — A2/A3 n-gram workload A/B
+
+Repetition-heavy code prompt (~3.7k tok), warm:
+| arm | c1 | c8 |
+|---|--:|--:|
+| NGRAM=0 (generic mix ref) | 46.6 | 82.1 |
+| NGRAM=1 (M1 fix) | **50.9 (+9%)** | **109.1 (+33%)** |
+
+So n-gram is a **large win on repetitive/code content** (+33% c8) and a loss on the generic mix
+(-15%, cont.59). Workload-dependent → keep default-off unless the deployment is code/repetitive-heavy;
+A3 (depth+ngram) is the same axis and is covered by this. (extended_rows ~3% here.)
