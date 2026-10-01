@@ -1857,3 +1857,21 @@ Repetition-heavy code prompt (~3.7k tok), warm:
 So n-gram is a **large win on repetitive/code content** (+33% c8) and a loss on the generic mix
 (-15%, cont.59). Workload-dependent → keep default-off unless the deployment is code/repetitive-heavy;
 A3 (depth+ngram) is the same axis and is covered by this. (extended_rows ~3% here.)
+
+## 2026-10-01 (cont. 62) — adaptive n-gram gate implemented + enabled
+
+Deep research (dynamic n-gram gating) → implemented a **per-request productivity gate** in
+`patch_dynamic_depth.py` (`RUNNER_TAIL`): per-request EMA of extend-rate + warmup + periodic probe,
+per-row skip, and a **batch-level early return** (no gather/launches/syncs when the whole batch is
+cold). Gated `RADIANCE_DRAFT_NGRAM_ADAPT`; output lossless (cold rows keep their MTP draft).
+
+Warm A/B (c1 / c8):
+| workload | NGRAM=0 | NGRAM=1 static | NGRAM=1 + ADAPT |
+|---|--:|--:|--:|
+| generic | 67.8 / 369 | 62.8 / 313.6 | **64.9 / 380.3** |
+| repetitive code | 46.6 / 82.1 | 50.9 / 109.1 | **52.2 / 115.6** |
+
+So the gate **recovers the generic loss** (c8 ≈ baseline) while **retaining the repetitive win**
+(c8 +41% vs NGRAM=0). Enabled **by default** in the registry (`RADIANCE_DRAFT_NGRAM=1`,
+`RADIANCE_DRAFT_NGRAM_ADAPT=1` on both MTP entries); vllm-0 restarted, env confirmed, HEALTHY.
+This turns the manual workload toggle into automatic per-request behavior.

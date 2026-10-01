@@ -123,7 +123,7 @@ Tooling: `aijuus/bench-conc.py` (decode: agg t/s, ms/step proxy, acc/draft, per-
 | # | Item | Result | Decision |
 |---|---|---|---|
 | A1 | E1 enablement | Warm E1-on c1 **71.3** / c8 **371.6** vs off 67.8/369; tier 67.3→71.0%, recompute 25→24%, HEALTH PASS | **ENABLED** in registry (`RADIANCE_OFFLOAD_SUFFIX_INV`/`_EAGLE_INCLUDE`=1 on both MTP entries) |
-| A2/A3 | n-gram workload A/B | Repetitive prompt: NGRAM=1 c1 **50.9 (+9%)** / c8 **109.1 (+33%)**; generic −15% | Workload-dependent → **keep default-off**; enable if code/repetitive-heavy |
+| A2/A3 | n-gram workload A/B | Static NGRAM=1: repetitive c8 **109.1 (+33%)**, generic −15%. **Adaptive gate** (`NGRAM_ADAPT=1`): generic c8 **380.3** (loss recovered), repetitive c8 **115.6 (+41%)** | **ENABLED by default** (`RADIANCE_DRAFT_NGRAM=1`+`_ADAPT=1`) — automatic per-request gating |
 | A4 | EXACTSET/FUSED | EXACTSET=0 c1 67.3/c8 370.4 vs EXACTSET=1 **71.3/371.6** (higher acc) | **Keep EXACTSET=1, FUSED=1** (registry already) |
 | A5 | A1 fusion confirm | fusion on **2230 tok/s** vs off 1949 (−12.6%) | **Keep fusion on**; A6 deprioritised (fusion already captures it) |
 | A6 | o_proj quant fold | — | **Deprioritised** by A5 |
