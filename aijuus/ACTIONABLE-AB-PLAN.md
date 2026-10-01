@@ -115,3 +115,20 @@ Tooling: `aijuus/bench-conc.py` (decode: agg t/s, ms/step proxy, acc/draft, per-
 4. **A5** fusion confirmation (cheap, prefill).
 5. **A10** 8k decision; **A9** E3 implementation (larger).
 6. A6 conditional; A7/A8 N/A/parked.
+
+---
+
+## RESULTS (2026-10-01)
+
+| # | Item | Result | Decision |
+|---|---|---|---|
+| A1 | E1 enablement | Warm E1-on c1 **71.3** / c8 **371.6** vs off 67.8/369; tier 67.3→71.0%, recompute 25→24%, HEALTH PASS | **ENABLED** in registry (`RADIANCE_OFFLOAD_SUFFIX_INV`/`_EAGLE_INCLUDE`=1 on both MTP entries) |
+| A2/A3 | n-gram workload A/B | Repetitive prompt: NGRAM=1 c1 **50.9 (+9%)** / c8 **109.1 (+33%)**; generic −15% | Workload-dependent → **keep default-off**; enable if code/repetitive-heavy |
+| A4 | EXACTSET/FUSED | EXACTSET=0 c1 67.3/c8 370.4 vs EXACTSET=1 **71.3/371.6** (higher acc) | **Keep EXACTSET=1, FUSED=1** (registry already) |
+| A5 | A1 fusion confirm | fusion on **2230 tok/s** vs off 1949 (−12.6%) | **Keep fusion on**; A6 deprioritised (fusion already captures it) |
+| A6 | o_proj quant fold | — | **Deprioritised** by A5 |
+| A7 | TF4 TunableOp | no env in our stack (fixed table, tuning off) | **N/A** |
+| A8 | TF6/TF7 | need tcclaviger-fork internals | **Parked** (pending TF5) |
+| A10 | 8k chunk | short-prompt harness can't test long-context concurrency; PF1 showed prefill chunk-independent at 8k | **Keep 16384** |
+| A11 | dormant D1/D2 | D1 conf-exit A/B-negative; D2 mamba scratch-zero perf-neutral | **Keep dormant**; D2 available as hardening |
+| A9 | E3 host-ring | — | **Remaining** — the only substantive no-rebuild feature left (pure-Python; lazy is off today so it's a memory win) |
