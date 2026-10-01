@@ -48,7 +48,9 @@ REPO = HERE.parent
 
 MODEL_KEY = os.environ.get("MODEL_KEY", "mtp-27B-MXFP4-blend")
 INSTANCE = os.environ.get("INSTANCE", "vllm-0")
-CONTROLLER = os.environ.get("CONTROLLER", "http://172.18.0.5:8101")
+CONTROLLER = os.environ.get("CONTROLLER", "")          # empty -> auto-discover on the compose net
+CONTROLLER_SERVICE = os.environ.get("CONTROLLER_SERVICE", "model-controller")
+RELOAD_PORT = int(os.environ.get("RELOAD_PORT", "8101"))
 API_KEY = os.environ.get("VLLM_API_KEY", "juup-123")
 REGISTRY = Path(os.environ.get("MODEL_REGISTRY_FILE", str(HERE / "model-registry.json")))
 INSTANCE_PORT = {"vllm-0": 8000, "vllm-1": 8001}
@@ -114,6 +116,19 @@ def container_id(instance):
     return ids[0] if ids else None
 
 
+def container_networks(cid):
+    if not cid:
+        return {}
+    r = sh("docker", "inspect", "-f",
+           "{{range $n,$v := .NetworkSettings.Networks}}{{$n}}={{$v.IPAddress}} {{end}}", cid)
+    out = {}
+    for tok in r.stdout.split():
+        n, _, a = tok.partition("=")
+        if a:
+            out[n] = a
+    return out
+
+
 def instance_base(instance):
     override = os.environ.get("VLLM_BASE")
     if override:
@@ -121,12 +136,26 @@ def instance_base(instance):
     cid = container_id(instance)
     if not cid:
         die("no container for service %r (is the compose up?)" % instance)
-    r = sh("docker", "inspect", "-f",
-           "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", cid)
-    ip = next((t for t in r.stdout.split() if t), None)
+    ip = next((a for a in container_networks(cid).values() if a), None)
     if not ip:
         die("could not resolve an IP for %s" % instance)
     return "http://%s:%d" % (ip, INSTANCE_PORT.get(instance, 8000))
+
+
+def controller_base():
+    """The controller may have no published port; find it on the instance's network."""
+    if CONTROLLER:
+        return CONTROLLER.rstrip("/")
+    cid = container_id(CONTROLLER_SERVICE)
+    if not cid:
+        die("no container for controller service %r (is the compose up?)" % CONTROLLER_SERVICE)
+    nets = container_networks(cid)
+    inst_nets = container_networks(container_id(INSTANCE))
+    ip = next((a for n, a in nets.items() if n in inst_nets), None) or \
+        next((a for a in nets.values() if a), None)
+    if not ip:
+        die("could not resolve an IP for the controller")
+    return "http://%s:%d" % (ip, RELOAD_PORT)
 
 
 def read_logs(instance, tail=3000):
@@ -183,16 +212,16 @@ def wait_health(base, timeout):
     return False
 
 
-def reload_instance():
-    st, body = get_json("POST", CONTROLLER.rstrip("/") + "/reload",
+def reload_instance(controller):
+    st, body = get_json("POST", controller + "/reload",
                         {"model": MODEL_KEY, "instance": INSTANCE}, timeout=RELOAD_TIMEOUT)
     return st, body
 
 
 def probe(base, model, chunk, timeout=600):
     """One CHUNK-sized prefill + a short decode -- upstream's PASS test."""
-    n_words = max(64, int(chunk * 1.05 / 11))  # ~11 tokens per phrase
-    prompt = "the quick brown fox jumps over the lazy dog. " * (n_words // 9 + 1)
+    reps = max(16, int(chunk * 1.05 / 11))  # ~11 tokens per 9-word phrase
+    prompt = "the quick brown fox jumps over the lazy dog. " * reps
     body = {"model": model, "prompt": prompt, "max_tokens": 32, "temperature": 0}
     return http_status("POST", base + "/v1/completions", body, timeout=timeout)[0]
 
@@ -201,12 +230,12 @@ def served_name(reg):
     return reg[MODEL_KEY].get("served_name") or MODEL_KEY
 
 
-def attempt(pin, chunk, reg, do_reload):
+def attempt(pin, chunk, reg, do_reload, controller):
     """Set pin (or profile if None), (optionally) reload, probe. Returns a dict."""
     set_pin(reg, "" if pin is None else int(pin))
     save_reg(reg)
     if do_reload:
-        st, body = reload_instance()
+        st, body = reload_instance(controller)
         if st != 200 or not body.get("ok"):
             return {"pin": pin, "pass": False, "reason": "reload failed: %s %s" % (st, body)}
     else:
@@ -246,7 +275,7 @@ def main():
     say("registry:  %s" % REGISTRY)
     say("model:     %s (served as %r)" % (MODEL_KEY, served_name(reg)))
     say("instance:  %s @ %s" % (INSTANCE, instance_base(INSTANCE) if container_id(INSTANCE) else "(not running)"))
-    say("controller:%s" % CONTROLLER)
+    say("controller:%s" % (CONTROLLER or "(auto-discover on the compose net)"))
     say("shape:     chunk=%d maxlen=%d spec=%s maxseqs=%s" % (
         chunk, maxlen, entry.get("spec_tokens", "?"),
         entry.get("server_env", {}).get("MAX_NUM_SEQS", "8")))
@@ -261,6 +290,7 @@ def main():
         say("        then back off %d step(s); would write the best pin to the registry" % BACKOFF_STEPS)
         return
 
+    controller = controller_base()
     explicit = [int(float(x)) for x in args.pins.split(",") if x.strip()]
     results = []
     final = None
@@ -276,7 +306,7 @@ def main():
         if explicit:
             for pin in explicit:
                 say("trying %d bytes (%.2f GiB)" % (pin, pin / GIB))
-                r = attempt(pin, chunk, reg, True)
+                r = attempt(pin, chunk, reg, True, controller)
                 results.append(r)
                 say("  %s%s" % ("PASS" if r["pass"] else "FAIL",
                                 "" if r["pass"] else " -- " + r.get("reason", "")))
@@ -287,7 +317,7 @@ def main():
                 die("no explicit pin passed", "try smaller pins")
         else:
             say("pass 1/2: profiling run (kv_cache_memory=\"\")")
-            r1 = attempt(None, chunk, reg, True)
+            r1 = attempt(None, chunk, reg, True, controller)
             results.append(r1)
             if not r1["pass"]:
                 die("the profiling run itself failed: %s" % r1.get("reason", ""),
@@ -306,7 +336,7 @@ def main():
                 for step in range(1, MAX_STEPS + 1):
                     try_pin = int(base * (1 + STEP * step))
                     say("  +%.0f%%: %d bytes (%.2f GiB)" % (STEP * step * 100, try_pin, try_pin / GIB))
-                    r = attempt(try_pin, chunk, reg, True)
+                    r = attempt(try_pin, chunk, reg, True, controller)
                     results.append(r)
                     if r["pass"]:
                         say("    served, %s tokens" % r["facts"]["tokens"])

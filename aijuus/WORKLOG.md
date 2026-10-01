@@ -2187,3 +2187,17 @@ Modes: default sweep (profile → +2% × 6 → back off 1 step); `--quick` (prof
 It reloads (restarts) the target instance — a deployment op, so the user runs it. Verified compiling +
 `--dry-run` only so far (the compose was down at time of writing). Because we want the *minimum* pin
 that holds 160k tokens (not the max), an explicit `--pins 5.87e9,6.06e9,6.5e9` run is the most direct.
+
+## 2026-10-01 (cont. 74) — OOM fix VALIDATED on the live server; harness controller auto-discovery
+
+- **`calibrate-kv-live.py` fix:** the controller has no published port, so the hardcoded
+  `172.18.0.5:8101` was stale after the compose restart. It now **auto-discovers** the controller by
+  compose-service label and picks its IP on the same network as the instance (`container_networks`),
+  `CONTROLLER=` override still wins. Also fixed the CHUNK-sized probe prompt (it was ~1/9 of a chunk).
+- **Validation (live vllm-0):** `'max_num_batched_tokens': 12288`, `GPU KV cache size: 190,157 tokens`.
+  `calibrate-kv-live.py --no-reload` → CHUNK-sized prefill **HTTP 200**, `oom=False`. Then a direct
+  **32k-token prefill** (the exact BetterBench case that failed at cont.71) → **HTTP 200 in 8.1 s**.
+  The OOM is gone; chunk 16384→12288 is the confirmed fix.
+- Registry pin was restored by the `--no-reload` run (it changes nothing); the registry still carries
+  `kv_cache_memory=6979321856` (190,157 tokens). Optional next: reclaim the ~1.03 GiB that 160k can
+  never use via `calibrate-kv-live.py --pins 6.06e9` (≈165k tokens) — a reload, user-run.
