@@ -1875,3 +1875,24 @@ So the gate **recovers the generic loss** (c8 ≈ baseline) while **retaining th
 (c8 +41% vs NGRAM=0). Enabled **by default** in the registry (`RADIANCE_DRAFT_NGRAM=1`,
 `RADIANCE_DRAFT_NGRAM_ADAPT=1` on both MTP entries); vllm-0 restarted, env confirmed, HEALTHY.
 This turns the manual workload toggle into automatic per-request behavior.
+
+## 2026-10-01 (cont. 63) — variant B: independent n-gram depth (enabled)
+
+Deep research: the "row width == scheduled K" rule is a stale workaround for the misdiagnosed HSA
+fault — the worker-driven width means a request's draft list length is free (≤ SPEC=8, capture ladder
+must cover 1+M). So an independent n-gram depth is overlay-only. Implemented variant B in
+`patch_dynamic_depth.py`: `RADIANCE_DRAFT_NGRAM_DEPTH` (M), `_BS_MAX` (apply M only at bs≤2),
+`_NGRAM_MIN` (decoupled gate: `mlen>=STRONG and cl>=MIN`, emit `min(cl,M)`), `W=max(K,M)` on fired
+steps. Adaptive gate/`NGRAM=1` unchanged.
+
+Warm A/B on the repetitive code probe (M=8 at bs≤2 vs adaptive M=K):
+| arm | repetitive | generic |
+|---|--:|--:|
+| adaptive (M=K) | c1 52.2 | c1 64.9 / c8 380.3 |
+| variant B | **c1 56.8 (+8.8%)**, c2 96.3 | **c1 70.7 (+9%)**, c8 361.9 (M not applied at R>2; ≈noise) |
+No wedge; HEALTHY. So there **is** headroom at bs1-2 (K was binding on repetitive), and M>K is safe
+now that `_nblk` is fixed. **Enabled by default** in the registry (`NGRAM_DEPTH=8`, `NGRAM_BS_MAX=2`).
+
+Note: the `cl/mlm` histogram print was finicky (the `RADIANCE_DRAFT_NGRAM_HIST` env didn't reach the
+EngineCore, so I made recording unconditional; the print still didn't surface in `docker logs` this
+session). Variant B's own gain demonstrates the headroom; the histogram can be revisited if needed.
