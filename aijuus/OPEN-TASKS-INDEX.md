@@ -34,7 +34,7 @@ MT1/MT2 (inherent, closed), K2/K3/P4/X2/T1/T2/M2, PF1, V1 (static), ST6.
 
 | ID | Task | Status | Source | Blocker | Effort |
 |---|---|---|---|---|---|
-| M1 | N-gram tail HSA fault at bs≥2. | **FIXED** cont.58 | Overlay fix in `patch_dynamic_depth.py` (host-staged ctx from the pinned CPU source instead of the UVA torch gather; `num_computed_tokens` from its CPU mirror; `_nblk` window **size** not base; clamp `n`). `NGRAM=1` now runs bs≥2 cleanly. **NGRAM stays default-off** (net -7.5%/-16% c1/c8 on our mix; ~8% extended rows). |
+| M1 | N-gram tail HSA fault at bs≥2. | **FIXED (one line)** cont.59 | Cause = `_nblk` passed the window *base* not *size* → scan grid ~9x too big → `q` past `ML` → unmasked suffix load OOB (gfx1201 HSA). Fix: `gpu._nblk(n, window_size)` in `patch_dynamic_depth.py`. Not the UVA gather / not syncs. **NGRAM default-off** (net -7.4%/-15% c1/c8; ~8% extended rows). |
 | M2 | **`RADIANCE_DRAFT_HEAD_TOP1`** — drop the arm (neutral + mutually exclusive with the vocab prune; crashes on reload). Registry stays off. | **CLOSED (dropped)** | WORKLOG cont.28 3b, cont.29 | no code change |
 
 ## 2. Calibration / config debt

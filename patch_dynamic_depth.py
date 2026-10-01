@@ -148,23 +148,12 @@ def _radiance_ngram_extend(runner, input_batch, base_tokens):
     dev = base_tokens.device
     if R == 0 or K <= 0:
         return base_tokens
-    # M1 fix: read the pinned CPU sources of truth and stage with a host gather + H2D, instead of a
-    # torch gather over the UVA host-mapped `all_token_ids` (an engine-only op never exercised by the
-    # standalone repro; a torch gather over the 160k-column UVA host aperture is the prime suspect for
-    # the gfx1201 HSA fault). R is 1..8, so the H2D is small.
-    _idx_np = idx.cpu().numpy()
-    n_np = st.num_computed_tokens_np[_idx_np].astype(np.int32)
+    n_gpu = st.num_computed_tokens.gpu.index_select(0, idx).to(torch.int32)
+    n_np = n_gpu.cpu().numpy()
     nmax = int(n_np.max())
     if nmax < 3:
         return base_tokens
-    _uva = getattr(st.all_token_ids, "_uva_buf", None)
-    if _uva is not None:
-        ctx = _uva.cpu.index_select(0, idx.cpu()).to(dev)
-    else:
-        ctx = st.all_token_ids.gpu.index_select(0, idx)
-    # M1 fix: never let n exceed the row width (the kernels' suffix/gather loads are unmasked above ML).
-    n_np = np.minimum(n_np, int(ctx.shape[1])).astype(np.int32)
-    n_gpu = torch.from_numpy(n_np).to(dev)
+    ctx = st.all_token_ids.gpu.index_select(0, idx)
     if nmax > _RAD_NGRAM_WINDOW_FROM:
         base_np = np.maximum(0, n_np - _RAD_NGRAM_WINDOW).astype(np.int32)
     else:

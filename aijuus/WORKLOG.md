@@ -1816,3 +1816,18 @@ fault needs the real engine context; the fix works empirically.
 this mix. T3 measured: ~8% extended rows on the bench prompt (repetitive content would be higher).
 The fault no longer blocks enabling n-gram for repetitive/code workloads; a device-side gather (Triton)
 would remove the sync cost if we ever want it on.
+
+## 2026-09-30 (cont. 59) — M1 fix CORRECTED: it is the `_nblk` grid bug, one line
+
+Follow-up experiment isolated the cause: reverting the context staging to the original **sync-free
+on-device** `index_select` (keeping only the grid fix + clamp) still ran bs>=2 cleanly; then dropping the
+clamp (grid fix only) also ran clean (conc8 x2, HEALTHY). So the fault is **not** the UVA gather and
+**not** host syncs — it is the `_nblk(base vs size)` bug alone: the engine passed the window *base*,
+inflating the scan grid ~9x so `q` ran past `ML` and the unmasked suffix load read outside the row
+(gfx1201 HSA). The fix is one line in `_radiance_ngram_extend`:
+`nblks = [gpu._nblk(int(n_np[i]), _win) for i in range(R)]` (window **size**, not `base_np[i]`).
+
+Perf (warm, NGRAM=1 with the one-line fix): conc1 **62.8** vs 67.8, conc8 **313.6** vs 369 (-7.4% /
+-15%). The per-row matcher launches (not the syncs) outweigh the ~8% extended-row draft gain on our
+mix, so **NGRAM stays default-off**. The fault no longer blocks enabling n-gram for repetitive/code
+workloads (T3: ~8% here). The earlier host-staging variant is unnecessary and was reverted.
