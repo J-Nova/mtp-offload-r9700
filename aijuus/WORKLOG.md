@@ -2273,3 +2273,269 @@ Loaded `chunk=4096` (was 12288) keeping `kv=7,600,000,000` (207,748 tokens) via 
 
 **Net:** 4k chunk + 7.6 GiB is robust end-to-end (long prefill + concurrency + decode), confirming it is
 a safe operating point; decode is not affected by the chunk change.
+
+## 2026-10-01 (cont. 79) — n-gram draft tail: root cause + trust-gated fix (F1/F2/F5/F4)
+
+**Symptom:** concurrent/normal agent traffic showed MTP acceptance collapsing to <5% (unusable decode),
+and responses felt degraded/cut. Isolated probes (math, tool calls, 48k-token retrieval, prefix-cache
+reuse, greedy 8x determinism) were all correct on BOTH models -> the model/kernels were fine; the
+regression was the **draft policy**.
+
+**Root cause (evidence).**
+- Two n-gram implementations exist. `radiance_draft.py::slot_decide` has the good policy (agreement OR
+  long-match OR recency, + confidence/TAU) but hooks the legacy `SpecDecodeBaseProposer._greedy_sample`,
+  which the **vLLM-0.29 V2 runner never calls** (`greedy_sample ENTERED` never logs) -> it is dead code.
+- The live path is runner-side `patch_dynamic_depth.py::_radiance_ngram_extend`: on `mlen >= STRONG(8)`
+  (variant-B: `clen >= NGRAM_MIN(3)`) it **replaces the whole MTP draft** with the verbatim continuation
+  -- no agreement, no confidence, no frequency.
+- The captured agent request repeats tool-schema boilerplate (`"type":"object","properties":{"<name>"`,
+  `"$schema":...`, `"description":"` x9). The matcher finds a long exact suffix match on the boilerplate
+  but the continuation is a DIFFERENT field name -> the target rejects it. Matches saturate
+  (`clen8 1803/2000`, `mlen32 1365/2000`), so the override fires ~every step and throws away the
+  reliable MTP draft -> per-position-0 acceptance bimodal: **0.97 healthy vs 0.028 collapse**, identical
+  on both models. Turning `RADIANCE_DRAFT_NGRAM=0` restored steady 48-70% (A/B confirmed live).
+- `RADIANCE_DRAFT_NGRAM_ADAPT` cannot help: its EMA signal is `ext_flags` = "took a tail" (always ~1),
+  not "was accepted" -> it never disarms.
+- Matcher kernels are correct: `batched_ngram_equiv.py` (batched == per-row) and the GPU selftest pass,
+  so this is **selectivity**, not a kernel bug. (Safety invariant holds: proposals cannot change output.)
+
+**External research (why match length alone is wrong).** vLLM 0.29 ships native Suffix Decoding (Arctic
+`SuffixDecodingCache`, `min_token_prob`=0.1) -- a **frequency-weighted suffix tree** that would not
+speculate on boilerplate. TensorRT-LLM *combines* a suffix automaton with the neural drafter
+(`sa_spec_threshold`) and notes neural is better for novel content. MNN lookahead uses frequency x length;
+SpecDec++/Xu gate on predicted rejection/confidence. `arctic_inference` is not installed here, so the
+frequency idea is ported as a cheap proxy (top-2 determinism).
+
+**Fix design (ranked).** F1 agreement gate (tail slot-0 == MTP slot-0) · F2 determinism gate (top-2
+matches agree on slot-0) · F3 confidence gate (needs V2 conf wiring) · F4 fix adaptive feedback
+(agreement-rate EMA) · F5 threshold hygiene · F6 frequency-weighted suffix matcher (port Arctic).
+
+**Implemented (this cont.):** F1, F2, F4 + F5 partial in `patch_dynamic_depth.py` (runtime overlay, no
+rebuild), behind new knobs `RADIANCE_DRAFT_NGRAM_AGREE` / `_DET` (default ON), `_EMA_MIN` 0.02->0.10.
+`AGREE=0 DET=0` restores the pre-fix behaviour for A/B. F3/F6 deferred. Offline policy test added.
+
+**Validation (offline, no GPU):**
+- `aijuus/patch_dynamic_depth_policy_test.py` -- extracts + execs the injected `RUNNER_TAIL`, asserts
+  the gate declines the boilerplate case and accepts the echo case, and the AGREE/DET toggles. **PASS (9/9).**
+- `ngram_draft_selftest.py` (legacy `slot_decide`) **ALL PASS**; patch file `ast.parse` OK.
+- Applied the patch to the **pristine image** files in a throwaway container: anchors matched, both
+  `speculator.py` and `model_runner.py` patch + `ast.parse` clean -> restart will apply it.
+
+**F3 (confidence gate) is blocked on the served path:** the decode loop is a replayed full CUDA graph
+(`radiance_draft.py` V2_CONF comment), so the draft-head confidence is not visible in Python at
+serving time. F6 (true frequency-weighted suffix matcher, Arctic `min_token_prob`) remains the proper
+end-state but needs kernel work + GPU validation; F2's top-2 determinism is the cheap proxy for now.
+
+**Enable recipe (after you restart):** set in the MTP entry `server_env` `RADIANCE_DRAFT_NGRAM=1`
+(AGREE/DET default ON; optional `RADIANCE_DRAFT_NGRAM_DEPTH=0` to disable variant B). Watch
+`SpecDecoding metrics` per-position acceptance + `[ngram] extended_rows/appended`. Rollback = `=0`.
+
+**Review follow-up (same cont.):** self-review found 3 refinements, all fixed + re-validated (12/12):
+1. DET now takes the other candidate's match length and only vetoes against another **STRONG** match, so
+   a short unrelated 2nd match cannot suppress a valid long one.
+2. The F4 agreement EMA now guards on `clen>0`, so a row whose matcher did not run (pk zeros -> cont 0)
+   cannot fake agreement when MTP's token id is 0.
+3. `RADIANCE_DRAFT_NGRAM_STRONG<=0` restored as an explicit kill-switch (the old `>0` guard was implicit).
+
+## 2026-10-01 (cont. 80) — F6 frequency-weighted n-gram gate (overlay); F3 confirmed blocked
+
+**F6 implemented as a runtime overlay** (Arctic Suffix-Decoding `min_token_prob` idea, no rebuild):
+- `radiance_draft_gpu.py` (overlay, `/patches` = repo root): new `_match_count` Triton kernel +
+  `match_count()` wrapper + `occ`/`agree` int32 buffers in `make_match_buffers`. Per row it scans the
+  context and counts **other occurrences** of the top-1 matched suffix (`L >= Lref`) and how many share
+  the reference continuation's first token. Deterministic (one program per row, no atomics).
+- `patch_dynamic_depth.py`: new knobs `RADIANCE_DRAFT_NGRAM_FREQ` (default **1**), `_MIN_FREQ` (1),
+  `_MIN_PROB` (0.5). `_radiance_ngram_ok` is now: fast path (F1/F2) OR -- when MTP disagrees or the top-2
+  are ambiguous -- allow **only** if `agree_other >= MIN_FREQ` and `(agree+1)/(occ+1) >= MIN_PROB`.
+  Candidate 2 keeps the F1/F2 gates only (freq is measured for the top-1 suffix). The host runs
+  `match_count` on the armed rows and feeds the counts in. `FREQ=0` = F1/F2 only; `AGREE=0 DET=0 FREQ=0`
+  = pre-fix.
+
+**Validation:** `aijuus/ngram_freq_gpu_test.py` -- real Triton `_match_count` vs a CPU longest-suffix
+reference -- **PASS (40 iters, B 1..8, windows 0/256/1024)**; `batched_ngram_equiv.py` still **PASS**;
+policy test **17/17**; patch applies to the pristine image (`model_runner.py` + `speculator.py`) and both
+`ast.parse` clean.
+
+**F3 confirmed BLOCKED (evidence):** the run args show `cudagraph_mode: FULL_AND_PIECEWISE`, so
+`init_cudagraph_manager` sets the draft-decode mode to `FULL_DECODE_ONLY`
+(`speculator.py:154-158`) -- draft decodes are graph-replayed and the Python sampling body
+(`_greedy_sample_draft`) never runs at serving, so draft-head confidence is not host-visible. Enabling it
+would require baking a confidence kernel into the captured draft graph (buffer indexed by
+`current_draft_step`); parked since F1 (agreement) + F6 (frequency) already cover the failure.
+
+**Enable recipe:** `RADIANCE_DRAFT_NGRAM=1` (AGREE/DET/FREQ default ON). Tune `_MIN_PROB` upward for
+stricter override; `_FREQ=0` to fall back to agreement-only; `_NGRAM=0` to disable.
+
+## 2026-10-01 (cont. 81) — CRITICAL: `docker start` did NOT re-apply the overlay; gates were never live
+
+**Symptom:** after "restarting to apply" the F1/F2/F6 gates, acceptance still collapsed (position-0
+0.029, avg 1.3%) and `[ngram] extended_rows` stayed 54-74%. The env change applied but the code did not.
+
+**Root cause:** `docker kill && docker start` reuses the container's **writable layer**. `entrypoint.sh`
+applies `patch_dynamic_depth.py`, but `edit()` returns early when `MARK="patch_dynamic_depth"` is already
+present in `model_runner.py`. The container was created 12:34 with the OLD tail; every subsequent
+`docker start` saw MARK and skipped, so the injected `_radiance_ngram_ok`/F6 host code was never the new
+version. (`radiance_*.py` IS copied unconditionally, so the F6 kernel file was fresh but unused.)
+**A fresh container (recreate) is required for patch-code changes** -- a plain restart only re-applies env.
+
+**Fix applied (overlay, no recreate):** re-inject just the `RUNNER_TAIL` into the running container's
+`model_runner.py` (cut at the tail header `# ---- RADIANCE dynamic draft depth + n-gram tail`, append the
+new `RUNNER_TAIL` extracted from `patch_dynamic_depth.py`), `ast.parse`, then `docker restart`. Anchors are
+unchanged between old/new so only the tail needed replacing. Done for both vllm-0 and vllm-1; backups at
+`/tmp/kilo/mr_backup.py` and `/tmp/kilo/mr_backup_v1.py`. The entrypoint now skips (MARK present) and keeps
+the new tail.
+
+**Live A/B (same model Thinkingcap, same env `_DEPTH=0 _MIN_FREQ=2 _MIN_PROB=0.75`):**
+- **OLD code (vllm-1, before re-inject):** mean avg-acceptance **47.5%**, collapses to **1.3%**
+  (position-0 0.029), `extended_rows` 54-74%.
+- **NEW code (vllm-0):** **7 windows, mean 67.0%, min 55.7%, max 74.8%, zero windows <15%**, position-0
+  0.83-1.00 -- at/above the `NGRAM=0` baseline (~66%) with n-gram still enabled.
+**Conclusion:** the F1/F2/F6 gates work; the earlier "tightening didn't help" was entirely the stale
+overlay. Both instances re-injected + restarted and re-verified (`_radiance_ngram_ok` present).
+
+## 2026-10-01 (cont. 83) -- Arctic SuffixDecoding backend: implemented, offline-validated, LIVE CRASHED (HSA)
+
+Implemented the research-recommended Arctic hybrid backend as an overlay and enabled it; it crashed the
+engine on first live boot, so it is reverted to the Triton backend pending debugging.
+
+- **Dependency:** `pip install --no-deps arctic-inference` (0.3.0, cp312, pure-python wheel built OK) into
+  both containers. `from arctic_inference.suffix_decoding import SuffixDecodingCache` works; API:
+  `start_request(id, prompt_ids)`, `add_active_response(id, ids)`, `speculate(id, context, max_spec_tokens,
+  max_spec_factor, min_token_prob) -> draft{token_ids, score, match_len}`, `stop_request(id)`; **inputs must
+  be int32**.
+- **Overlay:** `patch_dynamic_depth.py` gained `_radiance_arctic_extend` + `RADIANCE_DRAFT_NGRAM_BACKEND`
+  (`triton`|`arctic`), `_NGRAM_TAU` (score gate = expected accepted length), `_ARCTIC_DEPTH/_FACTOR/_MIN_PROB`.
+  Per-request `SuffixDecodingCache`, fed incrementally from `req_states.all_token_ids.gpu` (D2H of the
+  prompt once, then deltas + the last `depth` pattern); takes the suffix draft only when
+  `score >= tau`, else keeps MTP (hybrid). Runtime `InputBatch` uses `idx_mapping_np`,
+  `num_computed_tokens_np`, `prefill_len_np` (NOT `token_ids_cpu`/`num_prompt_tokens`).
+- **Offline:** `aijuus/arctic_hybrid_test.py` (fake InputBatch) -- repeat -> Arctic tail taken,
+  novel -> MTP kept, `tau` too high -> MTP kept. PASS.
+- **Live:** first boot with `BACKEND=arctic` reached full graph capture then **`Queue error:
+  HSA_STATUS_ERROR_EXCEPTION` + `GPU coredump` during `[dyn-depth] propose#5`** (bs=1). Engine wedged
+  (health 000); reverted `BACKEND=triton` + restart -> healthy (200). Root cause of the HSA is NOT
+  established: candidate is the per-row/per-step `.cpu()` D2H on `all_token_ids.gpu` inside
+  `propose_draft_token_ids`, but the Triton path also does D2H there; GPU0 is `THROTTLED` (possible
+  hardware instability). Needs a controlled repro before re-enabling.
+
+**TODO (arctic):** reproduce on a quiesced/cool GPU; try batching the D2H (one gather/step) or feeding the
+context from `input_batch.input_ids` instead of slicing `all_token_ids`; verify the draft width stays within
+`num_speculative_steps`. Keep `RADIANCE_DRAFT_NGRAM_BACKEND=triton` until then.
+
+## 2026-10-01 (cont. 84) -- Arctic HSA root-caused + fixed; result: prompt-lookup loses to MTP here
+
+- **Repro:** the HSA is fully deterministic at `propose#5` (bs=1) on every boot. Bisection: run the arctic
+  plumbing with `TAU=1e9` (never adopt) -> **HEALTHY**, so the D2H/speculate plumbing is fine; the fault is
+  the **adopted draft**. Failing kernel: `at::native::indexSelectSmallIndex<c10::BFloat16,long,...>` = a
+  token-embedding `index_select` with an out-of-range index.
+- **Root cause:** during speculator warmup the arctic cache speculates degenerate/short drafts
+  (`[0]`, `[0,0]`, `[0,0,0]`). An arctic-only row shorter than K is `-1`-padded, and the verify's embedding
+  `index_select` loads `-1` as a token id -> OOB -> HSA on gfx1201. (Not the raw values; `-1` pad.)
+- **Fix (overlay):** merge the arctic prefix INTO the full MTP row: `di` stays length K with **no -1**
+  (override slot j only for valid, in-vocab arctic tokens, stop at the first invalid); plus an optional
+  slot-0 agreement gate `RADIANCE_DRAFT_NGRAM_ARCTIC_AGREE`. After this, `BACKEND=arctic` boots and serves
+  with **no HSA**.
+- **Result (harness `ngram_ab_probe.py`, 5x1024, warm):**
+  | prompt | MTP-only | Triton(agree) | Arctic AGREE=1 | Arctic AGREE=0 |
+  |---|---|---|---|---|
+  | repeat | 123.1 | 115.2 | 111.7 | 32.2 |
+  | agent  | 100.5 | 103.4 | 94.3  | 40.3 |
+  | novel  | 53.6  | 54.2  | 51.1  | 47.3 |
+  Arctic `AGREE=1` adopts only ~1% of rows and costs ~10% (CPU `speculate()` on the step); `AGREE=0`
+  adopts ~62% but those drafts are rejected -> 2-4x slower. Same shape as the ungated Triton n-gram.
+- **Conclusion:** prompt-lookup (Triton matcher OR real Arctic suffix tree) does **not beat MTP** on this
+  blend/Thinkingcap agentic workload -- MTP-only is fastest and simplest. Registry set
+  `RADIANCE_DRAFT_NGRAM=0` (MTP-only). Arctic code retained (`BACKEND=arctic`, `ARCTIC_AGREE=1` = stable
+  demo). The HANDOFF gates F1/F2/F6 remain in code for A/B. The real lever for this workload is elsewhere
+  (e.g. DFlash, rebuild-class), not prompt-lookup.
+
+## 2026-10-01 (cont. 85) -- prompt-lookup CEILING is high; the gap is policy (override), not the workload
+
+Research subagent verdict was "policy-flawed + fundamentally capped"; our own empirical oracle **refutes the
+"capped" half** and localizes the fix.
+
+- **Ceiling probe** (`aijuus/ngram_ceiling_probe.py`, in-container, tokenizes prompt+gen, longest-suffix
+  oracle): at the SERVED temp 0.7:
+  | prompt | match>=8 on | first-token hit | mean oracle accepted len |
+  |---|---|---|---|
+  | repeat | 49.2% | 95.2% | 6.59 |
+  | agent  | 67.7% | 97.0% | 7.02 |
+  | novel  |  2.4% | 94.7% | 6.11 |
+  i.e. when a match exists the continuation is right ~95-97% and is worth ~6.6-7 tokens -- MORE than MTP's
+  ~3.5. There IS large headroom on repetitive/structured spans; the earlier "n-gram loses" is not the
+  workload's fault.
+- **Matcher correctness** (`aijuus/ngram_matcher_oracle_probe.py`): on a synthetic periodic sequence the
+  Triton matcher equals the oracle 25/26 (only misses L<MIN=3). So the matcher is sound in isolation.
+- **The real flaw is the POLICY**: `_radiance_ngram_extend` REPLACES the whole MTP row (`di = c[:K]`) --
+  zero-sum, and it fires on boilerplate whose continuation diverges. Also the live context fed to the
+  matcher can include unverified draft tokens.
+
+**RECOMMENDED FIX (ranked, kernel overlays allowed):**
+1. **Prefix-preserving EXTENSION** (not override): keep `MTP[0:K]`; append the suffix continuation only when
+   it is consistent with the MTP prefix, at slots `K..num_speculative_steps-1`. Monotone-safe (cannot
+   regress accepted length). This is the fix that harvests the measured ceiling.
+2. **Draft-conditioned lookup kernel**: find a context occurrence whose continuation starts with the MTP
+   draft `[0:K]`, then append its tail -- gives a trustworthy extension when MTP is right.
+3. **Continuation-probability scoring** (extend `_match_count` to a continuation histogram) to decide how
+   many append slots to spend.
+4. Acceptance-based adaptive gate; drop the zero-sum override entirely.
+Tree verification is NOT overlay-feasible in VLLM 0.29 (flat chain, no parent indices).
+
+## 2026-10-01 (cont. 86) -- F7 prefix-preserving extension implemented; single-chain verify is the ceiling
+
+- **Built** `_radiance_ngram_extend_row` (pure, unit-tested) + `RADIANCE_DRAFT_NGRAM_EXT`: keep the WHOLE
+  MTP row and append the suffix continuation `cont1[K:clen]` ONLY when it agrees with the full MTP prefix
+  (never overrides MTP -> monotone-safe). 21/21 policy tests pass; applied live, no HSA.
+- **Result: fires ~0.1% of rows** (`extended_rows=5/4000`). `[ngram-hist]` shows the live matcher gives
+  `clen8` on 29% of rows and `mlen>=8` on ~13% overall (≈45% of the rows the matcher actually runs on,
+  consistent with the ceiling probe) -- so matching is fine; **full-K agreement with MTP is what's rare**.
+- **Throughput** (5x1024 warm): repeat 110-117 (MTP 123), agent 92-101 (MTP 100.5), novel 51-53 (~MTP).
+  i.e. neutral-to-slightly-negative; no win.
+- **DEFINITIVE CONCLUSION for overlay prompt-lookup:** vLLM 0.29's spec decode verifies a SINGLE token
+  chain. So any suffix proposal must either (a) OVERRIDE MTP -> regresses when MTP is right (the anti-
+  correlation the research flagged; measured 2-4x slowdowns), or (b) require full-prefix agreement ->
+  almost never fires. The measured high ceiling (cont[0] correct 95%, ~6.6 accepted) cannot be harvested
+  without **tree verification**, which is not overlay-feasible in this version. Therefore **MTP-only is the
+  optimum** for this deployment among overlay options; all prompt-lookup variants (Triton gates, Arctic,
+  extension) are neutral-or-worse.
+- Registry left at `RADIANCE_DRAFT_NGRAM=0` (MTP-only). All prompt-lookup code (F1/F2/F6 gates, F7
+  extension, Arctic backend) remains in the overlay for future use/A-B.
+
+**TODO:** bake the overlay so this can't recur -- either clear the injected tail at boot before patching,
+or make `edit()` replace an existing tail instead of skipping.
+
+**Positive-case validation (cont.81, new code live):** a large repetitive/structured generation
+(60 near-identical Python functions) on vllm-0 gave **mean 78.1%, up to 90-100%** sustained (22/26
+windows >=70%) -- the n-gram echo tails are accepted. Across the whole boot (varied flows) **42 windows,
+mean 72.1%, 0 windows <15%**, 0 matcher errors. `[ngram] rows=500 extended_rows=301` (dominated by the
+repetitive gen) and `[ngram-hist]` mlen32 only 16/500 (vs the old 1365/2000 boilerplate saturation), so
+the gates now filter rather than fire on every long match.
+
+## 2026-10-01 (cont. 82) -- same-prompt A/B (NGRAM=0 vs 1) + spec-decode optimality research
+
+**A/B harness:** `aijuus/ngram_ab_probe.py` -- fixed prompts {repeat=60-function Python file,
+novel=1200-word story, agent=40-entry JSON tool-schema continuation}, REPS=5, max_tokens=1024,
+temperature 0.7, against vllm-0 (blend) directly, registry-toggle + restart + warm re-run.
+
+| prompt | NGRAM=1 (warm) | NGRAM=0 | delta |
+|---|---|---|---|
+| repeat | 115.2 tok/s | 123.1 | n-gram **-6.4%** |
+| novel | 54.2 | 53.6 | +1.1% |
+| agent | 103.4 | 100.5 | +2.9% |
+
+**Verdict: within noise -- the gated n-gram is a WASH vs MTP-only on this workload.** Confounded by
+both GPUs reporting `THROTTLE_STATUS: THROTTLED` (~+-5% run variance; one cold boot gave an anomalous
+52 tok/s that recovered to 115 on re-run). So: safe (no collapses) but **not demonstrably beneficial**;
+the earlier 78-100% "win" on repetitive content was MTP itself, not the n-gram.
+
+**Optimality research (subagent):** our design is the right family (hybrid neural + prompt-lookup) but
+**not globally optimal**. Our F1 slot-0-agreement gate makes it too conservative to rescue MTP misses;
+the principled published form is TensorRT-LLM **SA+MTP** (`sa_spec_threshold`) and the Arctic Suffix
+Decoding paper's **hybrid tau gate** (suffix tree first, fall back to neural when `SCORE <= tau`), with
+frequency x prefix-length scoring, adaptive `MAX_SPEC`, and a **cross-request** suffix cache -- we only
+have a single-suffix top-1 frequency proxy (F6). Ranked: (1) drive the tail from the real Arctic
+`SuffixDecodingCache` (overlay + `pip install arctic-inference`; expected +10-30% accepted length on
+repetitive agentic segments, neutral on prose); (2) keep ours + tune (marginal); (3) **DFlash** (big win
+on MI355X, but image rebuild + checkpoint + `TRITON_ATTN` and the ROCm concurrency bug -- high risk);
+(4) EAGLE3 tree (no head for this arch -> training project); native `method: suffix`/`ngram` **replaces**
+MTP and would regress the general fraction. Revert stays `RADIANCE_DRAFT_NGRAM=0`.

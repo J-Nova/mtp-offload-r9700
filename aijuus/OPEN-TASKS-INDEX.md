@@ -53,6 +53,13 @@ TTFT p50 83 ms) · T3 · V3 · H2 · **OS1/E1** (enabled in registry, cont.60) �
    — decide whether to pre-warm / stabilise the AOT key so a single cold boot is trustworthy.
 7. **Docs/cleanup:** **H4** README overlay refresh · **K2** align `mtp-27B-MXFP4-Thinkingcap` kv pin
    (`8761733283`) only if/when it is piloted.
+8. **NG1 — n-gram trust gates (cont.79): F1/F2/F4 implemented (READY to A/B), F3/F6 open.** The live
+   n-gram tail (`patch_dynamic_depth.py::_radiance_ngram_extend`) replaced the whole MTP draft on any
+   `mlen>=8` match, so tool-schema boilerplate matches collapsed per-position-0 acceptance to ~3%. Fix:
+   gate the override on **slot-0 agreement with MTP** (F1) and **top-2-continuation determinism** (F2),
+   both default ON via `RADIANCE_DRAFT_NGRAM_AGREE` / `_DET`; adaptive EMA now tracks agreement rate
+   (`_EMA_MIN` 0.02→0.10). Next: reload + A/B vs `NGRAM=0`; then F3 (V2 confidence) and F6 (port Arctic
+   frequency-weighted suffix matcher). Detail in §21.
 
 **B. Rebuild-class / kernel (needs a build you own):** PF2 GDN chunk-scan parallelization · PF3 R4D
 prefill scheduling · PF4 MXFP4 split-K @16k · S4 shrink each draft forward (C5 contract repair precedes
@@ -296,3 +303,24 @@ GDN scan + fixed-grid fp16 state rounding; alters cold numerics; `r4d.so` rebuil
 fp8 KV sets a ~6 %/element noise floor, chunked prefill re-partitions reductions, and R4D opts out of
 batch-invariance (`radiance_r4d_attn.py:260`, `backend.py:200,321`). Validate on acceptance/served
 semantics. Route A left unimplemented (benefit-destroying) unless bit-exactness becomes a hard requirement.
+
+## 21. n-gram draft tail — trust gates (cont.79)
+
+The MTP+n-gram tail path wrecked acceptance on agent traffic (<5%) because the live policy
+(`patch_dynamic_depth.py::_radiance_ngram_extend`) **replaced the whole MTP draft** on any long match
+(`mlen>=STRONG=8`), with no agreement/confidence/frequency gate. Tool-schema boilerplate produces long
+exact matches whose continuations differ -> rejected. The sophisticated `radiance_draft.py::slot_decide`
+policy is dead code (hooks the legacy proposer, not the V2 runner). Matcher kernels are correct.
+
+| ID | Task | Status | Notes |
+|---|---|---|---|
+| NG1 | F1 agreement gate (tail slot-0 == MTP) | **IMPLEMENTED (cont.79)** | `RADIANCE_DRAFT_NGRAM_AGREE` default **1**; `0` restores pre-fix |
+| NG2 | F2 determinism gate (top-2 cont agree slot-0) | **IMPLEMENTED (cont.79)** | `RADIANCE_DRAFT_NGRAM_DET` default **1**; kills boilerplate false positives |
+| NG3 | F4 adaptive feedback (agreement-rate EMA) | **IMPLEMENTED (cont.79)** | EMA input = slot-0 n-gram/MTP agreement, not `ext_flags`; `_EMA_MIN` 0.02→0.10 |
+| NG4 | F5 threshold hygiene | **PARTIAL** | `NGRAM_MIN` unchanged; rely on F1/F2. Consider `NGRAM_DEPTH=0` in registry |
+| NG5 | Live A/B vs `NGRAM=0` | **READY (needs reload you own)** | watch per-position acceptance + `[ngram] extended_rows`; agent ctx + repeat/echo probe |
+| NG6 | F3 confidence gate (V2 conf wiring) | **BLOCKED (evidence, cont.80)** | `cudagraph_mode=FULL_AND_PIECEWISE` -> draft decode is `FULL_DECODE_ONLY`; `_greedy_sample_draft` never runs at serving. Needs a confidence kernel baked into the captured draft graph (`current_draft_step`-indexed). Parked; F1+F6 cover it. |
+| NG7 | F6 frequency-weighted suffix matcher | **IMPLEMENTED + VALIDATED (cont.80)** | `_match_count` kernel + `match_count()` in `radiance_draft_gpu.py`; host gate `RADIANCE_DRAFT_NGRAM_FREQ`/`_MIN_FREQ`/`_MIN_PROB`. GPU equiv PASS 40 iters vs CPU ref. |
+
+Validation: offline policy test (boilerplate fixture) in `aijuus/patch_dynamic_depth_policy_test.py`;
+live via `bench-conc.py --conc 1` on an agent-like long context + a repeat/echo probe.

@@ -183,6 +183,49 @@ def _match_gather(ctx, nA, ML, key1, key2, pack, base,
     tl.store(out + 2 * NSPEC + 4, win_miss.to(tl.int32))
 
 
+@triton.jit
+def _match_count(ctx, nA, key1, base, occ_out, agree_out, ML, NBLK,
+                 MAXL: tl.constexpr, SH: tl.constexpr, RH: tl.constexpr, BLOCK: tl.constexpr):
+    """Frequency of the top-1 matched suffix's continuation (F6, cont.79).
+
+    For each row, `key1` holds the top-1 match (length Lref, end position qref). This kernel scans the
+    row's own context once and, for every OTHER occurrence of the Lref-length suffix (L >= Lref), counts
+    how many share the reference continuation's first token. Arctic Suffix Decoding gates on this
+    continuation probability (`min_token_prob`); here it lets a strongly repeated continuation override
+    an MTP disagreement while a boilerplate suffix (many occurrences, divergent continuations) is
+    rejected. Deterministic (no atomics): one program per row loops the blocks. occ/agree EXCLUDE the
+    reference occurrence (the host adds 1 for it when forming the probability)."""
+    i = tl.program_id(0)
+    n = tl.load(nA + i)
+    row = ctx + i * ML
+    b = tl.load(base + i)
+    k = tl.load(key1 + i)
+    has = k != 0
+    Lref = (k >> (SH + RH)).to(tl.int32)
+    qref = (k & ((1 << SH) - 1)).to(tl.int32)
+    cref = tl.load(row + qref + 1, mask=has & (qref + 1 < n), other=-1)
+    occ = 0
+    agree = 0
+    for blk in tl.range(0, NBLK):
+        q = b + blk * BLOCK + tl.arange(0, BLOCK)
+        alive = q < (n - 1)
+        L = tl.zeros((BLOCK,), tl.int32)
+        for kk in range(MAXL):
+            sk = n - 1 - kk
+            sfx = tl.load(row + sk, mask=sk >= 0, other=-2)
+            qi = q - kk
+            m = alive & (qi >= b) & (sk >= 0)
+            c = tl.load(row + qi, mask=m, other=-1)
+            alive = m & (c == sfx)
+            L = L + alive.to(tl.int32)
+        hit = has & (q < (n - 1)) & (q >= b) & (L >= Lref) & (q != qref)
+        cn = tl.load(row + q + 1, mask=hit, other=-1)
+        occ += tl.sum(hit.to(tl.int32), 0)
+        agree += tl.sum((hit & (cn == cref)).to(tl.int32), 0)
+    tl.store(occ_out + i, occ)
+    tl.store(agree_out + i, agree)
+
+
 def _nblk(nmax, window):
     span = nmax if not window else min(nmax, window)
     return max(1, triton.cdiv(span, _BLOCK))
@@ -198,6 +241,8 @@ def make_match_buffers(B, nspec, nc, device):
         "key2": torch.empty(B, dtype=torch.int64, device=device),
         "base": torch.zeros(B, dtype=torch.int32, device=device),
         "pack": torch.empty(B, 2 * nspec + _META, dtype=torch.int32, device=device),
+        "occ": torch.empty(B, dtype=torch.int32, device=device),
+        "agree": torch.empty(B, dtype=torch.int32, device=device),
     }
 
 
@@ -223,6 +268,17 @@ def match_gpu(ctx, n_arr, nspec, nmax, base, active_nc, cross, bufs, maxl=_MAXL)
     _match_gather[(B,)](ctx, n_arr, ML, bufs["key1"], bufs["key2"], bufs["pack"], base,
                         _SH, _RH, nspec)
     return bufs["pack"]
+
+
+def match_count(ctx, n_arr, key1, base, occ, agree, active_nc, maxl=_MAXL):
+    """Count occurrences of the top-1 matched suffix and how many share its continuation token.
+
+    `key1` is `bufs["key1"]` after `match_gpu`; `occ`/`agree` are `bufs["occ"]`/`bufs["agree"]`
+    (written here, so zero them first). `active_nc = 2 * nblk` as in `match_gpu`."""
+    B, ML = ctx.shape
+    nblk = active_nc // 2
+    _match_count[(B,)](ctx, n_arr, key1, base, occ, agree, ML, nblk,
+                       maxl, _SH, _RH, BLOCK=_BLOCK)
 
 
 # ----- confidence capture -----------------------------------------------------
