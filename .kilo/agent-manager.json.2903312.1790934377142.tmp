@@ -1,0 +1,45 @@
+{
+  "worktrees": {
+    "wt-1789826658023-1": {
+      "branch": "topaz-drive",
+      "path": "/home/juup/radiance-vllm-mxfp4/.kilo/worktrees/topaz-drive",
+      "parentBranch": "main",
+      "createdAt": "2026-09-19T14:04:18.023Z",
+      "remote": "origin",
+      "branchOwned": true
+    }
+  },
+  "sessions": {
+    "ses_f460490b9ffeAjdCvLVLdKNSpZ": {
+      "worktreeId": "wt-1789826658023-1",
+      "createdAt": "2026-09-19T14:04:18.765Z"
+    },
+    "ses_f0d3ec662ffeGUOnEPrMxNVlCa": {
+      "worktreeId": null,
+      "createdAt": "2026-09-30T14:39:04.703Z"
+    },
+    "ses_f0448dc9effeQzH2Sr14ngr276": {
+      "worktreeId": null,
+      "createdAt": "2026-10-02T08:24:38.556Z"
+    }
+  },
+  "tabOrder": {
+    "local": [
+      "pending:d38c5c4e-c084-4862-8fae-8e4e160c9139",
+      "pending:9166f11f-64cf-4835-be62-4a089f455d15",
+      "pending:d3cdc6ab-88b2-40da-8c14-fd10bc4e316a",
+      "pending:0d0065e6-759c-4a18-b227-a9680e4e207e",
+      "pending:de3e5132-5869-429c-801d-75cf45b2a079",
+      "pending:6e9d4dd2-aadb-4b0b-b191-7663548b0831",
+      "ses_f0d3ec662ffeGUOnEPrMxNVlCa",
+      "pending:831633bb-09d0-4e06-9f80-9eb368ed0d95",
+      "pending:45df8704-b964-49d7-84ec-16c9c6197065",
+      "ses_f0448dc9effeQzH2Sr14ngr276",
+      "ses_f03fe1d8effexjriu4t3CSTZct"
+    ]
+  },
+  "worktreeOrder": [
+    "wt-1789826658023-1"
+  ],
+  "sessionsCollapsed": true
+}

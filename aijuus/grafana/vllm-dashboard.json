@@ -1,0 +1,2021 @@
+{
+  "title": "Radiance MXFP4 (2x GPU, data-parallel) -- full hardware",
+  "uid": "radiance-mxfp4",
+  "schemaVersion": 39,
+  "version": 3,
+  "tags": [
+    "vllm",
+    "gpu",
+    "cpu",
+    "hardware",
+    "spec-decode"
+  ],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "editable": true,
+  "panels": [
+    {
+      "id": 1001,
+      "type": "row",
+      "title": "Model state + health",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 1002,
+      "type": "table",
+      "title": "Model state (live)",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "showHeader": true,
+        "orientation": "column",
+        "footer": {
+          "show": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "radiance_model_state_ready",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "NOT READY",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "ready",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        }
+      },
+      "description": "Which model is loaded on each instance + whether it is ready, from the state-collector textfile metric.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "model",
+                "exported_instance",
+                "Value"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "renameByName": {
+              "model": "Model",
+              "exported_instance": "Instance",
+              "Value": "Status"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 1003,
+      "type": "stat",
+      "title": "Spec acceptance %",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "textMode": "value",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum(rate(vllm:spec_decode_num_accepted_tokens_total[5m])) / clamp_min(sum(rate(vllm:spec_decode_num_draft_tokens_total[5m])), 1e-9)"
+        }
+      ],
+      "description": "Accepted / draft tokens over 5m. The headline spec-decode efficiency number. Green >60%, amber 45-60%, red <45%.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 45
+              },
+              {
+                "color": "green",
+                "value": 60
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 1004,
+      "type": "stat",
+      "title": "Hottest GPU temp (C)",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(amd_gpu_temp_junction_celsius)"
+        }
+      ],
+      "description": "Max junction temp across cards. R9700 throttles near 95-100C.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius"
+        }
+      }
+    },
+    {
+      "id": 1005,
+      "type": "stat",
+      "title": "Prefill (tok/s)",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vllm:prompt_tokens_by_source_total[1m]))"
+        }
+      ],
+      "description": "Total prefill tokens/s across all sources (compute + cache hit + offload), 1m rate."
+    },
+    {
+      "id": 1006,
+      "type": "stat",
+      "title": "Decode (tok/s)",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vllm:generation_tokens_total[1m]))"
+        }
+      ],
+      "description": "Decode (generation) tokens/s, 1m rate."
+    },
+    {
+      "id": 1007,
+      "type": "row",
+      "title": "Serving: throughput, spec & latency",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      }
+    },
+    {
+      "id": 1008,
+      "type": "timeseries",
+      "title": "Throughput (tok/s)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vllm:generation_tokens_total[1m]))",
+          "legendFormat": "decode"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(vllm:prompt_tokens_by_source_total{source=\"local_compute\"}[1m]))",
+          "legendFormat": "prefill compute"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(vllm:prompt_tokens_by_source_total{source=\"local_cache_hit\"}[1m]))",
+          "legendFormat": "prefill cache hit"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(vllm:prompt_tokens_by_source_total{source=\"external_kv_transfer\"}[1m]))",
+          "legendFormat": "prefill offload"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Decode + prefill tokens/s by source (1m rate)."
+    },
+    {
+      "id": 1009,
+      "type": "timeseries",
+      "title": "Spec acceptance (%)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum(rate(vllm:spec_decode_num_accepted_tokens_total[5m])) / clamp_min(sum(rate(vllm:spec_decode_num_draft_tokens_total[5m])), 1e-9)",
+          "legendFormat": "acceptance (total)"
+        },
+        {
+          "refId": "B",
+          "expr": "100 * sum by (instance) (rate(vllm:spec_decode_num_accepted_tokens_total[5m])) / clamp_min(sum by (instance) (rate(vllm:spec_decode_num_draft_tokens_total[5m])), 1e-9)",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        }
+      },
+      "description": "Accepted / draft tokens (5m). Total + per instance. The core spec-decode efficiency number."
+    },
+    {
+      "id": 1010,
+      "type": "timeseries",
+      "title": "Latency (s)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "TTFT p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "TTFT p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "TTFT p99"
+        },
+        {
+          "refId": "D",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket[5m])))",
+          "legendFormat": "ITL p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Time-to-first-token percentiles + inter-token latency p50."
+    },
+    {
+      "id": 1011,
+      "type": "timeseries",
+      "title": "Per-position accepted (tok/s)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (position) (rate(vllm:spec_decode_num_accepted_tokens_per_pos_total[5m]))",
+          "legendFormat": "pos {{position}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Accepted tokens/s per spec position -- the draft-depth decay curve (which positions are productive)."
+    },
+    {
+      "id": 1012,
+      "type": "timeseries",
+      "title": "Concurrency",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vllm:num_requests_running",
+          "legendFormat": "{{instance}} running"
+        },
+        {
+          "refId": "B",
+          "expr": "vllm:num_requests_waiting",
+          "legendFormat": "{{instance}} waiting"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Requests running + waiting per instance."
+    },
+    {
+      "id": 1013,
+      "type": "timeseries",
+      "title": "KV cache usage (%)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(vllm:gpu_cache_usage_perc or vllm:kv_cache_usage_perc) * 100",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        }
+      },
+      "description": "GPU KV cache occupancy per instance."
+    },
+    {
+      "id": 1014,
+      "type": "row",
+      "title": "GPU (per card)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      }
+    },
+    {
+      "id": 1015,
+      "type": "timeseries",
+      "title": "GPU utilization (%)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 25
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "amd_gpu_busy_percent",
+          "legendFormat": "{{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        }
+      },
+      "description": "GPU busy % per card."
+    },
+    {
+      "id": 1016,
+      "type": "timeseries",
+      "title": "VRAM (GiB + %)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 25
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "amd_vram_used_bytes",
+          "legendFormat": "{{gpu}} used"
+        },
+        {
+          "refId": "B",
+          "expr": "amd_vram_used_bytes / amd_vram_total_bytes * 100",
+          "legendFormat": "{{gpu}} %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "description": "VRAM used (GiB, left) + % of total (right)."
+    },
+    {
+      "id": 1017,
+      "type": "timeseries",
+      "title": "GPU power (W)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 25
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "amd_gpu_power_watts",
+          "legendFormat": "{{gpu}}"
+        },
+        {
+          "refId": "B",
+          "expr": "amd_gpu_power_cap_watts",
+          "legendFormat": "{{gpu}} cap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Drawn power vs cap per card."
+    },
+    {
+      "id": 1018,
+      "type": "timeseries",
+      "title": "GPU temps (C)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 33
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "amd_gpu_temp_edge_celsius",
+          "legendFormat": "{{gpu}} edge"
+        },
+        {
+          "refId": "B",
+          "expr": "amd_gpu_temp_junction_celsius",
+          "legendFormat": "{{gpu}} junction"
+        },
+        {
+          "refId": "C",
+          "expr": "amd_gpu_temp_mem_celsius",
+          "legendFormat": "{{gpu}} mem"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Edge / junction / memory temps per card."
+    },
+    {
+      "id": 1019,
+      "type": "timeseries",
+      "title": "GPU clocks (Hz)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 33
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "amd_gpu_sclk_hz",
+          "legendFormat": "{{gpu}} shader"
+        },
+        {
+          "refId": "B",
+          "expr": "amd_gpu_mclk_hz",
+          "legendFormat": "{{gpu}} memory"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "hz",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Shader + memory clock per card (auto-scaled to MHz)."
+    },
+    {
+      "id": 1020,
+      "type": "timeseries",
+      "title": "GPU fan",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 33
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "amd_gpu_fan_rpm",
+          "legendFormat": "{{gpu}} rpm"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rpm",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Fan speed per card."
+    },
+    {
+      "id": 1027,
+      "type": "row",
+      "title": "GPU throttle / limits / PCIe / faults",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "panels": [
+        {
+          "id": 1021,
+          "type": "timeseries",
+          "title": "Throttle & limits",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "amd_gpu_power_watts / clamp_min(amd_gpu_power_cap_watts, 1)",
+              "legendFormat": "{{gpu}} power-limit"
+            },
+            {
+              "refId": "B",
+              "expr": "amd_gpu_temp_junction_crit_celsius - amd_gpu_temp_junction_celsius",
+              "legendFormat": "{{gpu}} thermal headroom"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byFrameRefID",
+                  "options": "B"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "celsius"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  }
+                ]
+              }
+            ]
+          },
+          "description": "Power-limit ratio (0-1, left) + thermal headroom to crit (C, right)."
+        },
+        {
+          "id": 1022,
+          "type": "timeseries",
+          "title": "PCIe link",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "amd_pcie_current_link_width",
+              "legendFormat": "{{gpu}} width"
+            },
+            {
+              "refId": "B",
+              "expr": "amd_pcie_max_link_width",
+              "legendFormat": "{{gpu}} max width"
+            },
+            {
+              "refId": "C",
+              "expr": "amd_pcie_current_link_speed_gt_s",
+              "legendFormat": "{{gpu}} speed"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byFrameRefID",
+                  "options": "C"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  }
+                ]
+              }
+            ]
+          },
+          "description": "PCIe link width (lanes, left) + speed (GT/s, right). Card1 is x1."
+        },
+        {
+          "id": 1023,
+          "type": "timeseries",
+          "title": "GPU mem & volt",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "amd_mem_busy_percent",
+              "legendFormat": "{{gpu}} UMC busy"
+            },
+            {
+              "refId": "B",
+              "expr": "amd_gtt_used_percent",
+              "legendFormat": "{{gpu}} GTT"
+            },
+            {
+              "refId": "C",
+              "expr": "amd_gpu_voltage_mv",
+              "legendFormat": "{{gpu}} volt"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byFrameRefID",
+                  "options": "C"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "voltm"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  }
+                ]
+              }
+            ]
+          },
+          "description": "UMC busy % + GTT % (left) + core voltage (right)."
+        },
+        {
+          "id": 1024,
+          "type": "stat",
+          "title": "GPU ECC / AER / RAS faults",
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 0,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "options": {
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max(amd_gpu_aer_fatal_total) + max(amd_gpu_ras_fatal_total) + max(amd_gpu_vram_bad_pages)"
+            }
+          ],
+          "description": "Sum of fatal AER + fatal RAS + bad VRAM pages. 0 = clean; any increase = investigate.",
+          "fieldConfig": {
+            "defaults": {
+              "decimals": 0
+            }
+          }
+        },
+        {
+          "id": 1025,
+          "type": "timeseries",
+          "title": "Throttle reason flags (derived)",
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 8,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "(amd_gpu_power_watts / clamp_min(amd_gpu_power_cap_watts, 1)) > 0.98",
+              "legendFormat": "{{gpu}} POWER_LIMIT"
+            },
+            {
+              "refId": "B",
+              "expr": "(amd_gpu_temp_junction_crit_celsius - amd_gpu_temp_junction_celsius) < 5",
+              "legendFormat": "{{gpu}} THERMAL"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "1 when the card is power- or thermally throttling."
+        },
+        {
+          "id": 1026,
+          "type": "timeseries",
+          "title": "GPU throttle status (raw)",
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 16,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "amd_gpu_throttle_status",
+              "legendFormat": "{{gpu}} status"
+            },
+            {
+              "refId": "B",
+              "expr": "amd_gpu_indep_throttle_status",
+              "legendFormat": "{{gpu}} indep"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Raw throttle status bitfield per card."
+        }
+      ]
+    },
+    {
+      "id": 1028,
+      "type": "row",
+      "title": "CPU / host",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 42
+      }
+    },
+    {
+      "id": 1029,
+      "type": "timeseries",
+      "title": "CPU (usage % + load)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 43
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])))",
+          "legendFormat": "usage"
+        },
+        {
+          "refId": "B",
+          "expr": "node_load1",
+          "legendFormat": "load 1m"
+        },
+        {
+          "refId": "C",
+          "expr": "node_load5",
+          "legendFormat": "load 5m"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "description": "CPU usage % (left) + load average (right)."
+    },
+    {
+      "id": 1030,
+      "type": "timeseries",
+      "title": "CPU power (W)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 43
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(amd_cpu_power_watts)",
+          "legendFormat": "package"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "CPU package power (RAPL)."
+    },
+    {
+      "id": 1031,
+      "type": "timeseries",
+      "title": "Host memory",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 43
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+          "legendFormat": "used"
+        },
+        {
+          "refId": "B",
+          "expr": "node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes",
+          "legendFormat": "swap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "RAM used + swap used."
+    },
+    {
+      "id": 1032,
+      "type": "timeseries",
+      "title": "Disk",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 51
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (1 - node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})",
+          "legendFormat": "used %"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(node_disk_read_bytes_total[5m]))",
+          "legendFormat": "read"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(node_disk_written_bytes_total[5m]))",
+          "legendFormat": "write"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "Bps"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "Bps"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "description": "Root disk used % (left) + I/O read/write (right)."
+    },
+    {
+      "id": 1033,
+      "type": "timeseries",
+      "title": "Network",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 51
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(node_network_receive_bytes_total{device!~\"lo\"}[5m]))",
+          "legendFormat": "rx"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(node_network_transmit_bytes_total{device!~\"lo\"}[5m]))",
+          "legendFormat": "tx"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Network rx/tx (excl. loopback)."
+    },
+    {
+      "id": 1034,
+      "type": "row",
+      "title": "KV Offload (summary)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 59
+      }
+    },
+    {
+      "id": 1035,
+      "type": "stat",
+      "title": "RAM tier size",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 60
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(radiance_kvram_allocated_bytes)"
+        }
+      ],
+      "description": "Pinned CPU KV tier total.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      }
+    },
+    {
+      "id": 1036,
+      "type": "stat",
+      "title": "Disk tier used %",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 60
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "radiance_kvcache_bytes / radiance_kvcache_max_bytes * 100"
+        }
+      ],
+      "description": "Shared fs tier fill vs cap.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "id": 1037,
+      "type": "stat",
+      "title": "Offload hit rate %",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 60
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum(rate(vllm:external_prefix_cache_hits_total[5m])) / clamp_min(sum(rate(vllm:external_prefix_cache_queries_total[5m])), 1e-9)"
+        }
+      ],
+      "description": "External (offload) prefix-cache hit rate.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "id": 1038,
+      "type": "stat",
+      "title": "Disk tier blocks",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 60
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "options": {
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "radiance_kvcache_blocks"
+        }
+      ],
+      "description": "Blocks in the fs tier.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 1039,
+      "type": "timeseries",
+      "title": "RAM tier allocated (per engine)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "radiance_kvram_allocated_bytes",
+          "legendFormat": "{{engine}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Pinned RAM tier per engine."
+    },
+    {
+      "id": 1040,
+      "type": "timeseries",
+      "title": "Disk tier bytes vs cap",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "radiance_kvcache_bytes",
+          "legendFormat": "bytes"
+        },
+        {
+          "refId": "B",
+          "expr": "radiance_kvcache_max_bytes",
+          "legendFormat": "cap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "fs tier used vs hard cap."
+    },
+    {
+      "id": 1041,
+      "type": "timeseries",
+      "title": "Offload transfer rate (B/s)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vllm:kv_offload_total_bytes_total{transfer_type=\"CPU_to_GPU\"}[5m]))",
+          "legendFormat": "restore (CPU->GPU)"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(vllm:kv_offload_total_bytes_total{transfer_type=\"GPU_to_CPU\"}[5m]))",
+          "legendFormat": "store (GPU->CPU)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "description": "Offload restore/store throughput."
+    },
+    {
+      "id": 1051,
+      "type": "row",
+      "title": "KV Offload Deep Diagnostics",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 72
+      },
+      "panels": [
+        {
+          "id": 1042,
+          "type": "timeseries",
+          "title": "Lookup terminal outcomes (/s)",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(vllm:kv_offload_lookup_calls_total[5m]))",
+              "legendFormat": "calls"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(rate(vllm:kv_offload_lookup_served_total[5m]))",
+              "legendFormat": "served"
+            },
+            {
+              "refId": "C",
+              "expr": "sum(rate(vllm:kv_offload_lookup_skip_short_window_total[5m])) or vector(0)",
+              "legendFormat": "skip short_window"
+            },
+            {
+              "refId": "D",
+              "expr": "sum(rate(vllm:kv_offload_lookup_skip_zero_hit_total[5m])) or vector(0)",
+              "legendFormat": "skip zero_hit"
+            },
+            {
+              "refId": "E",
+              "expr": "sum(rate(vllm:kv_offload_lookup_deferred_backend_total[5m])) or vector(0)",
+              "legendFormat": "deferred backend"
+            },
+            {
+              "refId": "F",
+              "expr": "sum(rate(vllm:kv_offload_lookup_deferred_loading_total[5m])) or vector(0)",
+              "legendFormat": "deferred loading"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Offload lookup terminal outcomes per second."
+        },
+        {
+          "id": 1043,
+          "type": "timeseries",
+          "title": "Lookup chunk outcomes (/s)",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(vllm:kv_offload_lookup_chunk_hit_total[5m]))",
+              "legendFormat": "hit"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(rate(vllm:kv_offload_lookup_chunk_hit_pending_total[5m])) or vector(0)",
+              "legendFormat": "hit_pending"
+            },
+            {
+              "refId": "C",
+              "expr": "sum(rate(vllm:kv_offload_lookup_chunk_retry_total[5m])) or vector(0)",
+              "legendFormat": "retry"
+            },
+            {
+              "refId": "D",
+              "expr": "sum(rate(vllm:kv_offload_lookup_chunk_miss_total[5m]))",
+              "legendFormat": "miss"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Offload chunk-level lookup outcomes per second."
+        },
+        {
+          "id": 1044,
+          "type": "timeseries",
+          "title": "Lookup served tokens/s",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(vllm:kv_offload_lookup_served_tokens_total[5m]))",
+              "legendFormat": "served tokens/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Tokens served from the offload tier per second."
+        },
+        {
+          "id": 1045,
+          "type": "timeseries",
+          "title": "Tier capacity vs used (bytes)",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "vllm:kv_offload_tier_capacity_bytes",
+              "legendFormat": "{{tier}} capacity"
+            },
+            {
+              "refId": "B",
+              "expr": "vllm:kv_offload_tier_used_bytes",
+              "legendFormat": "{{tier}} used"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Per-tier capacity vs used bytes."
+        },
+        {
+          "id": 1046,
+          "type": "timeseries",
+          "title": "Tier hit blocks/tokens",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (tier) (rate(vllm:kv_offload_tier_hit_blocks_total[5m]))",
+              "legendFormat": "{{tier}} hit blocks/s"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (tier) (rate(vllm:kv_offload_tier_hit_tokens_total[5m]))",
+              "legendFormat": "{{tier}} hit tokens/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Per-tier hit blocks + tokens per second."
+        },
+        {
+          "id": 1047,
+          "type": "timeseries",
+          "title": "Tier stall / evictions (/s)",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (tier) (rate(vllm:kv_offload_tier_stall_seconds_total[5m]))",
+              "legendFormat": "{{tier}} stall s/s"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (tier) (rate(vllm:kv_offload_tier_evictions_total[5m]))",
+              "legendFormat": "{{tier}} evictions/s"
+            },
+            {
+              "refId": "C",
+              "expr": "sum by (tier) (rate(vllm:kv_offload_tier_lookup_miss_evicted_total[5m])) or vector(0)",
+              "legendFormat": "{{tier}} miss-evicted/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Per-tier stall seconds + evictions + miss-evictions."
+        },
+        {
+          "id": 1048,
+          "type": "timeseries",
+          "title": "Promotion initiated / refused (/s)",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 16
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (tier) (rate(vllm:kv_offload_promotion_initiated_total[5m]))",
+              "legendFormat": "{{tier}} initiated/s"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (tier) (rate(vllm:kv_offload_promotion_refused_total[5m])) or vector(0)",
+              "legendFormat": "{{tier}} refused/s"
+            },
+            {
+              "refId": "C",
+              "expr": "sum by (tier) (rate(vllm:kv_offload_promotion_refused_no_evictable_total[5m])) or vector(0)",
+              "legendFormat": "{{tier}} no_evictable/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Offload promotion initiated vs refused (with no-evictable reason)."
+        },
+        {
+          "id": 1049,
+          "type": "timeseries",
+          "title": "Deferral lifecycle (/s) + depth",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 16
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(vllm:kv_offload_lookup_deferral_total[5m]))",
+              "legendFormat": "deferral total"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(rate(vllm:kv_offload_lookup_deferral_served_total[5m]))",
+              "legendFormat": "served"
+            },
+            {
+              "refId": "C",
+              "expr": "sum(rate(vllm:kv_offload_lookup_deferral_gave_up_total[5m]))",
+              "legendFormat": "gave_up"
+            },
+            {
+              "refId": "D",
+              "expr": "sum(rate(vllm:kv_offload_lookup_deferral_depth_sum[5m])) / clamp_min(sum(rate(vllm:kv_offload_lookup_deferral_depth_count[5m])), 1e-9)",
+              "legendFormat": "avg depth"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            }
+          },
+          "description": "Lookup deferral lifecycle per second + average deferral depth (steps)."
+        },
+        {
+          "id": 1050,
+          "type": "timeseries",
+          "title": "CPU tier headroom / FS backlog",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 16
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max(vllm:kv_offload_cpu_cache_evictable_perc) * 100",
+              "legendFormat": "evictable %"
+            },
+            {
+              "refId": "B",
+              "expr": "max(vllm:kv_offload_cpu_cache_free_perc) * 100",
+              "legendFormat": "free %"
+            },
+            {
+              "refId": "C",
+              "expr": "sum(vllm:kv_offload_fs_inflight_jobs)",
+              "legendFormat": "FS inflight jobs"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "spanNulls": true,
+                "fillOpacity": 5
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byFrameRefID",
+                  "options": "C"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  }
+                ]
+              }
+            ]
+          },
+          "description": "CPU tier admission headroom (left) + FS tier cascade backlog (right)."
+        }
+      ]
+    }
+  ]
+}
