@@ -30,8 +30,17 @@ NEW = """        sample_hidden_states = hidden_states[input_batch.logits_indices
         try:
             import radiance_verifyhead as _radiance_vh
             _radiance_vh.before_compute_logits(self, input_batch, grammar_output)
-        except Exception:
-            pass
+        except Exception as _radiance_vh_e:
+            # Surface the first failure instead of hiding it: a silent `pass` here is why an
+            # armed-but-failing head is indistinguishable from a disabled one.
+            if not getattr(self, "_radiance_vh_err", False):
+                self._radiance_vh_err = True
+                import traceback as _radiance_tb
+                import sys as _radiance_sys
+                _radiance_sys.stderr.write(
+                    f"[radiance.verifyhead] hook failed: {_radiance_vh_e!r}\\n"
+                    + _radiance_tb.format_exc())
+                _radiance_sys.stderr.flush()
         logits = self.model.compute_logits(sample_hidden_states)
 """
 
@@ -49,8 +58,15 @@ NEW_029 = """            sample_hidden_states = hidden_states[input_batch.logits
             try:
                 import radiance_verifyhead as _radiance_vh
                 _radiance_vh.before_compute_logits(self, input_batch, grammar_output)
-            except Exception:
-                pass
+            except Exception as _radiance_vh_e:
+                if not getattr(self, "_radiance_vh_err", False):
+                    self._radiance_vh_err = True
+                    import traceback as _radiance_tb
+                    import sys as _radiance_sys
+                    _radiance_sys.stderr.write(
+                        f"[radiance.verifyhead] hook failed: {_radiance_vh_e!r}\\n"
+                        + _radiance_tb.format_exc())
+                    _radiance_sys.stderr.flush()
             logits = self.model.compute_logits(sample_hidden_states)
 """
 

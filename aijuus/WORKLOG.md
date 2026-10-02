@@ -2740,3 +2740,87 @@ for strict-zero streams, use a much higher margin (e.g. ceil(ema)+3) and gate on
 **Takeaway for MTP optimization.** Draft depth is a sub-10% lever. Future throughput work should
 target the TARGET forward (decode GEMM split-K/BK at small M, attention, GDN) or reducing verify
 rows -- not K. GPU0 thermal (LACT undervolt/clock cap <=3.3 GHz) is the real vllm-0 problem.
+
+## 2026-10-02 (cont. 93) -- N15 int2 verify head: arming bug fixed, GSM8K exactness gate PASS, throughput A/B
+
+**What it is.** `RADIANCE_VERIFY_HEAD=1` (per-model `verify_head`) points `radiance_drafthead`'s int2
+coarse+rerank head at the TARGET `lm_head` via `LogitsProcessor._apply_head`, gated per step by the
+batch's sampling params (greedy always safe; sampled needs `top_k <= RERANK//4`, `min_p==0`, no
+logprobs, no grammar). Requires `RADIANCE_FAST_DRAFT=1`.
+
+**ARMING BUG (root cause of a dead head).** `radiance_verifyhead._arm` did
+`float(w.data.abs().max())` as a liveness check on the target lm_head (248320x5120 bf16 = 1.27 GiB);
+`abs()` tries to allocate ~2.37 GiB and OOMs under the 7.6 GiB KV pin (0 free), so `_arm` aborted
+every step. The `patch_verify_head.py` hook wrapped the call in `except Exception: pass`, so the
+failure was invisible: no log, bf16 `lm_head` unchanged, head silently off. Found only after
+replacing the silent `pass` with a one-time traceback log.
+Fixes: (1) liveness check bounded to one row (`w.data[0].abs().max()`); (2) the hook now logs the
+first exception + traceback instead of swallowing it. Both live-applied and durable in `patch_verify_head.py`.
+
+**Working.** `[radiance.verifyhead] VERIFY_HEAD: draft head (248320,5120) bf16 -> int2 g128 asym
+(0.33 GiB/rank), 8 cand/block, rerank top-80 exact (max top_k 20, exact fallback otherwise)`;
+`first 200 steps: 194 on the int2 head, 6 fell back to bf16`.
+
+**Mechanism / kernel evidence (profiler).** Target lm_head `Cijk_...MT16x32x256` **2.285 -> 0.573
+ms/call** (~87% less), int2/rerank kernels added (`_draft_head_int2`, `_rerank_exact`,
+`_rerank_scatter`). Step time falls more than the GEMM saving because `_radiance_topk_only` leaves the
+row with EXACTLY RERANK=80 finite entries, so the sampler's top-k/argmax runs over 80 instead of
+248,320 -- the full-vocab top-k kernels collapse. GPU-busy/token -8%; step gaps 14.7 -> 3.5 ms.
+
+**Throughput A/B (clean, idle `num_requests_running=0`, thermal-controlled).** Both arms RERANK=80,
+MAX_M=128; only VERIFY_HEAD differs. Arm B stays 146.0-146.2 at 81 C, so the delta is not thermal.
+| regime | VH=0 | VH=1 |
+|---|---|---|
+| bs1 greedy/predictable | 107.6 (104.9/111.8/106.1) | **146.6** (146.7/146.5/146.5) |
+| bs1 sampled | 46.5 | ~74 (noisy) |
+| bs8 sampled | 342.9 | **403.1** |
+| GSM8K decode tok/s | 107.6 | **115.6** |
+Caveat: an earlier "broken-head" arm (VH=1 failing) measured 131-136 while VH=0 measured 114, i.e.
+cross-boot variance ~+-15% when other traffic is present -- clean idle runs are the trustworthy ones.
+
+**GSM8K exactness gate (200 q, greedy, no-thinking, seed 1234) -- PASS.** Both arms **93.5%
+(187/200)** and the harness summary is identical; graded against pack gold, both arms have the
+IDENTICAL wrong-question set (17 indices by last-number grading). Arm A is fully deterministic
+(0/200 answer-text diff on rerun), so the 8/200 answer-text divergences under the head are real but
+all keep the SAME final number (7) or are both `finish=length` truncations (1). No correctness change.
+=> int2 argmax is preserved; only near-tie wording shifts.
+
+**State.** Fix + diagnostic uncommitted (`radiance_verifyhead.py`, `patch_verify_head.py`,
+`NEXT-PLAN.md`). Live vllm-1 = arm A (VH=0, RERANK=80); prod registry still `verify_head:0`,
+`RERANK:32`. TODO: sampled-path gate (`--temperature 0.7`, top_k=20 = worst-case RERANK/4); clean
+`RERANK=32,VH=0` production baseline; then enable `verify_head=1` + `RERANK=80` if it wins.
+
+## 2026-10-02 (cont. 94) -- N15 sampled-path margin gate (top_k=20 = RERANK/4 worst case)
+
+GSM8K 200q `--temperature 0.7 --seed 1234` (bench-eval omits top_k, so the server's
+override_generation_config supplies top_k=20). Arm A is deterministic under the seed (0/200 diff on
+rerun), so any arm A->B divergence is the head.
+
+| | VH=0 | VH=1 |
+|---|---|---|
+| accuracy | 92.0% (184/200) | 92.0% (184/200) |
+| graded wrong set (last-number vs gold) | 20 idx | IDENTICAL 20 idx |
+| answer-text diffs vs arm A | 0 (rerun) | **18/200** |
+| decode tok/s | 105.9 | **113.7 (+7.4%)** |
+
+Of the 18 text-diffs only 2 change the final number (idx 119, 184) and both are already wrong in BOTH
+arms (119 finish=length both; 184 length in A vs complete-but-wrong in B). => **The 4x margin at
+top_k=20/RERANK=80 preserves correctness but is NOT bit-exact**: ~9% of sampled sequences diverge,
+consistent with the rerank's FP8 rescoring (`_rerank_exact(..., FP8=True)`) shifting near-ties off
+the bf16 scores. If bit-reproducibility of sampled output matters, raise RERANK (e.g. 128, 6.4x) or
+keep the selector top_k below RERANK/4. Greedy remains exact (verified, cont.93).
+
+## 2026-10-02 (cont. 95) -- N15 net-production delta (RERANK=32/VH=0 vs RERANK=80/VH=1)
+
+Arm C = exact production (VH=0, RERANK=32, MAX_M=32), measured clean/idle. GSM8K tok/s is the robust
+cross-boot metric; the synthetic "count to 400" probe is thermally noisy across boots.
+| metric | arm C prod (R32,VH0) | arm B (R80,VH1) | net |
+|---|---|---|---|
+| GSM8K greedy 200q | 107.5 t/s, 93.5% | 115.6 t/s, 93.5% | +7.5% |
+| bs1 greedy (count) | 136.0 | 146.6 | +7.8% |
+| bs8 sampled | 392 | 403 | ~+2.8% (noise) |
+| RERANK 32 vs 80 (both VH=0) | GSM8K 107.5 | 107.6 (arm A) | neutral |
+Correction: an earlier reading that RERANK 32->80 costs ~21% was an artifact of arm A's count run
+being measured right after the heat test (thermally depressed). GSM8K, run cold in both cases, shows
+RERANK neutral and isolates the head's +7.5%. => Enable `verify_head=1` + `RADIANCE_DRAFT_RERANK=80`
+for ~+7.5% (GSM8K-like), no accuracy change, sampled output ~9% text-divergent.

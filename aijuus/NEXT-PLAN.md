@@ -8,6 +8,17 @@ work batch; `OPEN-TASKS-INDEX.md` remains the long-horizon catalog. Status: **RE
 Restarts/recreates are user-owned. Overlay patches are marker-idempotent, so a `docker start` does
 NOT re-apply changed patches — durable changes need a container **recreate**.
 
+## Progress (cont.92)
+
+| ID | Status | Result |
+|---|---|---|
+| N1 | **DONE** | `patch_gdn_lazy.py` sentinel comment now contains the sentinel → `apply()` NOOPs on re-run (unit-tested: 2 applies → 1 block). Recreate resets live count to 1. |
+| N3 | **DONE** | registry `RADIANCE_MXFP4_DECODE_MAX_M` 192→128. |
+| N4 | **DONE** | committed `8ecdabe`. |
+| N8 | **DONE — thermal confirmed** | sustained decode on vllm-1 + 2 Hz sampling: **GPU1** (load) junction max 71 °C, sclk ≤3053 MHz, mclk 1258, fan 12 %. **GPU0** (vllm-0) junction 98–**103 °C**, sclk pulled 2997→2711 MHz, fan only **34 % (2322 rpm)**, power avg 209 W (cap 215 applied). The `>3.3 GHz` knee is avoided, but **GPU0 saturates thermally because LACT `fan_control_enabled: false` leaves the PMFW acoustic curve (target 85 °C, acoustic_limit 2600) too lazy** → junction throttle. That is the vllm-0 throughput constraint. |
+| N7 | **DONE (bs=1 + bs=8)** | Kernel attribution captured (traces at `/tmp/kilo/prof/`, analyzer `aijuus/profile_analyze.py`). Target GEMM ~58–60 % of GPU-busy; **bf16 unquantized weights ~21 % (bs=8) / ~28 % (bs=1)** (MTP block `wvSplitK` + `lm_head` `Cijk`); GDN ~3 %→**9 %** (bs1→bs8); attention ~0.5–1 % (short ctx); draft head int2 ~2 %. Kernel-busy ≈ **80 % of the generation wall** at both bs1 and bs8 → **step is kernel-bound, not host/launch-bound**. Profiler caveat: torch profiler × rocprofiler-sdk crashes on the **second** stop in one process (`External init callback must run in same thread as registerClient`); single start/stop per boot is safe. |
+| N2 | **USER** | recreate both containers (Coolify redeploy of project `w7p20ww076tcrg9zhq7zhmne`, or `docker compose ... up -d --force-recreate`) to apply N1/N3 + acc-gate-off + reset invalidate. |
+
 ## Decision log (this session — closed/clarified)
 
 | # | Decision | Evidence |
@@ -48,7 +59,7 @@ NOT re-apply changed patches — durable changes need a container **recreate**.
 | N12 | GDN: unblock `in_proj` merge under PRESHUFFLE | −2.9% c1 / −6.5% stacked | med | med | GSM8K paired |
 | N13 | GDN: fuse `conv_update`+`lazy_update` (lazy-only) | 0.1–0.2 ms | med (kernel) | med | fp32 bit-exact |
 | N14 | Attention **output-quant epilogue fusion** (upstream-inspired) | small; −1 launch × 17 | med | low-med | A/B + bit-compare |
-| N15 | **int2 verify head** `RADIANCE_VERIFY_HEAD=1` | ~1.5–2.0 ms (~3–4%) | low | med: needs `top_k ≤ RERANK/4` (raise RERANK 32→80 or top_k ≤ 8) | paired compile + logprobs/grammar lane |
+| N15 | **int2 verify head** `RADIANCE_VERIFY_HEAD=1` | +7% (GSM8K) … +36% (long greedy); +17.5% bs8 | low | med: needs `top_k ≤ RERANK/4` → RERANK≥80 for sampled | **DONE/PASS (cont.92).** Bug fixed (one-row liveness check; hook logs the first exception). Head arms, 194/200 on int2. **GSM8K 200q exactness A/B: both arms 93.5% (187/200) with the IDENTICAL wrong-question set**; arm A deterministic (0/200 rerun diff), arm B perturbs 8/200 answer texts but all keep the same final number (7) or are both truncations (1) → no correctness change. Kernel: lm_head `Cijk` 2.285→0.573 ms/call; sampler top-k collapses (80 finite entries vs 248320). Throughput A/B clean+idle: bs1 greedy 107.6→146.6, bs8 342.9→403.1, GSM8K 107.6→115.6 tok/s. **Sampled margin gate (temp 0.7, top_k=20=RERANK/4, seed 1234): accuracy 92.0% both, IDENTICAL wrong sets; 18/200 answer-text diffs (not bit-exact) but only 2 final-number changes, both already-wrong/truncated → correctness preserved.** **To enable in prod: `VERIFY_HEAD=1` + `RADIANCE_DRAFT_RERANK=80`** (prod is 32); net-vs-32 baseline not yet measured. If bit-reproducibility of sampled output is required, raise RERANK (128) or lower selector top_k. |
 | N16 | Attention split/TILE retune at live N/ctx | low-med | low | low | **gated on N9** |
 
 ## Phase 3 — Structural (DESIGN / research)

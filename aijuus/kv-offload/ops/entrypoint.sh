@@ -393,6 +393,14 @@ if [ -n "${RADIANCE_DRY_MULTIPLIER:-}" ] && [ "${RADIANCE_DRY_MULTIPLIER}" != "0
   echo "[run] DRY enabled: $DRY_ARG"
 fi
 
+# torch profiler (N7): RADIANCE_PROFILER_DIR set => mount the /start_profile endpoint with a kineto
+# trace dir. Off by default (no behaviour change); tracing only starts on POST /start_profile.
+PROF_ARG=""
+if [ -n "${RADIANCE_PROFILER_DIR:-}" ]; then
+  PROF_ARG="--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"${RADIANCE_PROFILER_DIR}\"}"
+  echo "[run] torch profiler enabled: $PROF_ARG"
+fi
+
 # shellcheck disable=SC2086
 exec /opt/radiance_entrypoint.sh \
   "$VLLM_MODEL_PATH" --served-model-name "$VLLM_SERVED_MODEL_NAME" \
@@ -403,6 +411,7 @@ exec /opt/radiance_entrypoint.sh \
   --attention-backend "$ATTN" \
   $SPEC_ARG \
   $DRY_ARG \
+  $PROF_ARG \
   $ASYNC_ARG \
   --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype "${MAMBA_SSM_DTYPE:-float16}" \
   --compilation-config "{\"cudagraph_capture_sizes\":$CAPLIST,\"pass_config\":{\"fuse_norm_quant\":true,\"fuse_act_quant\":true}}" \

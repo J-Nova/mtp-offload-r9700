@@ -116,7 +116,10 @@ def _arm(model):
         sys.stderr.write("[radiance.verifyhead] no (lm_head, logits_processor) pair found; off\n")
         return
     w = getattr(lm_head, "weight", None)
-    if w is None or w.dim() != 2 or float(w.data.abs().max()) == 0.0:
+    # Liveness only -- check a single row. A full `w.data.abs().max()` allocates a 1.27 GiB copy of
+    # the lm_head, which OOMs under the pinned KV cache (2.37 GiB requested, 0 free) and made the
+    # head fail silently every step. A zeroed placeholder lm_head has a zero first row.
+    if w is None or w.dim() != 2 or w.numel() == 0 or float(w.data[0].abs().max()) == 0.0:
         _state["failed"] = True
         sys.stderr.write("[radiance.verifyhead] target lm_head not a live 2-D weight; off\n")
         return
