@@ -13,6 +13,10 @@ from the intact vllm-1 dir helped). Never measure an unverified boot.
 
 ## 0. Remaining tasks — refreshed cont.71
 
+> **Current work batch → `aijuus/NEXT-PLAN.md` (cont.92).** Prioritized N1–N21 with the decision log
+> (acc gate disabled, draft-depth premise corrected, mxfp4a8 not broken, invalidate hygiene bug,
+> thermal finding). This section is the long-horizon catalog.
+
 **Closed since the previous index:** M1 (n-gram HSA fix + enablement, cont.59–63) · **C1/C2** batched
 matcher (cont.64) · **rx10 libr4d** built + live (cont.66, +6%) · **lazy GDN (OS3/E3)** fixed + enabled
 (cont.67–69, KV +11%) · **first BetterBench on vllm-0** (cont.71; single-stream combined 90.3 t/s,
@@ -362,7 +366,9 @@ Prompt-lookup (Triton + Arctic) and tree verification are exhausted (cont.79-88:
 | M7 | libr4d small-M (M=64) GEMM kernels | throughput | **DONE (cont.89)** | rx11 = libr4d v0.5.0 + rx10 extras; `gemm_nt M=64 bf16/w4a16/w4a8` now resolve (was fallback). Deployed to live mount `~/.cache/radiance-libr4d/v0.5.0-w4a16` (backup `.lean-backup`); vllm-1 needs restart. Gain within noise. |
 | M8 | Fused CUDA GDN decode | throughput | OPEN (config-gated) | blocked by `mamba_ssm_cache_dtype=float16` (needs fp32/bf16 recurrent state, `FUSED_GDN_STATE_DTYPES`); interacts with GDN-lazy + SSM-state memory. A/B `mamba_ssm_cache_dtype` fp16 vs bf16 vs fp32. |
 | M9 | cuteDSL/CUTLASS `ll_bf16_gemm` | throughput | **N/A (cont.89)** | requires NVIDIA `cutlass.cute`, SM100f-tuned -> not usable on gfx1201/ROCm. Parked. |
-| M10 | mamba SSM state dtype (fp16 vs model's fp32) | accuracy/throughput | OPEN | fp16 state diverges from model config, blocks fused GDN, least accurate. A/B needed. |
+| M10 | mamba SSM state dtype (fp16 vs model's fp32) | accuracy/throughput | OPEN (unblocked, cont.90) | fp16 state diverges from model config, blocks fused GDN, least accurate. A/B needed. bf16 is now runnable **with lazy on** (rx12 adds `gdn_lazy_*_bf16state`); pre-rx12 it raised at `_Tables` init. A/B fp16 vs bf16 vs fp32 via `bench-eval.py`. |
+| M11 | bf16 lazy-state kernels | config/accuracy | **DONE (cont.90)** | rx12 = libr4d v0.5.0 + `r4d_radiance_extras_rx12.patch`; adds `gdn_lazy_update`/`gdn_lazy_materialize` `_bf16state` + registry constraint/row. Built, symbols verified, deployed to live mount + `~/.cache/radiance-libr4d/v0.5.0-rx12`; fresh-deploy path (serve + compose) now pins `v0.5.0-rx12`. Engine restart pending (user-owned). |
+| M12 | MTP acceptance gate (low-acceptance bail-out) | throughput | **BUILT, pending restart (cont.91)** | No acceptance feedback at bs<3: a lone low-acceptance stream drafts K=5 forever (vllm-0 saw p0 0.03, 10 tok/s). Discriminator `aijuus/acc_gate_check.py` proves the drafter is healthy (greedy/predictable accepted/update 4.90, p0~1.0) and the collapse is high-entropy output. `patch_dynamic_depth.py` gains `RADIANCE_ACC_GATE` (speculator-side EMA of max accepted drafts at `num_reqs <= RADIANCE_ACC_GATE_BATCH`, margin 1); registry enables it on both MTP models. Verify `[acc-gate]` diag + high-entropy bs=1 tok/s on next restart. |
 
 **Highest-value bounded next step:** overlay A/B of **M1 (draft-head precision/vocab)** + **M4 (depth schedule)**,
 measuring per-position acceptance + tok/s (no output-semantics change).

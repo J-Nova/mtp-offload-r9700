@@ -50,7 +50,7 @@
    "RADIANCE_MXFP4_CHECKX": "0",
    "RADIANCE_MXFP4_PADOUT": "0",
    "RADIANCE_MXFP4_TN4_MIN_M": "2048",
-   "RADIANCE_MXFP4_DECODE_MAX_M": "192",
+    "RADIANCE_MXFP4_DECODE_MAX_M": "128",
    "RADIANCE_MXFP4_DECODE_NT": "1",
    "RADIANCE_MXFP4_A_TILED_MIN_M": "513",
    "RADIANCE_MXFP4_WPERM": "1",
@@ -108,13 +108,16 @@
    "RADIANCE_DRAFT_FUSED": "1",
    "RADIANCE_DYNAMIC_DEPTH": "1",
    "RADIANCE_DRAFT_NGRAM": "0",
+   "MAMBA_SSM_DTYPE": "float16",
    "RADIANCE_DRAFT_HEAD_TOP1": "0",
    "RADIANCE_DRAFT_VOCAB": "/patches/aijuus/draft_keep/keep-union-freq.txt",
    "RADIANCE_COLLECT_TOKENS": "0",
    "RADIANCE_OFFLOAD_SUFFIX_INV": "1",
-   "RADIANCE_OFFLOAD_EAGLE_INCLUDE": "1",
-   "RADIANCE_GDN_LAZY": "1"
-  },
+    "RADIANCE_OFFLOAD_EAGLE_INCLUDE": "1",
+    "RADIANCE_GDN_LAZY": "1",
+    "RADIANCE_ACC_GATE": "0",
+    "RADIANCE_ACC_GATE_BATCH": "2"
+   },
   "note": "2026-10-01 STATUS (current; 2026-09-29/30 history is folded in below). Active served model: blend MTP variant (MTP head inside the blend, no drafter). spec_tokens=8 (B1 A/B: SPEC 8 beats 4 -- greedy 88.1 vs 86.5). verify_head=0 (neutral for mtp). RERANK=32 (mtp argmax needs only 32; 80 is the dflash value). TAU=0.20. N-gram enabled and healthy: RADIANCE_DRAFT_NGRAM=1 + NGRAM_ADAPT=1 + NGRAM_DEPTH=8 + NGRAM_BS_MAX=2 + NGRAM_STRONG=8 (adaptive per-request gate: repetitive c1 +9%, c8 +33% vs off, generic unchanged); matcher batched (C1/C2, RADIANCE_DRAFT_NGRAM_BATCH default 1, bit-identical). EXACTSET=1 + FUSED=1 confirmed (A4). Offload E1: RADIANCE_OFFLOAD_SUFFIX_INV=1 + RADIANCE_OFFLOAD_EAGLE_INCLUDE=1 (A1 warm c1 71.3 / c8 371.6). Lazy GDN: RADIANCE_GDN_LAZY=1 (needs libr4d rx10, now live; KV pool 190,157 tokens = +11%; c8 +3.2%, c1 -1.8%; outputs NOT bit-identical to eager by design -- fp32 replay; multi-turn gate clean after the prefill-invalidation fix). COLLECT_TOKENS=0 (must stay off for any throughput/validation run). RADIANCE_DRAFT_VOCAB=keep-union-freq.txt (reduced-vocab prune). Chunk (max_num_batched_tokens) 2026-10-01: was 16384 with kv_cache_memory=6979321856 (6.5 GiB), which loaded cleanly, but BetterBench 32k/64k prefill then OOM'd in radiance.mxfp4_linear_pq (bf16 out 1.03 GiB, 0 free; container auto-restarted) -- the same pin yields GPU KV cache 190,157 tokens (~1.19x for 160k) vs max_model_len=160000, so ~30,157 tokens (~1.03 GiB) of it is unusable. CHANGED to max_num_batched_tokens=12288 (user's choice) to shrink the prefill activation peak; KV pin stays 6.5 GiB (a smaller chunk leaves MORE headroom, so the pin stays valid). Fallbacks if 32k still OOMs: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (reclaims the 2.45 GiB reserved-unallocated fragmentation) or kv_cache_memory -> ~5,873,000,000 (~160k tokens). The earlier 16k OOMs were at the superseded 8.16 GiB pin. Fix 2026-09-30: the 2026-09-29 bs=1->bs=2 HSA fault was root-caused to gpu._nblk receiving the window BASE instead of its SIZE in _radiance_ngram_extend (scan grid ~9x too big -> q past ML -> OOB); fixed in patch_dynamic_depth.py. Dropped: RADIANCE_DRAFT_HEAD_TOP1 (M2) and the reduced-vocab W4 draft head (superseded 2026-09-29). HISTORY: at the 8.16 GiB pin the 16384 chunk OOM'd (and cudagraph capture grew to 3.05 GiB at a 7.0 GiB pin); the 8761733283 pin was borrowed INTERIM from the identical-weights dflash entry; per-row/width n-gram fixes failed until the _nblk size fix. 2026-10-01 later: chunk set to 4096 (kv kept 7,600,000,000 = 207,748 tokens); full BetterBench pass -- single-stream 89.1 t/s, concurrency 8 = 199.5 agg t/s (48/48), 64k prefill OK; see WORKLOG cont.78."
  },
  "dflash-27B-MXFP4-Thinkingcap": {
@@ -140,12 +143,15 @@
    "RADIANCE_DRAFT_FUSED": "1",
    "RADIANCE_DYNAMIC_DEPTH": "1",
    "RADIANCE_DRAFT_NGRAM": "0",
+   "MAMBA_SSM_DTYPE": "float16",
    "RADIANCE_DRAFT_HEAD_TOP1": "0",
    "RADIANCE_DRAFT_VOCAB": "/patches/aijuus/draft_keep/keep-union-freq.txt",
    "RADIANCE_COLLECT_TOKENS": "0",
    "RADIANCE_OFFLOAD_SUFFIX_INV": "1",
-   "RADIANCE_OFFLOAD_EAGLE_INCLUDE": "1"
-  },
+    "RADIANCE_OFFLOAD_EAGLE_INCLUDE": "1",
+    "RADIANCE_ACC_GATE": "0",
+    "RADIANCE_ACC_GATE_BATCH": "2"
+   },
   "note": "Blend, MTP variant: uses the MTP head inside the blend (no drafter). Spec tuning from the MTP sweep: SPEC=8; DYNAMIC_DRAFT=1, FAST_DRAFT=1, TAU=0.20, NGRAM_STRONG=8 (from _defaults + here); RERANK=32 (MTP's argmax needs only 32 -- README.md:561, MTP-DECODE-OPT-PLAN.md:214; _defaults' 80 is the dflash value); VERIFY_HEAD=0 via the field above. kv_cache_memory: INTERIM -- borrowed 8761733283 from the identical-weights -blend-MXFP4-OCP-GPTQ (dflash) entry to unblock the deploy; profiling alone finds only ~4.59 GiB and rejects MAXLEN=160000 (needs >=6.05 GiB). Run ./calibrate-kv.sh SPEC_METHOD=mtp SPEC=8 to measure the exact mtp:8 pin and replace it. B1 A/B RESULT (2026-09-29): SPEC 4 is WORSE on our workload -- greedy 86.5 vs 88.1, sampled 77.6 vs 80.2 t/s (SPEC 8 wins); kept spec_tokens=8. The reduced-vocab W4 draft head (DAVETHA_DRAFTER_QUANT) was REMOVED 2026-09-29 as superseded (tcclaviger dropped that MTP path; our B2 run showed no clear win). RADIANCE_COLLECT_TOKENS=0 added 2026-09-29: the B2 token-collector (on globally in the compose env) wraps the MTP draft head's compute_logits and does out.argmax + a host sync every eager draft step, and rewrote /patches/aijuus/draft_keep/rank1.json during serving; it must be off for any throughput/validation run. 2026-09-29 HSA FAULT: with a fully clean cache and COLLECT_TOKENS=0, MTP decode faults deterministically with HSA_STATUS_ERROR_EXCEPTION at the bs=1->bs=2 transition ([sd-trace] bs=2 nspec_sched=5) on BOTH cards; bs=1 runs ~23 proposals fine, then the engine wedges (Running=2, 0 tok/s). The n-gram tail (_radiance_ngram_extend) is NOT in HEAD -- it is part of the uncommitted 154-line patch_dynamic_depth.py diff -- and was absent from the cont.26 dynamic-depth validation, so it is the prime suspect. RADIANCE_DRAFT_NGRAM set to 0 to isolate (keeps DYNAMIC_DEPTH=1). If the fault persists: next step RADIANCE_DYNAMIC_DEPTH=0 (overlay fully off). FIX 2026-09-29: _radiance_ngram_extend now keeps the row width == the scheduled depth K -- it takes the n-gram only when its recorded continuation length >= K and REPLACES the K MTP drafts (never appends past K, which was the old `di += c[kk:cl]` up to num_speculative_steps). NGRAM=1 re-enabled to test the fix at bs>=2. That width-only fix FAILED (still HSA at bs=2 with the row width already equal to K), so the fault is in match_gpu's B>=2 kernel launches, not the width: _radiance_ngram_extend now runs the matcher PER ROW at B=1 (the proven-safe path), sharing one row-sized buffer (_rad_ngram_bufs1). The per-row B=1 fix ALSO FAILED (still HSA at bs=2). CONCLUSION: the fault is neither the draft row width nor the matcher launch shape -- MERELY RUNNING the matcher during a bs=2 draft step faults, independent of B. NGRAM reverted to 0 (validated baseline). The tail needs a dedicated offline repro (run match_gpu standalone at B=1/2 with serving stopped, compare against the bs=2 in-engine context) before it can be re-enabled. TOP1 ARM 2026-09-29: RADIANCE_DRAFT_HEAD_TOP1=1 with RADIANCE_DRAFT_VOCAB REMOVED (the fused top-1 path declines the vocab prune and keeps the full head), A/B vs the freq-prune baseline 88.3/155.8/264.4/421.9.",
   "spec_schedule": "[[1,2,5],[3,8,4]]"
  }

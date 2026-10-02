@@ -260,12 +260,12 @@ services:
       - TRITON_CACHE_DIR=/cache/triton
       - AITER_ROOT_DIR=/cache/aiter
       - TRITON_CACHE_AUTOTUNING=1
-      - R4D_SO=/home/juup/.cache/radiance-libr4d/b9e42ab-rx10
+      - R4D_SO=/home/juup/.cache/radiance-libr4d/v0.5.0-rx12
     volumes:
       - /home/juup/models:/models
       - /home/juup/.radiance-cache-w4a8-093-gdnm-nqft-fp8s-gnq-tp1s:/cache
       - /home/juup/radiance-vllm-mxfp4:/patches:z
-      - /home/juup/.cache/radiance-libr4d/b9e42ab-rx10:/r4d:z
+      - /home/juup/.cache/radiance-libr4d/v0.5.0-rx12:/r4d:z
       # Shared fs KV tier backing store, mounted into BOTH instances. Point the host side at a
       # dedicated SSD/volume (or a loop volume from ops/make-kvcache-volume.sh). Docker creates
       # the default path if absent. The host-side reaper runs against the same directory.
@@ -479,12 +479,12 @@ services:
       - TRITON_CACHE_DIR=/cache/triton
       - AITER_ROOT_DIR=/cache/aiter
       - TRITON_CACHE_AUTOTUNING=1
-      - R4D_SO=/home/juup/.cache/radiance-libr4d/b9e42ab-rx10
+      - R4D_SO=/home/juup/.cache/radiance-libr4d/v0.5.0-rx12
     volumes:
       - /home/juup/models:/models
       - /home/juup/.radiance-cache-w4a8-093-gdnm-nqft-fp8s-gnq-tp1s-b:/cache
       - /home/juup/radiance-vllm-mxfp4:/patches:z
-      - /home/juup/.cache/radiance-libr4d/b9e42ab-rx10:/r4d:z
+      - /home/juup/.cache/radiance-libr4d/v0.5.0-rx12:/r4d:z
       # Shared fs KV tier backing store, mounted into BOTH instances. Point the host side at a
       # dedicated SSD/volume (or a loop volume from ops/make-kvcache-volume.sh). Docker creates
       # the default path if absent. The host-side reaper runs against the same directory.
@@ -3873,6 +3873,31 @@ services:
     command:
       - python3
       - /code/kvcache-exporter.py
+
+  # state-collector: exposes the live model state (which model is loaded on which
+  # instance + ready + per-model spec config) as a textfile metric. It reads
+  # model-state/state.json + usage.json + model-registry.json (all read-only) and
+  # writes model_state.prom into the SHARED serve-shape volume, which node-exporter's
+  # textfile collector already scrapes -- so no node-exporter change is needed.
+  # Full host path is the variable default (no /suffix) to avoid Coolify mangling.
+  state-collector:
+    image: python:3.13-alpine
+    restart: unless-stopped
+    networks:
+      - coolify
+    depends_on:
+      init-observability:
+        condition: service_completed_successfully
+    environment:
+      - REFRESH_SECONDS=${STATE_COLLECTOR_REFRESH:-30}
+    volumes:
+      - ${MODEL_STATE_HOST_DIR:-/home/juup/radiance-vllm-mxfp4/aijuus/model-state}:/model-state:ro
+      - ${MODEL_REGISTRY_FILE:-/home/juup/radiance-vllm-mxfp4/aijuus/model-registry.json}:/model-registry.json:ro
+      - ${STATE_COLLECTOR_FILE:-/home/juup/radiance-vllm-mxfp4/aijuus/state-collector.py}:/code/state-collector.py:ro
+      - serve-shape:/textfiles
+    command:
+      - python3
+      - /code/state-collector.py
 
   # Prometheus scrapes both vllm instances + node + gpu + model-router + itself.
   prometheus:

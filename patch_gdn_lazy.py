@@ -255,7 +255,7 @@ apply(H,
             input_batch.idx_mapping,
         )
 ''',
-'''        import radiance_gdn_lazy as _rlz  # radiance lazy gdn
+'''        import radiance_gdn_lazy as _rlz  # radiance lazy gdn: invalidate prefilling rows' stash
         if _rlz.ENABLED:
             import torch as _t
             _pf = _t.as_tensor(input_batch.is_prefilling_np, dtype=_t.int32,

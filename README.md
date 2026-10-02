@@ -591,7 +591,7 @@ content. The patch targets the engine, so it applies under either parser name.
 | `R4D_ATTN` | `1` | The R4D paged attention backend. +37.8% prefill at 260k against AITER unified attention; `0` falls back to it |
 | `AUTO_R4D` | `1` | Build the pinned libr4d on first run. `0` uses the image's, which **NaNs this model** |
 | `R4D_SO` | unset | Use your own libr4d checkout directory instead; nothing is rebuilt behind your back |
-| `R4D_PIN` | `b9e42ab` | Which libr4d commit to build. Each is cached separately and keyed by the string, so `R4D_PIN=main` is fetched once and reused (`rm -rf ~/.cache/radiance-libr4d/main` to refresh) |
+| `R4D_PIN` | `b9e42ab` | Which libr4d commit to build. Each is cached separately and keyed by the string, so `R4D_PIN=main` is fetched once and reused (`rm -rf ~/.cache/radiance-libr4d/main` to refresh). The lazy-GDN path (`RADIANCE_GDN_LAZY=1`) instead builds `R4D_PIN_RX12` (default `v0.5.0`) + `r4d_radiance_extras_rx12.patch`, cached as `v0.5.0-rx12` |
 | `MIN_M` | `0` | M above which the hand-written W4A8 kernel takes over from aiter. `0` means always: the comparison is `>`, so `1` would still send M=1 to aiter |
 | `RADIANCE_MXFP4_DECODE_MAX_M` | `64` (`128` if `MAXSEQS>8`) | The small-M decode GEMM band. Must cover `MAXSEQS x (SPEC+1)` rows or the biggest verify batches fall onto the prefill tile |
 | `FAST_DRAFT` | `1` | The int2 draft head with an exact rerank: +6.5% decode under mtp, +5.1% under dflash |

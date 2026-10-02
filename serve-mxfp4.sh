@@ -544,8 +544,18 @@ R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
 # nothing at TP>=2 has been gated on it; R4D_KEY=b9e42ab-rx9 opts a TP=2 serve in for that gate.
 R4D_PATCH_RX9="$SCRIPT_DIR/r4d_radiance_extras_rx9.patch"
 R4D_PATCH_RX10="$SCRIPT_DIR/r4d_radiance_extras_rx10.patch"
+# rx12 (2026-10-01) = the rx10 extras rebased onto libr4d **v0.5.0** + a bf16 lazy-state kernel. v0.5.0
+# is where the M=64 bf16/w4a16/w4a8 GEMM kernels and the quant_act_i8 / dflash_conv units live (the
+# lean b9e42ab build predates them), and the rebase folds in the three anchors rx10 needed merged by
+# hand. It also adds gdn_lazy_update/materialize _bf16state, so RADIANCE_GDN_LAZY=1 no longer rejects
+# a --mamba-ssm-cache-dtype=bfloat16 state (radiance_gdn_lazy.py used to raise at init).
+R4D_PATCH_RX12="$SCRIPT_DIR/r4d_radiance_extras_rx12.patch"
+R4D_PIN_RX12=${R4D_PIN_RX12:-v0.5.0}
 # R4D_KEY=<key> in the environment selects a specific libr4d build (e.g. b9e42ab-rx7, what the
 # ParoQuant units serve on) instead of the launcher's default below.
+# R4D_SRC_PIN is the commit the selected patch is applied to -- the same as R4D_PIN except for rx12,
+# which is built against v0.5.0 rather than b9e42ab.
+R4D_SRC_PIN="$R4D_PIN"
 if [ -z "${R4D_KEY:-}" ]; then
   R4D_KEY="$R4D_PIN"
   if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx6"; fi   # rx6: + ar_oneshot_3rank_exact (TP=3 all-reduce); rx5: fused_update zeroes the pad rows
@@ -554,16 +564,24 @@ if [ -z "${R4D_KEY:-}" ]; then
   fi
   # rx10 = rx9 + the lazy-snapshot GDN kernels (gdn_lazy_update / gdn_lazy_materialize).
   if [ "$GDN_LAZY" = 1 ] && [ -f "$R4D_PATCH_RX10" ]; then R4D_KEY="$R4D_PIN-rx10"; fi
+  # rx12 supersedes rx10 for lazy: v0.5.0 source (M=64 GEMM units) + bf16 lazy state.
+  if [ "$GDN_LAZY" = 1 ] && [ -f "$R4D_PATCH_RX12" ]; then
+    R4D_KEY="$R4D_PIN_RX12-rx12"; R4D_SRC_PIN="$R4D_PIN_RX12"
+  fi
 fi
-case "$R4D_KEY" in *-rx9) R4D_PATCH="$R4D_PATCH_RX9" ;; *-rx10) R4D_PATCH="$R4D_PATCH_RX10" ;; esac
+case "$R4D_KEY" in
+  *-rx9)  R4D_PATCH="$R4D_PATCH_RX9" ;;
+  *-rx10) R4D_PATCH="$R4D_PATCH_RX10" ;;
+  *-rx12) R4D_PATCH="$R4D_PATCH_RX12"; R4D_SRC_PIN="$R4D_PIN_RX12" ;;
+esac
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
     rm -rf "$R4D_CACHE/.build"
     mkdir -p "$R4D_CACHE/.build"
     git clone -q https://codeberg.org/StillDeadcode/libr4d.git "$R4D_CACHE/.build"
-    git -C "$R4D_CACHE/.build" checkout -q "$R4D_PIN"
-    if [ "$R4D_KEY" != "$R4D_PIN" ]; then
+    git -C "$R4D_CACHE/.build" checkout -q "$R4D_SRC_PIN"
+    if [ "$R4D_KEY" != "$R4D_SRC_PIN" ]; then
       git -C "$R4D_CACHE/.build" apply "$R4D_PATCH"
     fi
     "$RUNTIME" run --rm --entrypoint bash -v "$R4D_CACHE/.build":/work:z -w /work \

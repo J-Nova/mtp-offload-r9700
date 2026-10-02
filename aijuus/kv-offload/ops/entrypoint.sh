@@ -404,7 +404,7 @@ exec /opt/radiance_entrypoint.sh \
   $SPEC_ARG \
   $DRY_ARG \
   $ASYNC_ARG \
-  --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype float16 \
+  --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype "${MAMBA_SSM_DTYPE:-float16}" \
   --compilation-config "{\"cudagraph_capture_sizes\":$CAPLIST,\"pass_config\":{\"fuse_norm_quant\":true,\"fuse_act_quant\":true}}" \
   --enable-prefix-caching --mamba-cache-mode "$MAMBA_MODE" \
   $TOOL_ARG \

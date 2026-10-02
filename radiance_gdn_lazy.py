@@ -79,7 +79,8 @@ class _Tables:
         self.n = len(ptrs)
         self.H, self.Hg, self.K, self.V, self.st_head, self.dtype = geom
         import r4d
-        tag = {torch.float16: "f16state", torch.float32: "fp32state"}.get(self.dtype)
+        tag = {torch.float16: "f16state", torch.bfloat16: "bf16state",
+               torch.float32: "fp32state"}.get(self.dtype)
         if tag is None:
             raise RuntimeError(f"lazy GDN: no materialize kernel for a {self.dtype} state cache")
         self.fn = getattr(r4d, f"gdn_lazy_materialize_k128_v128_bf16_{tag}")

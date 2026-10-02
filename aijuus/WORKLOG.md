@@ -2626,3 +2626,117 @@ repetitive agentic segments, neutral on prose); (2) keep ours + tune (marginal);
 on MI355X, but image rebuild + checkpoint + `TRITON_ATTN` and the ROCm concurrency bug -- high risk);
 (4) EAGLE3 tree (no head for this arch -> training project); native `method: suffix`/`ngram` **replaces**
 MTP and would regress the general fraction. Revert stays `RADIANCE_DRAFT_NGRAM=0`.
+
+## 2026-10-01 (cont. 90) -- rx12: bf16 lazy-state kernel + v0.5.0 rebase; fresh-deploy path wired
+
+**Why.** A bf16 `--mamba-ssm-cache-dtype` state could not run with `RADIANCE_GDN_LAZY=1`:
+`radiance_gdn_lazy._Tables` maps only `{fp16: f16state, fp32: fp32state}` and looks up an exported
+`r4d.gdn_lazy_materialize_k128_v128_bf16_<tag>`, and rx10/rx11 shipped no `_bf16state` sibling for the
+lazy family (recurrent + fused already had one). Python cannot build a kernel, so this was rebuild-class
+(libr4d rebuilds are permitted).
+
+**Kernel change (rx12).** The lazy kernels are already generic over `STDT` (`lz_launch<STDT>` /
+`lz_materialize_launch<STDT>`, `r4d_gdn_state.h` already implements `R4D_ST_BF16` load/store), so the
+addition is a thin TU + plumbing:
+- `r4d_gdn_lazy_update_k128_v128_bf16_bf16state.hip` (new): calls `lz_launch<R4D_ST_BF16>` /
+  `lz_materialize_launch<R4D_ST_BF16>`.
+- `r4d.h`: declare both symbols; `r4d_module.hip`: two `m.def`.
+- `r4d_registry.hip`: `cGdnLazyUpdateBf16St` (`state_dtype=bf16`) + the matching `ROW`
+  (**mandatory** -- `select()` matches on `state_dtype`, else it can hand back the wrong-width kernel).
+- `build.sh`: one `UNITS` entry (the v0.5.0 link line is auto-generated from UNITS).
+- `radiance_gdn_lazy.py`: `torch.bfloat16: "bf16state"` in the tag map (runtime-copied from /patches).
+
+**Packaging.** `r4d_radiance_extras_rx12.patch` = rx10 extras **rebased onto libr4d `v0.5.0`** (folds in
+the 3 anchors rx10 needed merged by hand, and brings the v0.5.0-only `gemm_*_m64` + `quant_act_i8` +
+`dflash_conv` units) **+** the bf16 lazy TU. 22 files; `git apply --check` clean against a fresh v0.5.0.
+Built `GFX_ARCH=gfx1201` in `juupp/vllm-radiance:0.9.3-collect-tokens` (2,712,064 B, sha
+`01d4f90b…`). Verified: `kernels 28`, `select("gdn_lazy_update", state_dtype="bf16", head_k=128,
+head_v=128) -> gdn_lazy_update_k128_v128_bf16_bf16state`, both `_bf16state` symbols exported,
+`gemm_bf16_nt_m64` / `gemm_w4a16_nt_m64` present.
+
+**Deployed.** Live mount `~/.cache/radiance-libr4d/v0.5.0-w4a16/r4d.so` (both instances) overwritten with
+rx12; prior rx11 saved as `r4d.so.rx11-backup`. Cache copy at `~/.cache/radiance-libr4d/v0.5.0-rx12/r4d.so`.
+Revert = restore the `.rx11-backup`.
+
+**Fresh-deploy wiring.** `serve-mxfp4.sh` now selects `$R4D_PIN_RX12-rx12` (source pin `v0.5.0`, default
+`R4D_PIN_RX12=v0.5.0`) for `RADIANCE_GDN_LAZY=1`, via a new `R4D_SRC_PIN` so the checkout pin follows the
+key; rx9/rx10 paths are unchanged. `coolify-compose-2gpu.yml`: both vllm services' `R4D_SO` + `/r4d` mount
+moved `b9e42ab-rx10` -> `v0.5.0-rx12`. README `R4D_PIN` row notes the lazy override.
+
+**Caveat (design, not a bug).** `r4d_gdn_state.h` argues fp16 still beats bf16 for this state (10 vs 7
+mantissa bits; bf16's extra exponent range is unreachable for the O(1e-2) leaky integrator). rx12 makes
+bf16 *possible*, not preferable -- the M10 fp16-vs-bf16 A/B via `bench-eval.py` is the decider.
+
+**Pending.** Engine restart to load rx12 (user-owned). Then: confirm boot log shows the bf16 materialize
+fn under `MAMBA_SSM_DTYPE=bfloat16` + `RADIANCE_GDN_LAZY=1`, and run the M10 A/B.
+
+## 2026-10-02 (cont. 91) -- MTP acceptance gate (low-acceptance bail-out) + acceptance discriminator
+
+**Diagnosis (live).** vllm-0 was pinned on one 20k-context request drafting 5/step and accepting
+~0.3-1.9 tok/s (p0 0.03-0.26, p1-p4 ~0, gen 10 tok/s), while vllm-1 was healthy (p0 0.70-0.88).
+Root cause of the throughput loss: **no acceptance feedback at small batch**. `patch_dynwidth`'s
+per-request width cap is gated to `running >= RADIANCE_DYNW_MIN_BATCH` (3) and floored at 2, and the
+V2 runner's draft depth K comes only from `num_speculative_tokens_per_batch_size` (bs 1-2 -> 5). So a
+lone low-acceptance stream pays the full K=5 draft cost forever. Also confirmed the width cap is
+largely inert under sync scheduling: the runner sets K from `speculator._radiance_dyn_k` and slices
+`draft_tokens[:, :_rd_k2]`; it never forwards `SchedulerOutput.num_spec_tokens_to_schedule`.
+
+**Discriminator (one-shot, `aijuus/acc_gate_check.py`).** Same drafter, three regimes on vllm-1:
+- greedy/predictable (counting): 137 tok/s, accepted/update 4.90, per-pos 1.00 1.00 0.99 0.97 0.94
+- greedy/high-entropy (random words): 61.7 tok/s, accepted/update 1.61, 0.99 0.35 0.17 0.07 0.03
+- sampled/high-entropy (temp 0.9): 67.8 tok/s, accepted/update 1.90, 0.90 0.52 0.26 0.14 0.07
+=> **drafter is healthy** (p0 ~1.0 on predictable text); the collapse is HIGH-ENTROPY output, not a
+draft/state bug. So an acceptance-gated depth cut is the correct fix, not a correctness investigation.
+
+**Fix (`patch_dynamic_depth.py`).** Added an acceptance gate inside the speculator's `propose`, which
+already receives `num_sampled`/`num_rejected`: when `RADIANCE_ACC_GATE=1` and `num_reqs <=
+RADIANCE_ACC_GATE_BATCH` (default 2), track an EMA of `max_i(num_sampled_i - 1)` (accepted drafts,
+max-across-requests so a good co-scheduled request is never dragged down; accept-full-width observes
++1 so the EMA can climb out) and shrink `_rd_k` to `max(1, ceil(ema)+RADIANCE_ACC_GATE_MARGIN)`
+(margin default 1). Sets both `_radiance_eff_k` (loop bound) and `_radiance_dyn_k` (runner slice).
+Above the batch threshold the size-only schedule is untouched (weight-stream flat zone). Defaults
+off; `RADIANCE_ACC_GATE_DIAG=1` logs `[acc-gate] bs accmax ema k`. `RADIANCE_ACC_GATE_BATCH=2`
+because bs=1-2 is per-request/effectively so; bs>=3 stays batch-size-only (batch-K coupling would
+hurt mixed batches). Applied-tested in a pristine container: patches + `ast.parse` clean.
+
+**Wiring.** `aijuus/model-registry.json`: `RADIANCE_ACC_GATE=1`, `RADIANCE_ACC_GATE_BATCH=2` added to
+both MTP server_env blocks (`mtp-27B-MXFP4-blend`, `mtp-27B-MXFP4-Thinkingcap`).
+
+**Status.** NOT live yet: the user's 08:03 restart (Thinkingcap switch) booted before these edits
+(installed speculator grep `RADIANCE_ACC_GATE` = 0; PID1 env has DYNAMIC_DEPTH but not ACC_GATE).
+Takes effect on the next restart. Verify: boot log `[dyn-depth] applied`, then `RADIANCE_ACC_GATE_DIAG`
+`[acc-gate]` lines should show `k` dropping on low-`accmax` lone streams, and high-entropy bs=1
+throughput rising toward the ~60+ tok/s regime seen in the discriminator.
+
+## 2026-10-02 (cont. 92) -- acceptance gate MEASURED, refuted, disabled
+
+**Live-apply.** The overlay patches are marker-idempotent and `docker start` reuses the container
+filesystem, so the new gate never applied on restart (`[dyn-depth] speculator.py already applied`).
+Applied the gate delta directly to both containers' installed speculator via
+`aijuus/apply_acc_gate_live.py` (+6 refs each); a changed patch needs a container RECREATE for the
+entrypoint path to pick it up. Gate confirmed live: `drafts/update` fell 5.00 -> 2.84/3.34 on vllm-1.
+
+**Measured on vllm-1 (blend, gate on vs the gate-off baseline earlier same instance):**
+| regime | baseline tok/s | gate tok/s | baseline drafts/upd | gate drafts/upd | baseline acc/upd | gate acc/upd |
+|---|---|---|---|---|---|---|
+| greedy/predictable | 137.2 | 133.2 | 5.00 | 4.97 | 4.90 | 4.92 |
+| greedy/high-entropy | 61.7 | **65.3 (+6%)** | 5.00 | 3.34 | 1.61 | 1.61 |
+| sampled/high-entropy | 67.8 | **56.8 (-16%)** | 5.00 | 2.84 | 1.90 | 1.23 |
+
+**Verdict: net-negative on the live default (sampled, temp 0.7/top_p 0.95/top_k 20); disabled.**
+Step time fell only 42.7 -> 39.3 ms (-8%) while tokens/step fell 2.90 -> 2.23 (-23%). The draft loop
+is only ~8% of the step (each draft forward ~1.6 ms = 849 MB bf16 MTP block; K=5 ~= 8 ms of ~43 ms);
+the target weight stream (~24 ms) dominates. Marginal drafts have POSITIVE expected value under
+sampled/stochastic acceptance, so trimming K loses more accepted tokens than the time it saves.
+Greedy/zero-acceptance streams are the exception (dead drafts removed -> +6%).
+
+**Corrected premise.** The earlier "lone low-acceptance stream = 4x loss from the draft loop" was
+wrong; the gate can save at most ~8-15% even at zero acceptance, and it HURTS sampled throughput. The
+vllm-0 10 tok/s was thermal (97 C junction, sclk 3364 MHz) + 17k context, not the draft loop. Registry
+set `RADIANCE_ACC_GATE=0` on both MTP models; the code stays as an off-by-default option
+(`apply_acc_gate_live.py` / `patch_dynamic_depth.py`), margin/EMA knobs documented. If ever re-enabled
+for strict-zero streams, use a much higher margin (e.g. ceil(ema)+3) and gate on ema < ~1.
+
+**Takeaway for MTP optimization.** Draft depth is a sub-10% lever. Future throughput work should
+target the TARGET forward (decode GEMM split-K/BK at small M, attention, GDN) or reducing verify
+rows -- not K. GPU0 thermal (LACT undervolt/clock cap <=3.3 GHz) is the real vllm-0 problem.
