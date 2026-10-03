@@ -1,7 +1,10 @@
 #!/bin/bash
-# Shared vLLM entrypoint for both vllm-0 and vllm-1 services.
-# Parameterized by SERVE_PORT (8000 for vllm-0, 8001 for vllm-1).
-# All other logic is identical across instances; SERVE_RANK distinguishes them.
+# Shared entrypoint for the single dual-card vllm service.
+# Parent mode (default): select the model from the registry/state, install the
+# runtime overlay + patches, then exec engine-supervisor.py, which spawns the
+# engine set for the model's topology.
+# Rank-child mode (RADIANCE_RANK_CHILD=1): skip selection+prep and exec THIS
+# engine's vLLM with SERVE_PORT / SERVE_RANK / TP from the supervisor.
 set -e
 
 # ---- model selection (hot-swap; see model-registry.json) ----
@@ -13,7 +16,13 @@ set -e
 # then resolves from these values unchanged.
 RID=${SERVE_RANK:-0}
 INST="vllm-$RID"
+# ---- rank-child mode: engine-supervisor.py re-invokes this script once per
+# engine with RADIANCE_RANK_CHILD=1. The parent already selected the model and
+# installed the runtime overlay + patch/prep, so a child skips selection+prep and
+# only resolves its own serving shape + execs vLLM.
+if [ "${RADIANCE_RANK_CHILD:-0}" != 1 ]; then
 [ -f /patches/aijuus/model-registry.json ] || { echo "[run] FATAL: /patches/aijuus/model-registry.json missing (repo bind not mounted?)" >&2; exit 1; }
+set -a
 eval "$(python3 - "$INST" <<'PY'
 import json, os, sys
 inst = sys.argv[1]
@@ -56,12 +65,16 @@ print("TOOL_CALL_PARSER=" + q(pick("tool_call_parser", "")))
 print("REASONING_PARSER=" + q(pick("reasoning_parser", "")))
 gc = pick("generation_config", None)
 print("GEN_CFG=" + q(json.dumps(gc) if gc else "{}"))
+# Serving topology: "dp" = one TP=1 engine per card (two ports, the MTP shape),
+# "tp2" = one TP=2 engine across both cards (one port). Read by engine-supervisor.py.
+print("RADIANCE_TOPOLOGY=" + q(e.get("topology", dflt.get("topology", "dp"))))
 env = dict(dflt.get("server_env", {}))
 env.update(e.get("server_env", {}))
 for k in sorted(env):
     print("export " + k + "=" + q(env[k]))
 PY
 )"
+set +a
 # ---- A/B override hook (dev): /patches/aijuus/ab.env, sourced on every container start ----
 # Container env is fixed at `docker create`; a `docker kill && docker start` only re-runs this
 # entrypoint, so an A/B arm that needs different RADIANCE_* values writes them here and restarts
@@ -71,7 +84,8 @@ if [ -f /patches/aijuus/ab.env ]; then
   sed 's/^/    /' /patches/aijuus/ab.env
   set -a; . /patches/aijuus/ab.env; set +a
 fi
-echo "[run] model selected: $MODEL_NAME path=$VLLM_MODEL_PATH spec=$SPEC_METHOD/$SPEC_TOKENS kv=$KV_CACHE_MEMORY vhead=${VERIFY_HEAD:-auto}"
+echo "[run] model selected: $MODEL_NAME path=$VLLM_MODEL_PATH spec=$SPEC_METHOD/$SPEC_TOKENS kv=$KV_CACHE_MEMORY vhead=${VERIFY_HEAD:-auto} topology=${RADIANCE_TOPOLOGY:-dp}"
+fi  # end model selection (parent only)
 
 # ---- parametrized serving shape (env vars, defaults = measured TP=1) ----
 SEQS=${MAX_NUM_SEQS:-8}
@@ -122,6 +136,14 @@ RTHREADS=${KV_OFFLOAD_READ_THREADS:-32}
 WTHREADS=${KV_OFFLOAD_WRITE_THREADS:-16}
 FANOUT=${RADIANCE_FS_FANOUT_MAX:-32}
 RID=${SERVE_RANK:-0}
+# Tensor-parallel size for THIS engine. The supervisor sets TP=1 (one engine per
+# card) or TP=2 (one engine across both cards). RADIANCE_FP8_STREAM_TP1 is a
+# TP=1-only residual-stream epilogue, so force it off whenever TP>1.
+TP=${TP:-1}
+if [ "$TP" != 1 ]; then export RADIANCE_FP8_STREAM_TP1=0; fi
+# A TP=2 engine crosses both cards; at 0.98 the startup free-memory guard trips
+# (free ~31.2 GiB vs 0.98*31.86=31.22), so default TP>1 to 0.95 unless set.
+GPU_UTIL=${GPU_UTIL:-$([ "$TP" = 1 ] && echo 0.98 || echo 0.95)}
 OVMODE=off
 if [ -n "$KV_OFFLOAD_GIB" ] && [ "$KV_OFFLOAD_GIB" != 0 ]; then OVMODE=on; fi
 MAMBA_MODE=${MAMBA_CACHE_MODE:-align}
@@ -209,6 +231,8 @@ export SERVE_KV_SOURCE="$KV_SRC"
 export SERVE_SPEC_RESOLVED="$SPEC"
 echo "[run] TP=1 shape: seqs=$SEQS maxlen=$MLEN chunk=$CHUNK kv=${KMEM:-none}($KV_SRC) spec=$SMETHOD/$SPEC ar_max_kb=$AR_MAX_KB captures=$CAPLIST"
 
+# ---- one-time prep (parent only; children inherit the installed overlay) ----
+if [ "${RADIANCE_RANK_CHILD:-0}" != 1 ]; then
 SP=/opt/vllm/lib/python3.12/site-packages
 cd /patches
 
@@ -309,10 +333,48 @@ bash aijuus/kv-offload/ops/apply-kv-patches.sh
 #  patch scripts, so the amdsmi .pth is active for every python process. Nothing to copy here.)
 
 hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $([ "${MXFP4_CUMODE:-0}" = 1 ] && echo -mcumode) $(python3 -m pybind11 --includes) radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
-if [ -n "${R4D_SO:-}" ] && [ -f /r4d/r4d.so ]; then
-  cp /r4d/r4d.so "$SP"/r4d.so
-  echo "[radiance] using patched r4d.so from $R4D_SO"
+# Per-model libr4d selection: R4D_SO_DIR is a CONTAINER path (e.g. /r4d-rx6),
+# defaulting to /r4d. Lets one service run models that need different r4d builds
+# (paro5 has only been validated on b9e42ab-rx6). R4D_SO stays the host path, for
+# logging only.
+R4D_DIR=${R4D_SO_DIR:-/r4d}
+if [ -f "$R4D_DIR/r4d.so" ]; then
+  cp "$R4D_DIR/r4d.so" "$SP"/r4d.so
+  echo "[radiance] using patched r4d.so from $R4D_DIR (host ${R4D_SO:-<image>})"
 fi
+
+# ---- ParoQuant W4A8/W5A8 kernel + quant-method registration (RADIANCE_PAROQUANT) ----
+# The paroquant quant_method and its W5A8 kernel live in the repo's paroquant/
+# dir (mounted at /paro), not in the image. Build the kernel once here and
+# register the method via the STDLIB sitecustomize so it is imported by the
+# engine AND every TP worker process (a site-packages sitecustomize.py is
+# shadowed by Ubuntu's /usr/lib one). Guarded so a restart cannot append twice.
+if [ "${RADIANCE_PAROQUANT:-0}" = 1 ]; then
+  if [ -d /paro ]; then
+    ( cd /paro && hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 \
+        ${RADIANCE_PQ_HIPCC_FLAGS:-} $(python3 -m pybind11 --includes) \
+        radiance_paroquant.hip -o "$SP"/radiance_paroquant_kernel.so ) \
+      || { echo "[radiance] FATAL: paroquant kernel build failed" >&2; exit 1; }
+    cp /paro/radiance_paroquant.py /paro/radiance_paroquant_mxfp4.py "$SP"/
+    cp /patches/radiance_dflash_capture.py "$SP"/ 2>/dev/null || true
+    if ! grep -q radiance_paroquant /usr/lib/python3.12/sitecustomize.py; then
+      printf "%s\n" \
+        "try:" \
+        "    import radiance_paroquant  # registers the paroquant quantization config" \
+        "    import radiance_paroquant_mxfp4  # and the MXFP4-weights variant (paroquant_mxfp4)" \
+        "    import radiance_dflash_capture  # drafter training-data capture (inert unless RADIANCE_DFLASH_CAPTURE_DIR)" \
+        "except Exception as e:" \
+        "    import sys" \
+        "    sys.stderr.write(\"[radiance.paroquant] registration failed: %r\\n\" % (e,))" \
+        >> /usr/lib/python3.12/sitecustomize.py
+    fi
+    echo "[radiance] paroquant kernel built + quant method registered (sitecustomize)"
+  else
+    echo "[radiance] FATAL: RADIANCE_PAROQUANT=1 but /paro is not mounted" >&2
+    exit 1
+  fi
+fi
+fi  # end one-time prep (parent only)
 
 # Shape labels for Prometheus (node-exporter --collector.textfile
 # scrapes the shared serve-shape volume).
@@ -337,9 +399,22 @@ echo "[run] shape labels: kv=$KV_SRC spec=$SMETHOD/$SPEC"
 # instance sweep the other's live region. A uuid is un-sweepable and
 # a hostname changes on container recreate (would orphan the sweep),
 # so the stable, unique per-instance rank is the right token.
-: "${SERVE_RANK:?SERVE_RANK must be set to a distinct value per instance (0/1)}"
+: "${SERVE_RANK:=$RID}"
 ENG_ID="radrank$SERVE_RANK"
-bash aijuus/kv-offload/ops/clean-stale-ram-tier.sh "$ENG_ID"
+bash /patches/aijuus/kv-offload/ops/clean-stale-ram-tier.sh "$ENG_ID"
+# Cross-rank sweep, PARENT ONLY (before engine-supervisor spawns any engine, so no
+# engine of this container is live yet -> any region bearing either rank id is stale).
+# The one container owns BOTH possible rank regions and restarts as a unit, so a
+# previous DP run (radrank1) that was SIGKILLed (OOM / docker kill / hard freeze /
+# the supervisor's c.kill()) leaves its pre-faulted tmpfs CPU-KV tier in host RAM.
+# Switching to a no-offload model (tp2, e.g. paro5-27B-int5, KV_OFFLOAD_GIB=0) starts
+# only radrank0, so that leaked radrank1 region would otherwise never be reclaimed.
+# Keep rank-children on their own single id above to avoid racing the live peer.
+if [ "${RADIANCE_RANK_CHILD:-0}" != 1 ]; then
+  for _r in 0 1; do
+    bash /patches/aijuus/kv-offload/ops/clean-stale-ram-tier.sh "radrank$_r"
+  done
+fi
 cd /
 
 # Final argv assembled here from the resolved shape (no static command:
@@ -401,12 +476,19 @@ if [ -n "${RADIANCE_PROFILER_DIR:-}" ]; then
   echo "[run] torch profiler enabled: $PROF_ARG"
 fi
 
+# ---- parent: hand off to the topology supervisor (it spawns 1 or 2 engines) ----
+if [ "${RADIANCE_RANK_CHILD:-0}" != 1 ]; then
+  echo "[run] prep done; starting engine-supervisor (topology=${RADIANCE_TOPOLOGY:-dp})"
+  exec python3 /patches/aijuus/engine-supervisor.py
+fi
+
+# ---- rank child: exec THIS engine's vLLM ----
 # shellcheck disable=SC2086
 exec /opt/radiance_entrypoint.sh \
   "$VLLM_MODEL_PATH" --served-model-name "$VLLM_SERVED_MODEL_NAME" \
   --host 0.0.0.0 --port "$SERVE_PORT" \
-  --kv-cache-dtype "$KV_CACHE_DTYPE" --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.98 $KV_ARG $OFF_ARG \
+  --kv-cache-dtype "$KV_CACHE_DTYPE" --tensor-parallel-size "$TP" \
+  --gpu-memory-utilization "${GPU_UTIL:-0.98}" $KV_ARG $OFF_ARG \
   --max-model-len "$MLEN" --max-num-seqs "$SEQS" --max-num-batched-tokens "$CHUNK" \
   --attention-backend "$ATTN" \
   $SPEC_ARG \

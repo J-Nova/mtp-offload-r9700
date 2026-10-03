@@ -1,16 +1,14 @@
-# Coolify deployment for MXFP4 (path A) -- TWO GPUs, data-parallel. One MXFP4-OCP-GPTQ
-# instance per card (each TP=1, no tensor parallelism), load-balanced by
-# model-router (a Python OpenAI front door; see MODEL HOT-SWAP below).
-# DEFAULT (2026-09-28): Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp -- MTP SPEC=8 via the head
-# inside the blend (no drafter), verify_head=0. Every other registry model (ThinkingCap dflash/16,
-# base MXFP4 dflash/16, blend dflash/16) loads on request. The 160000 KV pin (8761733283,
-# seqs=8/chunk=4096/dflash:16) is calibrated for the dflash entries; the blend-MTP entry has no
-# mtp:8 pin yet, so it profiles KV. DECODE_MAX_M/capture ladder sized for SEQS*(SPEC+1)=136.
-#
-# Generated from `coolify-compose.yml` (the 1x R9700 / TP=1 profile) on 2026-09-22.
-# It is that file with the single `vllm` service fanned out into `vllm-0` (GPU 0) and
-# `vllm-1` (GPU 1) + a load balancer in front, the observability scrape list updated
-# for two backends, and Open WebUI pointed at the LB.
+# Coolify deployment for the single dual-card radiance service, topology-aware.
+# ONE `vllm` container owns BOTH R9700s; engine-supervisor.py brings up the engine
+# set the selected model's registry `topology` asks for:
+#   topology=dp  -> two TP=1 engines, one per card, ports 8000/8001 (the MTP shape)
+#   topology=tp2 -> one TP=2 engine across both cards, port 8000 (int5-paro / large models)
+# model-router (the public OpenAI front door) + model-controller (hot-swap) are unchanged;
+# a `POST /load {"model": ...}` restarts the one container, which re-reads state.json and
+# re-derives the topology. See MODEL HOT-SWAP and TOPOLOGY below.
+# DEFAULT (2026-09-28): Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp (topology=dp, MTP SPEC=8 via
+# the head inside the blend, no drafter). Registry models load on request; paro5-27B-int5 is
+# topology=tp2.
 #
 # MODEL HOT-SWAP (2026-09-28): model-registry.json (repo root) maps each servable model to
 # its path / drafter / spec / calibrated KV pin. model-router (:8100) owns the OpenAI API:
@@ -22,12 +20,15 @@
 # Add a model by adding a key to model-registry.json (kv_cache_memory MUST be calibrated
 # per model via ./calibrate-kv.sh).
 #
-# WHY TWO INSTANCES AND NOT TENSOR=2 (the x1-lane reason):
-#   The second card sits on a PCIe x1 lane. Tensor-parallel runs an all-reduce across BOTH
-#   cards every layer -- over an x1 link (~1 GB/s) that would throttle the whole run.
-#   Two independent TP=1 instances do ZERO inter-GPU communication in the inference hot path
-#   (each model is fully VRAM-resident on its own card). x1 only slows that card's one-time
-#   weight load (cached after the first start); steady-state throughput is not affected.
+# TOPOLOGY (why one container, and why the supervisor):
+#   A TP=2 engine owns BOTH cards in ONE process; a DP pair owns one card each in TWO
+#   processes. Both must be reachable through the same registry + reload endpoint, so the
+#   container hosts a small supervisor (engine-supervisor.py) that spawns the right engine
+#   set per model. A DP pair would otherwise need two containers; a TP=2 model would need a
+#   different compose. A swap restarts the one container, so the router holds in-flight
+#   requests via its HOLD path instead of erroring.
+#   (This host's two cards do P2P at ~14 GB/s, so TP=2 is viable here; the old x1-lane
+#   argument applied to host<->GPU DMA and no longer blocks tensor parallelism.)
 #
 # Deploy (paste this whole file into Coolify as a Docker Compose resource on THIS host,
 # the one with /dev/kfd + /home/juup/models):
@@ -35,7 +36,7 @@
 #   2. Deploy in Coolify.
 #   Domains (set in the Coolify UI):
 #     model-router      -> port 8100   (the public endpoint; Open WebUI + clients point here)
-#     vllm-0 / vllm-1   -> 8000 / 8001 (OPTIONAL, for direct per-instance access + debugging)
+#     vllm              -> 8000 / 8001 (OPTIONAL, direct engine access for debugging; 8001 only in dp)
 #     open-webui        -> 8080, grafana -> 3000, prometheus -> 9090 (or keep internal-only)
 # Do NOT publish host ports here; Traefik on the `coolify` net handles exposure.
 #
@@ -65,7 +66,7 @@
 #   one shared prompt. For a chat UI, least-inflight is the 90%.
 
 services:
-  vllm-0:
+  vllm:
     image: juupp/vllm-radiance:0.9.3-collect-tokens
     restart: unless-stopped
     # Give vLLM time to exit cleanly so the token collector's atexit/signal save
@@ -95,6 +96,7 @@ services:
       - coolify
     expose:
       - "8000"
+      - "8001"
     environment:
       - VLLM_API_KEY=${VLLM_API_KEY:?set VLLM_API_KEY in the Coolify service environment}
       # Deterministic block-hash seed. vLLM seeds its prefix-cache hash chain with a
@@ -107,10 +109,9 @@ services:
       # so both replicas share one key space -- the premise the fs tier documents.
       # MUST be the SAME value on both instances. P2P would refuse to start without it.
       - PYTHONHASHSEED=0
-      - ROCR_VISIBLE_DEVICES=0
-      - HIP_VISIBLE_DEVICES=0
-      # Instance index for the shape-label metric (radiance_serve_info{instance=...}) and
-      # for the per-instance serve_shape_<rank>.prom file. Keep 0 here, 1 on vllm-1.
+      - ROCR_VISIBLE_DEVICES=0,1
+      # Parent rank for state.json model selection + the shape-label metric.
+      # engine-supervisor.py assigns each engine its own SERVE_RANK.
       - SERVE_RANK=0
       # --- one-off draft-vocab collection run (2026-09-28) ---
       # Records every draft token id the MTP head proposes (compute_logits argmax)
@@ -259,13 +260,21 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/cache/inductor
       - TRITON_CACHE_DIR=/cache/triton
       - AITER_ROOT_DIR=/cache/aiter
+      # AITER compiles module_aiter_core into get_user_jit_dir()/build. Unset, that
+      # defaults to the container's site-packages/aiter/jit, so EVERY container
+      # recreate pays the ~421 s rebuild (aiter/jit/core.py:431-446). Point it at
+      # the persistent /cache bind instead: one build, then reused across
+      # recreates. Version-suffixed so an aiter upgrade can't load a stale .so.
+      - AITER_JIT_DIR=/cache/aiter-jit-0.1.17
       - TRITON_CACHE_AUTOTUNING=1
       - R4D_SO=/home/juup/.cache/radiance-libr4d/v0.5.0-rx12
     volumes:
       - /home/juup/models:/models
       - /home/juup/.radiance-cache-w4a8-093-gdnm-nqft-fp8s-gnq-tp1s:/cache
       - /home/juup/radiance-vllm-mxfp4:/patches:z
+      - /home/juup/radiance-vllm-mxfp4/paroquant:/paro:z
       - /home/juup/.cache/radiance-libr4d/v0.5.0-rx12:/r4d:z
+      - /home/juup/.cache/radiance-libr4d/b9e42ab-rx6:/r4d-rx6:z
       # Shared fs KV tier backing store, mounted into BOTH instances. Point the host side at a
       # dedicated SSD/volume (or a loop volume from ops/make-kvcache-volume.sh). Docker creates
       # the default path if absent. The host-side reaper runs against the same directory.
@@ -283,225 +292,6 @@ services:
         bash /patches/aijuus/kv-offload/ops/entrypoint.sh
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 60
-      start_period: 1800s
-
-  vllm-1:
-    image: juupp/vllm-radiance:0.9.3-collect-tokens
-    restart: unless-stopped
-    # Give vLLM time to exit cleanly so the token collector's atexit/signal save
-    # runs before the container is SIGKILLed. 10s (docker default) is not enough.
-    stop_grace_period: 120s
-    privileged: true
-    ipc: host
-    devices:
-      - /dev/kfd:/dev/kfd
-      - /dev/dri:/dev/dri
-    group_add:
-      - "993"
-      - "44"
-    security_opt:
-      - seccomp=unconfined
-    cap_add:
-      - SYS_PTRACE
-    # Hard HOST RAM cap (VLLM_MEM_LIMIT). VRAM is NOT bounded by this: GPU device memory
-    # is a different cgroup resource, so --gpu-memory-utilization 0.98 still uses all of
-    # VRAM. Sized for the 16 GiB pinned CPU KV tier plus runtime/load headroom
-    # (lower KV_OFFLOAD_GIB if you shrink this). Memswap == mem so a runaway cannot refill
-    # host swap (which was 100% full at both 2026-09-23 freezes); it is cgroup-OOM-killed
-    # instead. Production runs 28g; the repo .env carries a stale single-instance 20g.
-    mem_limit: ${VLLM_MEM_LIMIT:-28g}
-    memswap_limit: ${VLLM_MEM_LIMIT:-28g}
-    networks:
-      - coolify
-    expose:
-      - "8001"
-    environment:
-      - VLLM_API_KEY=${VLLM_API_KEY:?set VLLM_API_KEY in the Coolify service environment}
-      # Deterministic block-hash seed. See the note on vllm-0: without PYTHONHASHSEED
-      # vLLM seeds the prefix-cache hash chain from os.urandom, so the SHARED fs tier
-      # cannot dedup or read the other instance's blocks. MUST match vllm-0 exactly.
-      - PYTHONHASHSEED=0
-      # ROCR_VISIBLE_DEVICES = ABSOLUTE card id; HIP_VISIBLE_DEVICES indexes INTO that
-      # filtered list, so it must be 0..n-1 for this 1-card container -> HIP=0, NOT 1.
-      # (HIP=1 here points past the 1-element list -> "No CUDA GPUs are available".)
-      - ROCR_VISIBLE_DEVICES=1
-      - HIP_VISIBLE_DEVICES=0
-      # Instance index for the shape-label metric (radiance_serve_info{instance=...}).
-      - SERVE_RANK=1
-      # --- one-off draft-vocab collection run (2026-09-28) ---
-      # Records every draft token id the MTP head proposes (compute_logits argmax)
-      # so a reduced-vocab draft_keep_file can be built for this model. Writes to a
-      # per-instance file under the repo bind (/patches == repo root on the host),
-      # flushed periodically + on shutdown. Set RADIANCE_COLLECT_TOKENS=0 to disable.
-      - RADIANCE_COLLECT_TOKENS=${RADIANCE_COLLECT_TOKENS:-0}
-      - RADIANCE_COLLECT_TOKENS_FILE=/patches/aijuus/draft_keep/rank1.json
-      - RADIANCE_COLLECT_TOKENS_INTERVAL=20
-      # Model to boot when /model-state/state.json has no entry for this instance yet
-      # (fresh boot). Hot-swap restarts read state.json instead; see model-registry.json.
-      - MODEL_DEFAULT=${MODEL_DEFAULT:-Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp}
-      # Model identity, drafter, spec depth and KV pin are intentionally NOT set
-      # here: the entrypoint resolves them per model from model-registry.json
-      # (keyed by this instance's model in state.json). A value set here would be
-      # silently overwritten by that eval -- see the model-selection block below.
-      # CPU KV-offload tier, GiB (0 = off). Default 16 per PERFORMANCE.md for the prod
-      # 2-instance shape: both share the host /dev/shm (ipc: host, raised to 40 G; was 32 G)
-      # so the two tiers SUM to <= ~36 G (both default 16 -> 32 G) plus headroom. The head cap
-      # is "auto" (a fair share per concurrent request) so an over-subscribed cycle restores a
-      # partial prefix instead of nothing. See PERFORMANCE.md "Productionizing the CPU/disk KV
-      # offload".
-      - KV_OFFLOAD_GIB=${KV_OFFLOAD_GIB:-16}
-      # --- Offload tuning knobs (set per redeploy to A/B in Grafana) ---
-      # Primary (CPU/RAM) tier eviction policy: "lru" (default) or "arc". ARC
-      # (Adaptive Replacement Cache) balances recency + frequency, which can lift the
-      # RAM hit rate on repeated-prefix traffic (RAM hit ~1 s vs disk ~8.6 s). Compare
-      # runs with the Grafana row "Offload tuning A/B (eviction / async / fan-out)".
-      - KV_OFFLOAD_EVICTION_POLICY=${KV_OFFLOAD_EVICTION_POLICY:-lru}
-      # fs secondary-tier I/O pool sizes. Reads are what restore latency waits on; the
-      # fs fan-out patch also splits one restore across up to READ threads.
-      - KV_OFFLOAD_READ_THREADS=${KV_OFFLOAD_READ_THREADS:-32}
-      - KV_OFFLOAD_WRITE_THREADS=${KV_OFFLOAD_WRITE_THREADS:-16}
-      # fs fan-out budget (patch_offload_fs_tier.py): MAX = flat batch cap (0 = derive
-      # from TARGET_MB / block bytes). Raising it parallelises a single restore. The
-      # measured SATA ceiling is ~480 MB/s, so fan-out (not the thread count) is what
-      # closes the gap between the ~270 MB/s seen today and the device limit.
-      - RADIANCE_FS_FANOUT_TARGET_MB=${RADIANCE_FS_FANOUT_TARGET_MB:-512}
-      - RADIANCE_FS_FANOUT_MAX=${RADIANCE_FS_FANOUT_MAX:-32}
-      # Async scheduler: 0 = keep --no-async-scheduling (current, conservative);
-      # 1 = --async-scheduling (overlap CPU scheduling with GPU work). Test for
-      # regressions against the custom R4D/Mamba backends before trusting it.
-      - VLLM_ASYNC_SCHEDULING=${VLLM_ASYNC_SCHEDULING:-0}
-      # On this stack async refuses KV offload (unvalidated). 1 forces the combination
-      # for a test; expect offload-cache corruption if it is genuinely unsafe.
-      - RADIANCE_ASYNC_ALLOW_OFFLOAD=${RADIANCE_ASYNC_ALLOW_OFFLOAD:-0}
-      # Head-cap override: empty = auto by topology (Mode A "auto", Mode B off). See the KV block.
-      - KV_OFFLOAD_HEAD_CAP=${KV_OFFLOAD_HEAD_CAP:-}
-      - MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
-      - MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-4096}
-      - RADIANCE_OFFLOAD_EAGLE_FIX=${RADIANCE_OFFLOAD_EAGLE_FIX:-1}
-      - RADIANCE_OFFLOAD_EAGLE_GROUPS=${RADIANCE_OFFLOAD_EAGLE_GROUPS:-1}
-      - RADIANCE_OFFLOAD_DEBUG=${RADIANCE_OFFLOAD_DEBUG:-0}
-      - RADIANCE_OFFLOAD_TRACE=${RADIANCE_OFFLOAD_TRACE:-0}
-      # Phase 1: mixed-hit safety (behavior, keep 1) + offload instrumentation (metrics-only;
-      # default 0 for the prefill A/B -- the debug JSON sink and counters cost CPU on the hot path).
-      - RADIANCE_OFFLOAD_MIXED_HIT=${RADIANCE_OFFLOAD_MIXED_HIT:-1}
-      - RADIANCE_OFFLOAD_INSTRUMENTATION=${RADIANCE_OFFLOAD_INSTRUMENTATION:-0}
-      # Phase 2 (behavioral): reconcile re-ask + prompt last-block alignment.
-      - RADIANCE_RECONCILE_REASK=${RADIANCE_RECONCILE_REASK:-1}
-      - RADIANCE_ALIGN_PROMPT_LAST_BLOCK=${RADIANCE_ALIGN_PROMPT_LAST_BLOCK:-1}
-      # Mamba store cadence (patch_mamba_stride.py): a Mamba group holds ONE recurrent state but
-      # the store path writes a full 6-group snapshot at every chunk boundary (~4.17x temporal
-      # amplification). Keep every Nth snapshot; 1 disables. Prereq: RADIANCE_OFFLOAD_EAGLE_GROUPS.
-      # At N=4 the CPU tier holds ~2.4x more tokens; the cost is a truncated-prefix dead zone
-      # (a prefix shorter than N chunks gets no external hit). Matches serve-mxfp4.sh:919.
-      - RADIANCE_MAMBA_STORE_STRIDE=${RADIANCE_MAMBA_STORE_STRIDE:-4}
-      # Phase 5 (optional metrics): lookup counters, debug instrument, tier report, promotion wallclock, miss deferral.
-      - RADIANCE_OFFLOAD_LOOKUP_METRICS=${RADIANCE_OFFLOAD_LOOKUP_METRICS:-0}
-      - RADIANCE_OFFLOAD_DEBUG_INSTRUMENT=${RADIANCE_OFFLOAD_DEBUG_INSTRUMENT:-0}
-      - RADIANCE_OFFLOAD_TIER_REPORT=${RADIANCE_OFFLOAD_TIER_REPORT:-0}
-      - RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK=${RADIANCE_OFFLOAD_PROMOTION_WALLCLOCK:-0}
-      - RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS=${RADIANCE_OFFLOAD_MISS_DEFERRAL_METRICS:-0}
-      # Optional fs-tier host bind; set KV_OFFLOAD_DISK_HOST_DIR to put the shared disk store elsewhere.
-      # SHARED fs secondary tier (Mode B, DEFAULT): both instances point at the same directory,
-      # so a prefix cached by one is loadable by the other (and it survives restarts). This is
-      # a path INSIDE the container; the host dir (KV_OFFLOAD_DISK_HOST_DIR) is mounted at
-      # /kvcache on BOTH services, and the host-side reaper (ops/kvcache-reap.sh) is REQUIRED
-      # against `$KV_OFFLOAD_DISK_HOST_DIR/blocks` -- the tier never deletes on its own.
-      # patch_offload_fs_tier.py (store fan-out + async-lookup invalidation on a store landing;
-      # 0.29.0 already handles a failed load) is ported to this image's vLLM 0.29.0.
-      # Set this to empty for CPU-only (Mode A): that turns on the auto head-cap and needs no
-      # reaper (watch for the boot line
-      #   [radiance] WARNING: fs tier fan-out ... did NOT apply -- do NOT enable the fs disk tier).
-      - KV_OFFLOAD_DISK_DIR=${KV_OFFLOAD_DISK_DIR-/kvcache/blocks}
-      - HF_HUB_OFFLINE=1
-      - VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
-      - VLLM_NO_USAGE_STATS=1
-      - VLLM_ROCM_USE_AITER=1
-      - VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1
-      - VLLM_ROCM_USE_AITER_MHA=0
-      - VLLM_ROCM_USE_AITER_MLA=0
-      - VLLM_ROCM_USE_AITER_MOE=0
-      - VLLM_ROCM_USE_AITER_LINEAR=0
-      - VLLM_ROCM_USE_AITER_FP8BMM=0
-      - VLLM_ROCM_USE_AITER_FP4BMM=0
-      - VLLM_ROCM_USE_AITER_RMSNORM=0
-      - NCCL_PROTO=Simple
-      - RADIANCE_USE_R4D=1
-      - RADIANCE_USE_R4D_AR=1
-      - RADIANCE_USE_R4D_AR_QUANT=1
-      - RADIANCE_R4D_REPORT=0
-      # Diagnostics off for the throughput A/B (DRAFT_STATS prints controller counters to stderr
-      # every 200 steps; RUN_BWTEST is a startup bandwidth sweep; both cost nothing at steady state
-      # but are not needed to serve). COLLECT_TOKENS stays 0 unless rebuilding the draft vocab.
-      - RADIANCE_DRAFT_STATS=0
-      - RADIANCE_RUN_BWTEST=0
-      - RADIANCE_AR_QBITS=6
-      - RADIANCE_TP_PAD=0
-      - RADIANCE_TP_PAD_DRAFTER=0
-      - RADIANCE_TP_PAD_STRICT=0
-      - RADIANCE_GDN_MERGE_INPROJ=1
-      - RADIANCE_FP8_STREAM_TP1=1
-      - RADIANCE_GDN_NORM_QUANT=1
-      - RADIANCE_GDN_STRIDED_GATES=0
-      - RADIANCE_GDN_EMPTY_OUT=0
-      - R4D_ATTN_FP8=3
-      - RADIANCE_AR_OVERLAP=0
-      - RADIANCE_GDN_FUSED_UPDATE=1
-      - RADIANCE_GDN_FUSED_MAX_ITEMS=48
-      - RADIANCE_GDN_TRACE_SIDX=0
-      - RADIANCE_GDN_LAZY=0
-      - RADIANCE_AR_QNB=96
-      - RADIANCE_AR_QNT=1024
-      - MXFP4_CUMODE=0
-      - RADIANCE_STEP_TRACE=0
-      - RADIANCE_AR_OVERLAP_MIN_M=2048
-      - RADIANCE_AR_OVERLAP_SLICES=4
-      - RADIANCE_TOPK_TRITON_MIN_ROWS=8
-      - RADIANCE_SKINNY_GEMM=1
-      - RADIANCE_DRY_MULTIPLIER=${RADIANCE_DRY_MULTIPLIER:-}
-      - RADIANCE_DRY_BASE=${RADIANCE_DRY_BASE:-}
-      - RADIANCE_DRY_ALLOWED_LENGTH=${RADIANCE_DRY_ALLOWED_LENGTH:-}
-      - RADIANCE_DRY_RANGE=${RADIANCE_DRY_RANGE:-}
-      - RADIANCE_DFLASH_CALIB_TOKENS=200000
-      - RADIANCE_FP8_STREAM=1
-      - RADIANCE_RMS_QUANT_FUSION=1
-      - RADIANCE_NVFP4_MXFP4=0
-      - RADIANCE_NVFP4_EXP=mse
-      - RADIANCE_NVFP4_FP8_LAYERS=mxfp4
-      - RADIANCE_NVFP4_BF16_LAYERS=in_proj_ba
-      - RADIANCE_NVFP4_LMHEAD=bf16
-      - RADIANCE_GDN_PATHS=both
-      - RADIANCE_GDN_NANTRACE=0
-      - VLLM_CACHE_ROOT=/cache/vllm
-      - TORCHINDUCTOR_CACHE_DIR=/cache/inductor
-      - TRITON_CACHE_DIR=/cache/triton
-      - AITER_ROOT_DIR=/cache/aiter
-      - TRITON_CACHE_AUTOTUNING=1
-      - R4D_SO=/home/juup/.cache/radiance-libr4d/v0.5.0-rx12
-    volumes:
-      - /home/juup/models:/models
-      - /home/juup/.radiance-cache-w4a8-093-gdnm-nqft-fp8s-gnq-tp1s-b:/cache
-      - /home/juup/radiance-vllm-mxfp4:/patches:z
-      - /home/juup/.cache/radiance-libr4d/v0.5.0-rx12:/r4d:z
-      # Shared fs KV tier backing store, mounted into BOTH instances. Point the host side at a
-      # dedicated SSD/volume (or a loop volume from ops/make-kvcache-volume.sh). Docker creates
-      # the default path if absent. The host-side reaper runs against the same directory.
-      - ${KV_OFFLOAD_DISK_HOST_DIR:-/var/lib/radiance-kvcache}:/kvcache
-      - /home/juup/.cache/huggingface:/root/.cache/huggingface
-      # Shared model-swap state (READ-ONLY here): the entrypoint picks its model from
-      # state.json at boot; model-controller is the sole writer. See model-registry.json.
-      - ${MODEL_STATE_HOST_DIR:-/home/juup/radiance-vllm-mxfp4/aijuus/model-state}:/model-state:ro
-      - serve-shape:/tmp/serve-shape
-    entrypoint:
-      - bash
-      - -lc
-      - |
-        export SERVE_PORT=8001
-        bash /patches/aijuus/kv-offload/ops/entrypoint.sh
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
       interval: 30s
       timeout: 5s
       retries: 60
@@ -536,8 +326,7 @@ services:
     networks:
       - coolify
     depends_on:
-      - vllm-0
-      - vllm-1
+      - vllm
       - model-controller
     environment:
       - VLLM_API_KEY=${VLLM_API_KEY:?set VLLM_API_KEY in the Coolify service environment}
@@ -548,11 +337,10 @@ services:
       # HOLD_TIMEOUT/KEEPALIVE_SECONDS/POLL_SECONDS/UPSTREAM_TIMEOUT also default
       # in the script; override them here to A/B the hold behaviour.
       # Idle routing preference (see model-router.py): when nothing is in flight,
-      # send the cold/first request to this card instead of the round-robin
-      # default. Concurrent load still balances across both cards. vllm-1 is the
-      # CPU-attached x16 slot; vllm-0 sits behind the chipset at 1x Gen3, so it
-      # is the backup, not the default. Comma-separate to rank more than one.
-      - RADIANCE_LB_PREFER=${RADIANCE_LB_PREFER:-vllm-1}
+      # send the cold/first request to this logical target instead of the
+      # round-robin default. Logical vllm-0/vllm-1 both live in the one container;
+      # in tp2 they collapse to the same endpoint. Comma-separate to rank several.
+      - RADIANCE_LB_PREFER=${RADIANCE_LB_PREFER:-vllm-0}
     volumes:
       # state.json is read per request; trigger.json is written here (so the dir
       # is mounted rw even though only trigger.json is new).
@@ -587,8 +375,7 @@ services:
     networks:
       - coolify
     depends_on:
-      - vllm-0
-      - vllm-1
+      - vllm
     environment:
       - VLLM_API_KEY=${VLLM_API_KEY:?set VLLM_API_KEY in the Coolify service environment}
       - MODEL_DEFAULT=${MODEL_DEFAULT:-Qwen3.8-3.6-27B-blend-MXFP4-OCP-GPTQ-mtp}
@@ -639,7 +426,7 @@ services:
           - job_name: vllm
             metrics_path: /metrics
             static_configs:
-              - targets: ['vllm-0:8000', 'vllm-1:8001']
+              - targets: ['vllm:8000', 'vllm:8001']
           - job_name: model-router
             metrics_path: /metrics
             static_configs:
