@@ -407,8 +407,8 @@ bash /patches/aijuus/kv-offload/ops/clean-stale-ram-tier.sh "$ENG_ID"
 # The one container owns BOTH possible rank regions and restarts as a unit, so a
 # previous DP run (radrank1) that was SIGKILLed (OOM / docker kill / hard freeze /
 # the supervisor's c.kill()) leaves its pre-faulted tmpfs CPU-KV tier in host RAM.
-# Switching to a no-offload model (tp2, e.g. paro5-27B-int5, KV_OFFLOAD_GIB=0) starts
-# only radrank0, so that leaked radrank1 region would otherwise never be reclaimed.
+# Switching to a model that starts only one rank (e.g. a tp2 model, which runs just
+# radrank0) leaves a previous DP run's leaked radrank1 region to never be reclaimed.
 # Keep rank-children on their own single id above to avoid racing the live peer.
 if [ "${RADIANCE_RANK_CHILD:-0}" != 1 ]; then
   for _r in 0 1; do

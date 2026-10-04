@@ -4,6 +4,118 @@ A running, dated log of what was changed, why, and how it was verified. Newest e
 Complements (does not replace) `TCCLA-VLLM-MTP-RESEARCH.md` and
 `TCCLA-VLLM-MTP-IMPLEMENTATION-PLAN.md`, which hold the analysis and the plan.
 
+## 2026-10-04 (cont. 35) — File-level KV pre-caching: deep research on EPIC + CacheBlend, perf matrix, implementation plan (NO CODE)
+
+Full plan: **`aijuus/FILE-KV-PRECACHE-PLAN.md`** (steal-this, resume-from-here). Deep research via two parallel subagents (EPIC, CacheBlend), stack-specific. Status: **plan only, not implemented** — gated on user go-ahead and on Phase-0 validation.
+
+### Goal
+Pre-compute KV for individual codebase files, store on the existing disk tier (`/kvcache/blocks`, 60 GiB, content-deterministic hashes), and reuse when those files reappear in later prompts — without full recompute. Files = "spans" at varying positions / multi-file contexts. Target: `paro5-27B-int5` (Qwen3.8-27B int5, RoPE, GQA, ~64 layers, 8 KV heads, head_dim 128, bf16 KV), 2× R9700 (**ROCm RDNA4 / gfx1201**), TP=2, **vLLM 0.29 V2 runner**, radiance overlay.
+
+### Why naive per-file pre-caching fails
+KV is sequential (token N depends on all before it); a file prefilled in isolation never attended to the system prompt / other files. vLLM's prefix cache is a content-addressed **prefix tree** (hash chains through all preceding tokens) → only matches an *identical* prefix, not an arbitrary embedded file. EPIC + CacheBlend are "Position-Independent Caching (PIC)" schemes: make KV position-independent + recompute a small subset to recover cross-attention.
+
+### Findings — how each works
+- **EPIC / "LegoLink"** (ICML '25, arXiv 2410.15332; repo `github.com/DerekHJH/epic` = a **vLLM fork**, ~2K lines Python, **no new CUDA kernels**): *compile* each span in isolation (`max_tokens=0` prefill → store KV under cache-ID, pos IDs from 0) + *link* (concat cached KVs in any order, append query, **recompute first `k≤32` tokens of each span (except first)** at new positions). The "attention-sink" insight: a span's first tokens trap attention; recomputing them at non-initial positions releases it. **O(k·N)≈O(N)**. Quality 0–7% (≤9B doc-QA, **NVIDIA-only, code EXCLUDED from eval**). 8× TTFT/7× tput is a memory-capacity artifact; defensible single-request ≈ **3× TTFT**. Precompute = 1 full prefill/file (one-time).
+- **CacheBlend** (EuroSys '25, arXiv 2405.16444; live in **LMCache** `github.com/LMCache/LMCache`, a **library + vLLM connector plugin**, not a fork): reuse cached KV + **recompute the ~15% highest-K-deviation (HKVD) tokens** (the ones attending across the boundary) via a gradual per-layer filter; `r=15%` is a fixed fraction (threshold early-stop is a TODO). Handles position via **delta RoPE re-rotation**. Pipelines recompute(layer L) with load(layer L+1). **O(0.15·N²) — quadratic in file size.** Quality ≤2% F1/Rouge-L (NVIDIA A40, 4K RAG, 7B–70B Llama/Yi/Mistral).
+- **Interaction: competing, NOT complementary.** Both solve the same sub-problem (recover cross-attention) with different selection (static first-k vs dynamic top-15%). **Stacking = redundant superset recompute, no quality gain** (EPIC's first-k ⊂ CacheBlend's 15%). Position-independence is shared + orthogonal (do once). For large immutable files **EPIC (O(kN)) is the better fit**; CacheBlend is the better reference (deviation selection + pipelining + storage controller). Our prior work already has position-independence (unrotated-K, MiniPIC `github.com/IBM/vllm`); EPIC's distinct add is the sink-fix.
+
+### Findings — our-stack blockers (the honest part)
+- **S1 (THE blocker):** the algorithmic heart = "a few tokens attend to all N over borrowed non-contiguous blocks" (scattered causal mask). **Untested on the ROCm backend (Triton / `rocm_flash_attn`) on the V2 runner.** Gates everything.
+- **S2 version gap:** EPIC = ~1.0-era **V1** runner; LMCache examples target an older `gpu_worker.py`. All touch-points re-derive onto 0.29 V2 (`vllm/v1/worker/gpu/model_runner.py`).
+- **S3 storage tight:** 60 GiB ≈ 240K tokens (bf16, 256 KiB/tok) ≈ a few hundred small / a few dozen large files. Need eviction/TTL (content hashes map to a cache-ID index).
+- **S4 staging tier too small:** 2 GiB CPU staging ≈ 8K tokens; a 20K-token file (5.12 GiB) does NOT fit → raise staging tier or chunk the promotion.
+- **S5 code unvalidated:** neither paper evaluated code; quality figures are doc-QA.
+- **S6 int5 KV-group:** paro uses `RADIANCE_KV_GROUP_OPT=1` + different KV-group layout; stored-KV format + in-kernel rotation must match.
+- **CacheBlend-specific:** **no LMCache ROCm wheel for gfx1201** (only Instinct gfx942/gfx950) → must build the native HIP ext from source + verify Triton block-sparse kernels on RDNA4; **MP-mode is CUDA-only** (IPC events) → only the legacy in-process path works on ROCm; LMCache files Qwen3.8 under "hybrid attention" (verify all layers are standard GQA + `.self_attn.rotary_emb`); LMCache disk format ≠ our tier.
+- **Verdict: do NOT adopt either as-is.** Steal the design, build a minimal radiance overlay on our existing tier.
+
+### Performance matrix (APPROXIMATES — to be measured in Phase 0)
+Assumptions: ~3000 tok/s prefill, ~3 GB/s disk, file KV on **disk**, bf16, EPIC k=32, CacheBlend 15%. **Both bounded by the disk-load ceiling ≈ 3.8× on this HW** (compute/tok ÷ load/tok). To exceed it: faster disk or 4-bit KV (~4× ceiling).
+
+| File | Baseline (recompute) | EPIC / LegoLink-32 | CacheBlend-15% | Both (redundant) |
+|---|---|---|---|---|
+| 1K tok | 333 ms | ~98 ms → **3.4×** | ~137 ms → **2.4×** (≈3.8× pipelined) | ≈CB, no gain |
+| 5K tok | 1667 ms | ~448 ms → **3.7×** | ~687 ms → **2.4×** (≈3.8× pipelined) | ≈CB, no gain |
+| 20K tok | ~6667 ms (real higher, O(N²)) | ~1759 ms → **3.8×** | ~2748 ms → **2.4×** (≈3.8× pipelined) | ≈CB, no gain |
+
+EPIC recompute negligible (always ~10 ms) → always at ceiling; CacheBlend 15% hidden by pipelining only while recompute ≤ load (large files fall below). **GPU-hot** (no disk load): EPIC ~100×+, CacheBlend ~6.7×. All published numbers are NVIDIA / ≤9B (EPIC) / 4K RAG (CacheBlend) / code-excluded → ours are first-order approximates.
+
+### Recommended approach (steal the design)
+Minimal env-gated radiance overlay reusing the disk tier: (1) **position-independence** — store unrotated K (= `W_K·X`) + V per span, re-rotate K in-kernel to target position (MiniPIC, ~5.7% overhead; or CacheBlend delta-rotation — pick one, stay consistent); (2) **LegoLink first-k recompute** as the primary recompute (O(kN), k≤32); (3) **CacheBlend deviation selection only if** first-k quality is insufficient on code (measure first); (4) **pipelined load/recompute**; (5) **compile job** (`max_tokens=0` prefill per file → unrotated K+V on disk tier, content-hash keyed); (6) **link path** (load spans → re-rotate → first-k recompute → decode).
+
+### Implementation plan (phased, NO CODE YET)
+- **Phase 0 — validation gates (measure BEFORE building; de-risks S1/S5).** **G1 (make-or-break, S1):** standalone Triton/`rocm_flash_attn` micro-benchmark (serving stopped) proving scattered-mask "first-k attends to all N over borrowed blocks" is correct + fast on ROCm — **gate the whole project on this.** G2 code quality (full-recompute ceiling vs unrotated-K+first-k vs +deviation, on real code files at varied positions, turnbench/equivbench-style). G3 latency (recompute+load TTFT for 1K/5K/20K on R9700; validates the matrix). G4 storage (how many hot files in 60 GiB bf16 vs 4-bit; staging-tier size for largest file). → go/no-go with measured numbers.
+- **Phase 1 — position-independence:** unrotated-K+V storage on the disk tier (namespace roll so new packed pages coexist with existing files) + in-kernel RoPE re-rotation; verify bit-exact vs rotated reference.
+- **Phase 2 — compile:** `precompute-file-kv.py` (tokenize → `max_tokens=0` prefill → extract unrotated K+V → write to tier keyed by content hash; batch mode; per-file token/byte ledger).
+- **Phase 3 — link:** detect cached spans by content hash → load (disk→staging→GPU) → re-rotate K → assemble block table over borrowed blocks → first-k recompute (G1 kernel) → decode.
+- **Phase 4 — quality tuning:** sweep k (2/16/32) on G2 code workloads; add deviation selection only if it misses the quality bar.
+- **Phase 5 — throughput + storage:** pipelined load/recompute; eviction/TTL (reuse reaper + content-hash cache-ID index); raise staging tier or chunk promotion for large files (S4).
+- **Phase 6 — hardening:** env-gate (default off), wire into entrypoint like other radiance patches; full bit-identical validation (turnbench/equivbench) + Grafana offload metrics + reaper health; document.
+- **Rollback:** env-gate off (single knob); precomputed disk blocks remain (harmless, reaper-managed).
+
+### Effort / risk
+Multi-week to multi-month; dominated by (a) Phase-0 G1 ROCm attention proof, (b) re-deriving the link path onto 0.29 V2, (c) code-specific quality validation. High integration risk, moderate algorithmic risk (algorithm is small), **high validation risk** (no published code/ROCm/27B data).
+
+### Key references
+- EPIC: arXiv 2410.15332 (v1 AttnLink / v3 LegoLink), PMLR v267, `github.com/DerekHJH/epic` (fork/demo).
+- CacheBlend: arXiv 2405.16444, `github.com/LMCache/LMCache` (`lmcache/v1/compute/blend/blender.py`, `.../attention/{utils,triton_sparse}.py`, PR #3092 ROCm Triton sparse).
+- MiniPIC (position-independence, in-kernel RoPE): arXiv 2606.13126, `github.com/IBM/vllm`.
+- KVShareArena ("mutually blind" cross-source limit): arXiv 2609.10266.
+- Prior research: WORKLOG cont.34 (position-independent KV + cross-attention).
+
+**Next (when resumed):** run Phase-0 G1 (the ROCm scattered-mask proof) — it is the go/no-go. Nothing is implemented.
+
+---
+
+## 2026-10-03 (cont. 34) — paro int5 disk KV offload enabled (tiny CPU staging + shared fs tier) + deep research: file-level KV pre-caching (position-independent KV / cross-attention)
+
+### Change: disk KV offload on for `paro5-27B-int5`
+- `aijuus/model-registry.json` → `paro5-27B-int5.server_env`: `KV_OFFLOAD_GIB` `"0"` → `"2"` (tiny 2 GiB CPU staging tier). Trailing `note` updated to record the change, the unvalidated risk, and the rollback.
+- `aijuus/kv-offload/ops/entrypoint.sh:410-411`: generalized the stale cross-rank-sweep comment (paro is no longer a "no-offload model"; now says "a model that starts only one rank (e.g. a tp2 model)"). Sweep logic (413-417) unchanged.
+- No compose / reaper / patch change. Plan: `.kilo/plans/1791034889369-paro-int5-disk-kv-offload.md`.
+
+### Why it is a one-line change (findings)
+- The whole offload stack is gated on `KV_OFFLOAD_GIB != 0`: `--kv-offloading-size` both sizes the CPU (RAM) tier **and** selects the `OffloadingConnector`. The fs disk tier is a *secondary* tier added only when `KV_OFFLOAD_DISK_DIR` is set, and it promotes **into** the CPU staging tier (`disk → CPU → GPU`) — so the disk tier is only reachable with a non-zero CPU tier.
+- Everything else was already in place and shared with the DP models: `KV_OFFLOAD_DISK_DIR` defaults to `/kvcache/blocks` (compose:199, inherited); backing store `/var/lib/radiance-kvcache/blocks` (60 GiB, reaper cap `KVCACHE_MAX_GIB=60`, `MIN_AGE=90`); `PYTHONHASHSEED=0` (content-deterministic block hashes → cross-model prefix reuse); the offload correctness patches (mixed-hit, eagle-groups, reconcile-reask, align-last-block, fs fan-out/invalidate/forget) are env-gated on for every model incl. paro.
+- Sizing: one paro chunk = 8192 tokens; a CPU block ≈ 2× GPU bytes/token → ~0.6 GiB/chunk. 2 GiB stages a couple of chunks + a small hot-prefix cache. The disk tier holds the bulk (long prefixes); the CPU tier only bounds per-window disk-restore length. Tune to 4-8 GiB only if dominated by long shared prefixes.
+
+### Risks (UNVALIDATED — gate before trusting)
+- **Offload + TP=2 is a new combination.** Offload was validated on TP=1 DP models. The connector's CPU tier is keyed by `engine_id` (`radrank0`); a TP=2 engine has 2 TP ranks sharing that id, so how the single CPU region handles the two sharded KV views is unverified. Main risk.
+- **Offload patches on the int5 path.** Patches are validated for MXFP4 DP models; paro uses `RADIANCE_KV_GROUP_OPT=1` + a different KV-group structure. Model-agnostic (act on KV blocks, not weights) so should apply, but unverified.
+- **Validation (user-owned restarts):** `POST /load {"model":"paro5-27B-int5"}` → check boot log `KV offload ON: cpu tier=2GiB` + `fs KV tier ON: root_dir=/kvcache/blocks`, no `async scheduling + KV offload` FATAL. Then run `aijuus/kv-offload/ops/turnbench.py` and/or `equivbench.py` for a bit-identical cached-vs-cold gate. Rollback: `KV_OFFLOAD_GIB` back to `"0"`.
+
+### Deep research: pre-caching individual codebase files into the KV cache
+Question: can we pre-compute KV for each file in a codebase and reuse it when those files appear in later prompts, instead of recomputing?
+
+**Why naive per-file pre-caching does NOT work:** transformer KV is sequential — the KV at token N depends on all tokens before it. A file prefilled in isolation only attended to itself; its layer-2+ KV never saw the system prompt or other files. vLLM's prefix cache is a content-addressed **prefix tree** (a block's hash chains through all preceding tokens), so it only matches an *identical* prefix, not an arbitrary file embedded in a varying multi-file context.
+
+**Finding 1 — the position problem is SOLVED (position-independent KV / "PIC"):**
+- **V is position-independent** — RoPE only rotates Q and K. V blocks can be cached and reused at any position with zero adjustment.
+- **K is trivially factorable** — store the *unrotated* `k̃ = W_K·X` (position-independent), apply the RoPE rotation inside the attention kernel at inference (cos/sin lookup + 2 FMA/elem, ~5.7% overhead). Mathematically exact, no storage penalty.
+- Already implemented: **MiniPIC** (IBM, arXiv 2606.13126) — 78 LOC core change to vLLM + a Triton attention backend, public fork `github.com/IBM/vllm`. Related: MEPIC, CacheSlide (USENIX FAST '26, RPDC).
+- RoPE variants that make K position-independent for free: ALiBi, T5-relative bias, NoPE (Llama 4). (YaRN/NTK/position-interpolation are context-*extension*, NOT position-independence.)
+
+**Finding 2 — the real obstacle is cross-file ATTENTION, not position (information-theoretic):**
+- Re-rotating K fixes the *geometry* (free) but cannot recover cross-file attention that was never computed. **KVShareArena** (arXiv 2609.10266): "correcting positions is free, enough until a question needs several sources at once… the sources are mutually blind."
+- Solutions, ranked by training cost:
+  | Approach | Training | Recompute | TTFT gain | Ref |
+  |---|---|---|---|---|
+  | **EPIC** | none | first 32 tokens/span (AttnLink) | 8× | arXiv 2410.15332 (ICML '25) |
+  | **CacheBlend** | none | ~15% of tokens (attention-deviation) | 2.2-3.3× | arXiv 2405.16444 (EuroSys '25), `github.com/LMCache/LMCache` |
+  | **KV Packet** | hours (tiny header/trailer adapters, self-supervised) | zero | — | 2026, tested on Qwen |
+  | **Block-Attention** | 500-1000 SFT steps (block mask, file=block) | zero | 98.7% | arXiv 2409.15355 (ICLR '25), released weights |
+  | **Comb / Native PIC** | encoder-branch training | zero | 51-94% | arXiv 2602.01519, vLLM-integrated |
+- Anthropic/OpenAI prompt caching is byte-exact **prefix** matching — does NOT do position-independent reuse, so commercial APIs don't solve this.
+- KV *compression* methods (H2O, SnapKV, KIVI, KVQuant, Quest, MInference, etc.) are orthogonal — none achieve position independence; they can be combined with PIC but don't give it.
+
+**Recommendation for this stack (Qwen3.8-27B, vLLM, disk offload now live):**
+1. Adopt **MiniPIC** (`github.com/IBM/vllm`) for exact position-independent KV; store unrotated K + free V per file on the existing disk tier (same disk→CPU→GPU promotion pipeline as regular offload).
+2. Add **EPIC** or **CacheBlend** on top only if cross-file reasoning quality matters (both zero-training).
+3. For zero-recompute: **KV Packet** (hours of adapter training) or **Block-Attention** (more training, best results).
+- Open gap: no code-specific file-level KV caching system exists yet.
+
+---
+
 ## 2026-09-30 (cont. 33) — Reorder batch threshold corruption analysis + overlay fix plan (vLLM #55894 / PR #55898)
 
 ### Problem

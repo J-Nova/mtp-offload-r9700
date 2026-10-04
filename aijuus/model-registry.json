@@ -192,7 +192,7 @@
    "RADIANCE_FP8_STREAM_TP1": "0",
    "RADIANCE_TOPK_TRITON_MIN_ROWS": "1",
    "RADIANCE_KV_GROUP_OPT": "1",
-   "KV_OFFLOAD_GIB": "0",
+   "KV_OFFLOAD_GIB": "2",
    "RADIANCE_AR_MAX_KB": "86016",
    "RADIANCE_AR_QNB": "96",
    "RADIANCE_AR_QNT": "1024",
@@ -202,6 +202,6 @@
    "MAMBA_SSM_DTYPE": "float32",
    "R4D_SO_DIR": "/r4d-rx6"
   },
-  "note": "ParoQuant int5 W5A8 (5.25 bits/weight), TP=2 across both cards, external DFlash2-FP8 drafter SPEC=7, measured on the 2x R9700 reference at 25.90/27.46/28.19 ms/step @25k/8k/32k, prefill 3941/3790/3616/3436, GSM8K 97.40, KV ~760k. kv_cache_memory intentionally OMITTED -> vLLM profiles on first boot at the 2x7551-32624 sig; pin it afterwards with ./calibrate-kv.sh. server_env mirrors paroquant/run_paroquant.sh MODE=prod: int5 I8/PG/ZPE defaults, GDN_MERGE_INPROJ=0 (in_proj a/b are fp16 there; the mxfp4 profile has it on), FP8_STREAM_TP1=0 (TP=1-only epilogue), TOPK_TRITON_MIN_ROWS=1, MAMBA_SSM_DTYPE=float32 (the paroquant default). R4D_SO_DIR=/r4d-rx6 selects the b9e42ab-rx6 libr4d build the paroquant path was validated on (mounted by the supervisor compose); other models stay on /r4d. Requires topology=tp2 (needs both cards)."
+  "note": "ParoQuant int5 W5A8 (5.25 bits/weight), TP=2 across both cards, external DFlash2-FP8 drafter SPEC=7, measured on the 2x R9700 reference at 25.90/27.46/28.19 ms/step @25k/8k/32k, prefill 3941/3790/3616/3436, GSM8K 97.40, KV ~760k. kv_cache_memory intentionally OMITTED -> vLLM profiles on first boot at the 2x7551-32624 sig; pin it afterwards with ./calibrate-kv.sh. server_env mirrors paroquant/run_paroquant.sh MODE=prod: int5 I8/PG/ZPE defaults, GDN_MERGE_INPROJ=0 (in_proj a/b are fp16 there; the mxfp4 profile has it on), FP8_STREAM_TP1=0 (TP=1-only epilogue), TOPK_TRITON_MIN_ROWS=1, MAMBA_SSM_DTYPE=float32 (the paroquant default). R4D_SO_DIR=/r4d-rx6 selects the b9e42ab-rx6 libr4d build the paroquant path was validated on (mounted by the supervisor compose); other models stay on /r4d. Requires topology=tp2 (needs both cards). 2026-10-03: KV_OFFLOAD_GIB 0 -> 2 (tiny CPU staging tier) + the shared fs disk tier (KV_OFFLOAD_DISK_DIR=/kvcache/blocks, inherited from the compose) turns on disk KV offload for paro -- the disk holds the bulk, the 2 GiB CPU tier only stages disk->GPU promotions (head cap off in Mode B, so no per-request cap defeats the disk). Offload+TP=2 and the int5-path offload patches are UNVALIDATED: run turnbench.py / equivbench.py for a bit-identical gate before trusting it in production. Roll back by setting KV_OFFLOAD_GIB back to 0."
  }
 }
